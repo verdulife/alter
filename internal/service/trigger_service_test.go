@@ -58,7 +58,7 @@ func (f *fakeTriggerRepo) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeTriggerRepo) ListPending(context.Context) ([]domain.Trigger, error) {
+func (f *fakeTriggerRepo) ListEnabled(context.Context) ([]domain.Trigger, error) {
 	return nil, errors.New("not implemented in fake")
 }
 

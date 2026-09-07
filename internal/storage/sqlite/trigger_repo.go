@@ -104,14 +104,15 @@ func (r *TriggerRepository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListPending returns all triggers currently enabled.
+// ListEnabled returns all triggers currently enabled, regardless of their
+// NextFireAt.
 //
-// Decision (documented): ListPending still returns every enabled trigger, not
-// only those due to fire. Incorporating NextFireAt filtering belongs to the
-// future Scheduler, not the repository — changing that semantics now would
-// turn the repository into a scheduler. The new columns are simply carried
-// through the scan so the Scheduler can filter once it exists.
-func (r *TriggerRepository) ListPending(ctx context.Context) ([]domain.Trigger, error) {
+// Decision (documented): this returns every enabled trigger, not only those
+// due to fire. Filtering by NextFireAt is the Scheduler's job (via the pure
+// execution contract), not the repository's — building time filters in here
+// would turn the repository into a scheduler. The fire-state columns are
+// simply carried through the scan so the Scheduler can filter once it exists.
+func (r *TriggerRepository) ListEnabled(ctx context.Context) ([]domain.Trigger, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+triggerCols+` FROM triggers WHERE enabled = 1 ORDER BY created_at`)
 	if err != nil {
