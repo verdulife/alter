@@ -1,4 +1,4 @@
-# secretary
+# alter
 
 Personal virtual secretary — modular, extensible, low-resource.
 
@@ -17,8 +17,8 @@ A local-first tool that will progressively grow into a personal secretary with i
 ## Project Structure
 
 ```
-secretary/
-├── cmd/secretary/      # Entry point
+alter/
+├── cmd/alter/      # Entry point
 ├── internal/
 │   └── config/         # Application configuration
 └── README.md
@@ -37,14 +37,14 @@ internal/
 ## Build & Run
 
 ```bash
-go build -o secretary ./cmd/secretary
-./secretary
+go build -o alter ./cmd/alter
+./alter
 ```
 
 Or directly:
 
 ```bash
-go run ./cmd/secretary
+go run ./cmd/alter
 ```
 
 ## Requirements
