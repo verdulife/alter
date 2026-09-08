@@ -58,6 +58,16 @@ func (f *fakeTriggerRepo) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeTriggerRepo) ClearDerivedNextFireAt(_ context.Context, taskID string) error {
+	for id, tr := range f.triggers {
+		if tr.TaskID == taskID && (tr.Type == domain.TriggerTypeBeforeDue || tr.Type == domain.TriggerTypeAfterDue) {
+			tr.NextFireAt = nil
+			f.triggers[id] = tr
+		}
+	}
+	return nil
+}
+
 func (f *fakeTriggerRepo) ListEnabled(context.Context) ([]domain.Trigger, error) {
 	return nil, errors.New("not implemented in fake")
 }

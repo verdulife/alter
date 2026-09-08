@@ -42,19 +42,21 @@ type UpdateTaskParams struct {
 // It depends only on domain interfaces; it never touches concrete storage
 // (e.g. SQLite), keeping the service testable and storage-agnostic.
 type TaskService struct {
-	tasks  domain.TaskRepository
-	events domain.EventStore
-	now    func() time.Time
-	newID  func() string
+	tasks    domain.TaskRepository
+	triggers domain.TriggerRepository
+	events   domain.EventStore
+	now      func() time.Time
+	newID    func() string
 }
 
 // NewTaskService builds a TaskService with production defaults.
-func NewTaskService(tasks domain.TaskRepository, events domain.EventStore) *TaskService {
+func NewTaskService(tasks domain.TaskRepository, triggers domain.TriggerRepository, events domain.EventStore) *TaskService {
 	return &TaskService{
-		tasks:  tasks,
-		events: events,
-		now:    time.Now,
-		newID:  newLocalID,
+		tasks:    tasks,
+		triggers: triggers,
+		events:   events,
+		now:      time.Now,
+		newID:    newLocalID,
 	}
 }
 
@@ -118,6 +120,17 @@ func (s *TaskService) Update(ctx context.Context, id string, p UpdateTaskParams)
 	if err := s.tasks.Update(ctx, task); err != nil {
 		return domain.Task{}, err
 	}
+
+	// If DueAt changed, invalidate the task's time-derived triggers (before_due /
+	// after_due) so the Scheduler recalculates their NextFireAt from the new due
+	// date. This deliberately does not duplicate scheduling math: it only nulls
+	// the cached deadline. Best-effort so a repository failure does not block the
+	// task update (mirrors emit's resilience). DueAt can only be set/changed in
+	// V1 (clearing is unsupported), so a non-nil param always means a change.
+	if p.DueAt != nil {
+		_ = s.triggers.ClearDerivedNextFireAt(ctx, task.ID)
+	}
+
 	s.emit(ctx, domain.EventTaskUpdated, task.ID)
 	return task, nil
 }

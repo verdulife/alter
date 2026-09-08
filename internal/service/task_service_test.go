@@ -105,10 +105,11 @@ func newHarness() (*TaskService, *fakeTaskRepo, *fakeEventStore, *clock) {
 	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
 
 	svc := &TaskService{
-		tasks:  repo,
-		events: events,
-		now:    clk.now,
-		newID:  func() string { return "id-1" },
+		tasks:    repo,
+		triggers: newFakeTriggerRepo(),
+		events:   events,
+		now:      clk.now,
+		newID:    func() string { return "id-1" },
 	}
 	return svc, repo, events, clk
 }
@@ -304,6 +305,87 @@ func TestGetByIDAndList(t *testing.T) {
 	}
 	if len(all) != 1 {
 		t.Errorf("expected 1 task, got %d", len(all))
+	}
+}
+
+func TestUpdateDueAtInvalidatesDerivedTriggers(t *testing.T) {
+	repo := newFakeTaskRepo()
+	trigRepo := newFakeTriggerRepo()
+	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
+	svc := &TaskService{
+		tasks:    repo,
+		triggers: trigRepo,
+		events:   newFakeEventStore(),
+		now:      clk.now,
+		newID:    func() string { return "id-1" },
+	}
+
+	due := time.Date(2024, 1, 5, 20, 0, 0, 0, time.UTC) // Friday
+	task, err := svc.Create(context.Background(), CreateTaskParams{Title: "t", DueAt: &due})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// before_due 24h with a stale NextFireAt (Thursday 20:00) and a LastFiredAt.
+	last := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	stale := time.Date(2024, 1, 4, 20, 0, 0, 0, time.UTC)
+	trigRepo.triggers["trg-1"] = domain.Trigger{
+		ID: "trg-1", TaskID: task.ID, Type: domain.TriggerTypeBeforeDue,
+		Value: "24h", Enabled: true, NextFireAt: &stale, LastFiredAt: &last,
+	}
+	// An absolute "at" trigger that must NOT be cleared.
+	atDue := time.Date(2024, 2, 1, 9, 0, 0, 0, time.UTC)
+	trigRepo.triggers["trg-2"] = domain.Trigger{
+		ID: "trg-2", TaskID: task.ID, Type: domain.TriggerTypeAt,
+		Value: "2024-02-01T09:00:00Z", Enabled: true, NextFireAt: &atDue,
+	}
+
+	newDue := time.Date(2024, 1, 6, 20, 0, 0, 0, time.UTC) // Saturday
+	if _, err := svc.Update(context.Background(), task.ID, UpdateTaskParams{DueAt: &newDue}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if got := trigRepo.triggers["trg-1"].NextFireAt; got != nil {
+		t.Errorf("derived NextFireAt should be nil, got %v", got)
+	}
+	if got := trigRepo.triggers["trg-1"].LastFiredAt; got == nil || !got.Equal(last) {
+		t.Errorf("LastFiredAt should be preserved, got %v", got)
+	}
+	if !trigRepo.triggers["trg-1"].Enabled {
+		t.Error("derived trigger should remain enabled")
+	}
+	if got := trigRepo.triggers["trg-2"].NextFireAt; got == nil || !got.Equal(atDue) {
+		t.Errorf("at trigger NextFireAt must not be cleared, got %v", got)
+	}
+}
+
+func TestUpdateWithoutDueAtKeepsNextFireAt(t *testing.T) {
+	repo := newFakeTaskRepo()
+	trigRepo := newFakeTriggerRepo()
+	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
+	svc := &TaskService{
+		tasks:    repo,
+		triggers: trigRepo,
+		events:   newFakeEventStore(),
+		now:      clk.now,
+		newID:    func() string { return "id-1" },
+	}
+
+	task, err := svc.Create(context.Background(), CreateTaskParams{Title: "t"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	next := time.Date(2024, 1, 4, 20, 0, 0, 0, time.UTC)
+	trigRepo.triggers["trg-1"] = domain.Trigger{
+		ID: "trg-1", TaskID: task.ID, Type: domain.TriggerTypeAfterDue,
+		Value: "24h", Enabled: true, NextFireAt: &next,
+	}
+
+	if _, err := svc.Update(context.Background(), task.ID, UpdateTaskParams{Title: ptr("renamed")}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := trigRepo.triggers["trg-1"].NextFireAt; got == nil || !got.Equal(next) {
+		t.Errorf("NextFireAt should be preserved when DueAt unchanged, got %v", got)
 	}
 }
 

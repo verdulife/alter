@@ -18,6 +18,13 @@ type TriggerRepository interface {
 	GetByTaskID(ctx context.Context, taskID string) ([]Trigger, error)
 	Update(ctx context.Context, trigger Trigger) error
 	Delete(ctx context.Context, id string) error
+	// ClearDerivedNextFireAt invalidates the cached NextFireAt of a task's
+	// time-derived triggers (before_due / after_due) by setting it to nil.
+	// Called when Task.DueAt changes so the Scheduler recalculates them from the
+	// new due date via CalculateNextFireAt. It preserves LastFiredAt and Enabled
+	// and only touches derived triggers: "at" triggers are absolute and must not
+	// be cleared.
+	ClearDerivedNextFireAt(ctx context.Context, taskID string) error
 	// ListEnabled returns all triggers that are currently enabled, regardless
 	// of their NextFireAt. It is the seam for the future Scheduler: enabled
 	// triggers are scanned here and filtered by due-ness using the pure
@@ -42,4 +49,15 @@ type EventStore interface {
 type Channel interface {
 	Name() string
 	Send(ctx context.Context, message string) error
+}
+
+// TriggerAction executes the user-facing consequence of a fired trigger. It is
+// a driven output the Scheduler invokes between ExecuteTrigger and persisting
+// fire state. A real implementation (e.g. Telegram) may wrap domain.Channel.
+//
+// The Scheduler requires a non-nil TriggerAction at construction and must never
+// be started with a no-op: a trigger must never be marked fired without a real
+// consequence. A failed action leaves the trigger due (it is not consumed).
+type TriggerAction interface {
+	Execute(ctx context.Context, trigger Trigger, task Task) error
 }

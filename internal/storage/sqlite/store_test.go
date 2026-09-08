@@ -312,6 +312,70 @@ func TestTriggerFireStateReopen(t *testing.T) {
 	}
 }
 
+// TestTriggerClearDerivedNextFireAt verifies that changing a task's due date
+// invalidates only its time-derived triggers' NextFireAt, preserving LastFiredAt,
+// Enabled, and absolute "at" triggers.
+func TestTriggerClearDerivedNextFireAt(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seedTriggerTask(t, store, "task-1")
+	repo := store.NewTriggerRepository()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	next := now.Add(24 * time.Hour)
+	last := now.Add(-time.Hour)
+
+	trigs := []domain.Trigger{
+		{ID: "trg-before", TaskID: "task-1", Type: domain.TriggerTypeBeforeDue,
+			Value: "24h", Enabled: true, NextFireAt: &next, LastFiredAt: &last, CreatedAt: now},
+		{ID: "trg-after", TaskID: "task-1", Type: domain.TriggerTypeAfterDue,
+			Value: "1h", Enabled: true, NextFireAt: &next, CreatedAt: now},
+		{ID: "trg-at", TaskID: "task-1", Type: domain.TriggerTypeAt,
+			Value: "2099-01-01T00:00:00Z", Enabled: true, NextFireAt: &next, CreatedAt: now},
+	}
+	for _, tr := range trigs {
+		if err := repo.Create(ctx, tr); err != nil {
+			t.Fatalf("create %s: %v", tr.ID, err)
+		}
+	}
+
+	if err := repo.ClearDerivedNextFireAt(ctx, "task-1"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+
+	// Derived triggers: NextFireAt nil, LastFiredAt/Enabled preserved.
+	before, err := repo.GetByID(ctx, "trg-before")
+	if err != nil {
+		t.Fatalf("get before: %v", err)
+	}
+	if before.NextFireAt != nil {
+		t.Errorf("before_due NextFireAt should be nil, got %v", before.NextFireAt)
+	}
+	if before.LastFiredAt == nil || !before.LastFiredAt.Equal(last) {
+		t.Errorf("before_due LastFiredAt should be preserved, got %v", before.LastFiredAt)
+	}
+	if !before.Enabled {
+		t.Error("before_due should remain enabled")
+	}
+
+	after, err := repo.GetByID(ctx, "trg-after")
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.NextFireAt != nil {
+		t.Errorf("after_due NextFireAt should be nil, got %v", after.NextFireAt)
+	}
+
+	// Absolute "at" trigger untouched.
+	at, err := repo.GetByID(ctx, "trg-at")
+	if err != nil {
+		t.Fatalf("get at: %v", err)
+	}
+	if at.NextFireAt == nil || !at.NextFireAt.Equal(next) {
+		t.Errorf("at NextFireAt should be preserved, got %v", at.NextFireAt)
+	}
+}
+
 // TestMigrationsApplyFromScratch verifies 0001 and 0002 are both applied on a
 // brand-new database.
 func TestMigrationsApplyFromScratch(t *testing.T) {

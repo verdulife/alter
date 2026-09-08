@@ -104,6 +104,18 @@ func (r *TriggerRepository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// ClearDerivedNextFireAt sets NextFireAt to NULL for all before_due/after_due
+// triggers of a task, preserving LastFiredAt and Enabled. Used to invalidate
+// time-derived schedules when Task.DueAt changes; the Scheduler recalculates
+// them via CalculateNextFireAt. "at" triggers are absolute and left untouched.
+func (r *TriggerRepository) ClearDerivedNextFireAt(ctx context.Context, taskID string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE triggers SET next_fire_at = NULL
+		 WHERE task_id = ? AND type IN ('before_due','after_due')`,
+		taskID)
+	return err
+}
+
 // ListEnabled returns all triggers currently enabled, regardless of their
 // NextFireAt.
 //
