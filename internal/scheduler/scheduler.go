@@ -25,6 +25,16 @@ import (
 	"github.com/verdu/alter/internal/domain"
 )
 
+var _ domain.Rescheduler = (*Scheduler)(nil)
+
+// defaultActionRetryDelay is the default backoff applied when a TriggerAction
+// fails. The trigger stays enabled and due (at-least-once) but a RetryAt is set
+// to now + actionRetryDelay so the Scheduler does not re-attempt it in a busy
+// loop. It is deliberately small and simple: no retry counter, no new tables, no
+// in-memory state. Because RetryAt is persisted in SQLite (the source of truth),
+// the delay survives Wake() rescans and process restarts.
+const defaultActionRetryDelay = 30 * time.Second
+
 // Scheduler drives enabled triggers against their persisted NextFireAt.
 //
 // It is designed to run as a single goroutine via Run(ctx). A non-nil
@@ -39,6 +49,9 @@ type Scheduler struct {
 	now    func() time.Time
 	logger *log.Logger
 	newID  func() string
+
+	// actionRetryDelay is the RetryAt backoff applied on an action failure.
+	actionRetryDelay time.Duration
 
 	// wake is a buffered-capacity-1 coalescing hint channel. A send when the
 	// buffer is full is dropped: one pending wake is enough to trigger a rescan.
@@ -59,14 +72,15 @@ func NewScheduler(
 		panic("scheduler: TriggerAction is required (nil action would consume triggers without consequence)")
 	}
 	s := &Scheduler{
-		triggers: triggers,
-		tasks:    tasks,
-		events:   events,
-		action:   action,
-		now:      time.Now,
-		logger:   log.New(io.Discard, "", 0),
-		newID:    newLocalID,
-		wake:     make(chan struct{}, 1),
+		triggers:         triggers,
+		tasks:            tasks,
+		events:           events,
+		action:           action,
+		now:              time.Now,
+		logger:           log.New(io.Discard, "", 0),
+		newID:            newLocalID,
+		actionRetryDelay: defaultActionRetryDelay,
+		wake:             make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(s)
@@ -85,6 +99,13 @@ func WithLogger(l *log.Logger) Option { return func(s *Scheduler) { s.logger = l
 
 // WithID overrides the event ID generator.
 func WithID(f func() string) Option { return func(s *Scheduler) { s.newID = f } }
+
+// WithActionRetryDelay overrides the RetryAt backoff applied on an action
+// failure. It exists for deterministic/real-clock tests; production keeps the
+// 30s default.
+func WithActionRetryDelay(d time.Duration) Option {
+	return func(s *Scheduler) { s.actionRetryDelay = d }
+}
 
 // Wake is a coarse, non-blocking, coalescing hint: it tells the Scheduler that
 // the state determining the next deadline may have changed and it should rescan
@@ -142,23 +163,53 @@ func (s *Scheduler) tick(ctx context.Context) (time.Time, error) {
 		// and from the deadline), no busy loop.
 	}
 
-	// DISPARAR: process ALL due triggers before planning the next deadline.
+	// DISPARAR: process ALL due triggers before planning the next deadline. A
+	// trigger is due only if it has a derived NextFireAt in the past AND no retry
+	// backoff currently holding it off (RetryAt nil or already elapsed).
+	// fireOne reports whether it persisted any schedule-relevant change (fire,
+	// backoff, or retire) so PLANIFICAR can re-read the source of truth.
+	changed := false
 	for _, t := range scheduled {
-		if t.NextFireAt != nil && !t.NextFireAt.After(now) {
-			s.fireOne(ctx, t, now)
+		if t.NextFireAt != nil && !t.NextFireAt.After(now) && (t.RetryAt == nil || !t.RetryAt.After(now)) {
+			if s.fireOne(ctx, t, now) {
+				changed = true
+			}
 		}
 	}
 
-	// PLANIFICAR: nearest future deadline among surviving (still enabled) triggers.
+	// PLANIFICAR: next point at which the scheduler must act, over still-enabled
+	// triggers. If anything changed during DISPARAR, re-read ListEnabled so the
+	// deadline is computed from the freshly persisted source of truth (a fired
+	// trigger is now disabled, and a failed action set a future RetryAt — neither
+	// is visible in the stale in-memory snapshot). The deadline is the earliest of
+	// any future derived NextFireAt and any future RetryAt: a retry becomes
+	// eligible exactly when RetryAt elapses, so the scheduler must wake for it.
+	view := scheduled
+	if changed {
+		fresh, err := s.triggers.ListEnabled(ctx)
+		if err != nil {
+			return time.Time{}, err
+		}
+		view = fresh
+	}
+
 	var next time.Time
 	found := false
-	for _, t := range scheduled {
-		if t.NextFireAt == nil || !t.NextFireAt.After(now) {
-			continue
+	consider := func(c time.Time) {
+		if c.IsZero() || !c.After(now) {
+			return
 		}
-		if !found || t.NextFireAt.Before(next) {
-			next = *t.NextFireAt
+		if !found || c.Before(next) {
+			next = c
 			found = true
+		}
+	}
+	for _, t := range view {
+		if t.NextFireAt != nil {
+			consider(*t.NextFireAt)
+		}
+		if t.RetryAt != nil {
+			consider(*t.RetryAt)
 		}
 	}
 	return next, nil
@@ -193,15 +244,17 @@ func (s *Scheduler) arm(ctx context.Context, t domain.Trigger) (time.Time, bool)
 }
 
 // fireOne executes one due trigger: ExecuteTrigger -> action -> persist -> emit.
-func (s *Scheduler) fireOne(ctx context.Context, t domain.Trigger, now time.Time) {
+// It reports whether it persisted a schedule-relevant change (true), which lets
+// the caller re-read the source of truth for deadline planning.
+func (s *Scheduler) fireOne(ctx context.Context, t domain.Trigger, now time.Time) bool {
 	task, err := s.tasks.GetByID(ctx, t.TaskID)
 	if err != nil {
 		if isNotFound(err) {
 			s.retire(ctx, t, "task not found")
-		} else {
-			s.logger.Printf("scheduler: load task %s: %v", t.TaskID, err)
+			return true
 		}
-		return
+		s.logger.Printf("scheduler: load task %s: %v", t.TaskID, err)
+		return false
 	}
 
 	executed, err := domain.ExecuteTrigger(t, task, now)
@@ -210,27 +263,42 @@ func (s *Scheduler) fireOne(ctx context.Context, t domain.Trigger, now time.Time
 			// Terminal: completed/cancelled task. Retire so it leaves the active
 			// set and cannot busy-loop.
 			s.retire(ctx, t, "task not executable")
-			return
+			return true
 		}
 		// Unexpected (e.g. disabled mid-flight, not scheduled): transient/skip.
 		s.logger.Printf("scheduler: execute trigger %s: %v", t.ID, err)
-		return
+		return false
 	}
 
 	if err := s.action.Execute(ctx, executed, task); err != nil {
-		// Transitory: do NOT persist. The trigger stays due and retries next cycle.
+		// Transitory: do NOT consume the trigger. Set a minimal retry backoff via
+		// RetryAt (now + actionRetryDelay). NextFireAt is left untouched: it remains
+		// the derived deadline, now in the past; RetryAt is separate operational state
+		// that holds the retry off until it elapses. Persisting RetryAt means the
+		// delay survives Wake rescans and process restarts (SQLite is the source of
+		// truth). We persist the ORIGINAL trigger (not `executed`) so LastFiredAt is
+		// not recorded: the action did not succeed. Enabled stays true.
 		s.logger.Printf("scheduler: action for trigger %s: %v", t.ID, err)
-		return
+		backoff := t
+		nf := now.Add(s.actionRetryDelay)
+		backoff.RetryAt = &nf
+		if err := s.triggers.Update(ctx, backoff); err != nil {
+			// Persisting the backoff failed: the trigger remains at its original due
+			// time with no RetryAt and will re-attempt next cycle (best-effort).
+			s.logger.Printf("scheduler: persist action retry %s: %v", t.ID, err)
+		}
+		return true
 	}
 
 	if err := s.triggers.Update(ctx, executed); err != nil {
 		// at-least-once: the trigger is still due in SQLite; on recovery it may
 		// re-fire (possible duplicate, preferred over losing the notification).
 		s.logger.Printf("scheduler: persist trigger %s: %v", t.ID, err)
-		return
+		return false
 	}
 
 	s.emit(ctx, executed, now)
+	return true
 }
 
 // retire disables a terminal trigger so it leaves the active set. NextFireAt is

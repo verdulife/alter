@@ -24,6 +24,7 @@ type fakeTriggerRepo struct {
 	enabled   bool // if true, ListEnabled filters by Enabled
 	triggers  map[string]domain.Trigger
 	listCalls int
+	listErr   error // if set, ListEnabled returns it (infra error testing)
 }
 
 func newFakeTriggerRepo() *fakeTriggerRepo {
@@ -34,6 +35,9 @@ func (f *fakeTriggerRepo) ListEnabled(context.Context) ([]domain.Trigger, error)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]domain.Trigger, 0, len(f.triggers))
 	for _, t := range f.triggers {
 		if !f.enabled || t.Enabled {
@@ -204,17 +208,18 @@ func (f *fakeAction) count() int {
 
 // --- Harness ---------------------------------------------------------------
 
-func newHarness(t *testing.T, action domain.TriggerAction) (*Scheduler, *fakeTriggerRepo, *fakeTaskRepo, *fakeEventStore) {
+func newHarness(t *testing.T, action domain.TriggerAction, opts ...Option) (*Scheduler, *fakeTriggerRepo, *fakeTaskRepo, *fakeEventStore) {
 	t.Helper()
 	trig := newFakeTriggerRepo()
 	tasks := newFakeTaskRepo()
 	events := newFakeEventStore()
 	discard := log.New(io.Discard, "", 0)
 	s := NewScheduler(trig, tasks, events, action,
-		WithNow(func() time.Time { return fixedNow }),
-		WithLogger(discard),
-		WithID(func() string { return "evt-1" }),
-	)
+		append([]Option{
+			WithNow(func() time.Time { return fixedNow }),
+			WithLogger(discard),
+			WithID(func() string { return "evt-1" }),
+		}, opts...)...)
 	return s, trig, tasks, events
 }
 
@@ -419,6 +424,40 @@ func TestAllDueTriggersProcessedBeforePlanning(t *testing.T) {
 	}
 }
 
+func TestBackoffSurvivesWake(t *testing.T) {
+	// After an action failure sets a RetryAt backoff, a Wake rescan must re-read
+	// SQLite and must NOT re-attempt the action while the backoff is still pending
+	// (the persisted RetryAt is the source of truth).
+	action := newFakeAction()
+	action.fail = true
+	s, trig, tasks, _ := newHarness(t, action)
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow})
+	tasks.seed(dueTask("t"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	waitFor(t, 2*time.Second, func() bool { return action.count() >= 1 })
+
+	before := trig.calls()
+	s.Wake()
+	waitFor(t, 2*time.Second, func() bool { return trig.calls() > before })
+
+	// The action must not re-run: the RetryAt backoff keeps the trigger non-due and
+	// Wake merely triggered a rescan that re-read the persisted RetryAt.
+	if action.count() != 1 {
+		t.Errorf("Wake must not force an immediate retry during backoff, got %d attempts", action.count())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+}
+
 // --- Acción ----------------------------------------------------------------
 
 func TestActionFailureDoesNotConsumeTrigger(t *testing.T) {
@@ -438,14 +477,170 @@ func TestActionFailureDoesNotConsumeTrigger(t *testing.T) {
 	if !got.Enabled {
 		t.Error("trigger must remain enabled when action fails (not consumed)")
 	}
+	// At-least-once: the trigger is NOT consumed and retries later, but a RetryAt
+	// backoff holds it off so it is no longer immediately due (no busy loop). The
+	// derived deadline NextFireAt is left untouched.
+	wantRetry := fixedNow.Add(defaultActionRetryDelay)
 	if got.NextFireAt == nil || !got.NextFireAt.Equal(fixedNow) {
-		t.Errorf("trigger NextFireAt must be preserved on action failure, got %v", got.NextFireAt)
+		t.Errorf("NextFireAt (derived deadline) must be preserved untouched, got %v", got.NextFireAt)
+	}
+	if got.RetryAt == nil {
+		t.Fatal("RetryAt must be set after action failure (backoff)")
+	}
+	if !got.RetryAt.Equal(wantRetry) {
+		t.Errorf("RetryAt should be %v, got %v", wantRetry, got.RetryAt)
 	}
 	if got.LastFiredAt != nil {
 		t.Errorf("LastFiredAt must not be set on action failure, got %v", got.LastFiredAt)
 	}
 	if n := len(events.fired()); n != 0 {
 		t.Errorf("no fired event expected on action failure, got %d", n)
+	}
+}
+
+func TestActionFailureBackoff(t *testing.T) {
+	// The RetryAt backoff must re-arm the scheduler's next deadline to RetryAt
+	// (now + defaultActionRetryDelay), so the loop wakes for the retry instead of
+	// busy-looping on the original due time or sleeping indefinitely.
+	action := newFakeAction()
+	action.fail = true
+	s, trig, tasks, _ := newHarness(t, action)
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow})
+	tasks.seed(dueTask("t"))
+
+	next := mustTick(t, s)
+	if next.IsZero() {
+		t.Fatal("expected a future deadline from the RetryAt backoff, got zero")
+	}
+	want := fixedNow.Add(defaultActionRetryDelay)
+	if !next.Equal(want) {
+		t.Errorf("next deadline should be %v (RetryAt), got %v", want, next)
+	}
+
+	// Running the same tick again while the backoff is still pending must NOT
+	// re-attempt the action (the trigger is held off by RetryAt).
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Errorf("action must not re-run while RetryAt pending, got %d attempts", action.count())
+	}
+}
+
+func TestActionFailureRecoversAfterBackoff(t *testing.T) {
+	// Advancing the clock past the RetryAt backoff makes the trigger due again; a
+	// retry then runs. NextFireAt (the derived deadline) is not consumed by the
+	// earlier failure.
+	action := newFakeAction()
+	action.fail = true
+	s, trig, tasks, _ := newHarness(t, action, WithNow(func() time.Time { return fixedNow.Add(defaultActionRetryDelay) }))
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow})
+	tasks.seed(dueTask("t"))
+
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Errorf("action should run once when RetryAt elapsed, got %d", action.count())
+	}
+}
+
+func TestSuccessfulFireClearsRetryAt(t *testing.T) {
+	// A trigger with an elapsed RetryAt and a succeeding action must fire normally:
+	// RetryAt is cleared, NextFireAt nil, Enabled false (one-shot done).
+	action := newFakeAction()
+	s, trig, tasks, events := newHarness(t, action)
+	retry := fixedNow.Add(-time.Minute) // already elapsed
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow, RetryAt: &retry})
+	tasks.seed(dueTask("t"))
+
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Errorf("action should run once, got %d", action.count())
+	}
+	got, _ := trig.get("a")
+	if got.Enabled {
+		t.Error("trigger should be disabled after successful fire")
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt should be nil after fire, got %v", got.NextFireAt)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be cleared after successful fire, got %v", got.RetryAt)
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(fixedNow) {
+		t.Errorf("LastFiredAt should record the fire, got %v", got.LastFiredAt)
+	}
+	if n := len(events.fired()); n != 1 {
+		t.Errorf("expected 1 fired event, got %d", n)
+	}
+}
+
+func TestRetryAtHoldsOffDueEvenWhenNextFirePast(t *testing.T) {
+	// Regression: a trigger whose derived NextFireAt is in the past must NOT fire
+	// while a future RetryAt is still pending (separation of derived vs retry state).
+	action := newFakeAction()
+	s, trig, tasks, _ := newHarness(t, action)
+	retry := fixedNow.Add(defaultActionRetryDelay) // still pending
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow, RetryAt: &retry})
+	tasks.seed(dueTask("t"))
+
+	next := mustTick(t, s)
+	if action.count() != 0 {
+		t.Errorf("action must not run while RetryAt pending, got %d", action.count())
+	}
+	// The loop still wakes at the pending RetryAt.
+	if next.IsZero() || !next.Equal(retry) {
+		t.Errorf("next deadline should be the pending RetryAt %v, got %v", retry, next)
+	}
+}
+
+func TestShutdownDuringRetryWait(t *testing.T) {
+	// An action failure sets a RetryAt backoff; cancelling while the scheduler
+	// waits on that deadline must still stop Run cleanly.
+	action := newFakeAction()
+	action.fail = true
+	s, trig, tasks, _ := newHarness(t, action)
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow})
+	tasks.seed(dueTask("t"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	waitFor(t, 2*time.Second, func() bool { return action.count() >= 1 })
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return on ctx cancellation during retry wait")
+	}
+}
+
+func TestRepositoryListEnabledErrorAbortsCycle(t *testing.T) {
+	// A persistent infrastructure error from ListEnabled must abort the cycle and
+	// put Run into a wait (wake/ctx) instead of churning the repository in a loop.
+	s, trig, _, _ := newHarness(t, newFakeAction())
+	trig.listErr = errors.New("sqlite: database is locked")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// Let a few loops run, then confirm the abort path keeps it from spinning the
+	// repository: only the initial failed reads happen, then it waits.
+	time.Sleep(100 * time.Millisecond)
+	calls := trig.calls()
+	time.Sleep(100 * time.Millisecond)
+	if n := trig.calls(); n > calls+1 {
+		t.Errorf("Run must not busy-loop on ListEnabled error, calls grew %d -> %d", calls, n)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop")
 	}
 }
 
@@ -704,4 +899,125 @@ func TestDueDuringRuntimeViaTimer(t *testing.T) {
 	if action.count() != 1 {
 		t.Errorf("expected trigger to fire once via timer, got %d actions", action.count())
 	}
+}
+func TestRetryBackoffUsesTimerNotBusyLoop(t *testing.T) {
+	// Runtime proof against a busy loop: an always-failing action with a short
+	// RetryAt backoff must produce a bounded number of attempts proportional to the
+	// backoff (the loop sleeps on a real timer), not an immediate spin.
+	action := newFakeAction()
+	action.fail = true
+	trig := newFakeTriggerRepo()
+	tasks := newFakeTaskRepo()
+	events := newFakeEventStore()
+	s := NewScheduler(trig, tasks, events, action,
+		WithLogger(log.New(io.Discard, "", 0)),
+		WithID(func() string { return "evt-1" }),
+		WithActionRetryDelay(50*time.Millisecond),
+	)
+
+	next := time.Now()
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &next})
+	tasks.seed(dueTask("t"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	waitFor(t, 3*time.Second, func() bool { return action.count() >= 2 })
+	time.Sleep(300 * time.Millisecond)
+
+	calls := action.count()
+	// With a 50ms backoff over ~400ms: expect a handful of attempts (~8), never a
+	// tight spin. A busy loop (0 delay) would produce hundreds.
+	if calls < 2 {
+		t.Errorf("expected retries, got %d", calls)
+	}
+	if calls > 25 {
+		t.Errorf("busy loop detected: %d attempts over ~400ms (wanted bounded by RetryAt backoff)", calls)
+	}
+	got, _ := trig.get("a")
+	if !got.Enabled {
+		t.Error("always-failing action must not consume the trigger")
+	}
+	if got.LastFiredAt != nil {
+		t.Error("no fire should be recorded for a failing action")
+	}
+}
+
+func TestRetryWakesSchedulerAndFiresWhenElapsed(t *testing.T) {
+	// Runtime proof that a future RetryAt wakes the loop at the right moment and
+	// the retry then succeeds: the action fails once, then the scheduler sleeps on
+	// a timer until RetryAt elapses and re-attempts, which fires and consumes it.
+	action := &failOnceSuccessAction{}
+	trig := newFakeTriggerRepo()
+	tasks := newFakeTaskRepo()
+	events := newFakeEventStore()
+	s := NewScheduler(trig, tasks, events, action,
+		WithLogger(log.New(io.Discard, "", 0)),
+		WithID(func() string { return "evt-1" }),
+		WithActionRetryDelay(50*time.Millisecond),
+	)
+
+	next := time.Now()
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &next})
+	tasks.seed(dueTask("t"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	// The fire's completion signal is the emitted EventTriggerFired, which the
+	// scheduler records AFTER persisting the disabled trigger (persist -> emit).
+	// Waiting on !Enabled would race that emit and read 0 events transiently, so
+	// poll the actual event emission instead.
+	waitFor(t, 3*time.Second, func() bool { return len(events.fired()) >= 1 })
+
+	if action.count() != 2 {
+		t.Errorf("expected exactly 2 attempts (1 failure, 1 retry), got %d", action.count())
+	}
+	got, _ := trig.get("a")
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be nil after a successful fire, got %v", got.RetryAt)
+	}
+	if n := len(events.fired()); n != 1 {
+		t.Errorf("expected exactly 1 fired event, got %d", n)
+	}
+}
+
+// failOnceSuccessAction fails its first attempt then succeeds: it models a
+// transient action error that a single retry resolves.
+type failOnceSuccessAction struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (a *failOnceSuccessAction) Execute(context.Context, domain.Trigger, domain.Task) error {
+	a.mu.Lock()
+	a.calls++
+	first := a.calls == 1
+	a.mu.Unlock()
+	if first {
+		return errors.New("transient action failure")
+	}
+	return nil
+}
+
+func (a *failOnceSuccessAction) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
 }

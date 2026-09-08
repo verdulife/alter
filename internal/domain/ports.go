@@ -61,3 +61,20 @@ type Channel interface {
 type TriggerAction interface {
 	Execute(ctx context.Context, trigger Trigger, task Task) error
 }
+
+// Rescheduler is the small inbound port that lets write services hint the
+// Scheduler that the state determining the next deadline may have changed and
+// that it should rescan SQLite now. It is deliberately minimal and never the
+// source of truth.
+//
+// Dependency direction: write services depend only on this interface; the
+// Scheduler provides a concrete implementation (its non-blocking, coalescing
+// Wake). Services must never depend on the scheduler package directly.
+//
+// Wake is fired only AFTER the relevant state has been persisted (so a rescan
+// is meaningful), is non-blocking and coalescing (a hint, not a poll), and its
+// absence never breaks correctness: the Scheduler re-reads SQLite on every
+// normal cycle anyway.
+type Rescheduler interface {
+	Wake()
+}

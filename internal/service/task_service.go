@@ -42,22 +42,39 @@ type UpdateTaskParams struct {
 // It depends only on domain interfaces; it never touches concrete storage
 // (e.g. SQLite), keeping the service testable and storage-agnostic.
 type TaskService struct {
-	tasks    domain.TaskRepository
-	triggers domain.TriggerRepository
-	events   domain.EventStore
-	now      func() time.Time
-	newID    func() string
+	tasks       domain.TaskRepository
+	triggers    domain.TriggerRepository
+	events      domain.EventStore
+	now         func() time.Time
+	newID       func() string
+	rescheduler domain.Rescheduler
+}
+
+// TaskOption configures a TaskService (dependency injection for testing and the
+// optional Scheduler hint).
+type TaskOption func(*TaskService)
+
+// WithTaskRescheduler wires the optional inbound port that hints the Scheduler to
+// rescan after a persisted change that may move a deadline (e.g. a DueAt change).
+// It is optional: without it the service still works (the Scheduler re-reads
+// SQLite on its next normal cycle); Wake only accelerates re-evaluation.
+func WithTaskRescheduler(r domain.Rescheduler) TaskOption {
+	return func(s *TaskService) { s.rescheduler = r }
 }
 
 // NewTaskService builds a TaskService with production defaults.
-func NewTaskService(tasks domain.TaskRepository, triggers domain.TriggerRepository, events domain.EventStore) *TaskService {
-	return &TaskService{
+func NewTaskService(tasks domain.TaskRepository, triggers domain.TriggerRepository, events domain.EventStore, opts ...TaskOption) *TaskService {
+	s := &TaskService{
 		tasks:    tasks,
 		triggers: triggers,
 		events:   events,
 		now:      time.Now,
 		newID:    newLocalID,
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Create creates a new pending task, persists it and emits task.created.
@@ -129,6 +146,10 @@ func (s *TaskService) Update(ctx context.Context, id string, p UpdateTaskParams)
 	// V1 (clearing is unsupported), so a non-nil param always means a change.
 	if p.DueAt != nil {
 		_ = s.triggers.ClearDerivedNextFireAt(ctx, task.ID)
+		// A DueAt change may move the effective next deadline, so hint the Scheduler
+		// to rescan — but only AFTER the task update and trigger invalidation are
+		// persisted, so the rescan sees the committed write.
+		s.wake()
 	}
 
 	s.emit(ctx, domain.EventTaskUpdated, task.ID)
@@ -188,4 +209,12 @@ func (s *TaskService) emit(ctx context.Context, eventType domain.EventType, task
 		Payload:   map[string]any{"task_id": taskID},
 		CreatedAt: s.now().UTC(),
 	})
+}
+
+// wake hints the Scheduler to rescan. It is a no-op when no Rescheduler is wired
+// (the Scheduler re-reads SQLite on its next normal cycle regardless).
+func (s *TaskService) wake() {
+	if s.rescheduler != nil {
+		s.rescheduler.Wake()
+	}
 }

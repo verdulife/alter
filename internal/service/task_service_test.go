@@ -389,6 +389,65 @@ func TestUpdateWithoutDueAtKeepsNextFireAt(t *testing.T) {
 	}
 }
 
+func TestTaskUpdateDueAtWakesScheduler(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	trigRepo := newFakeTriggerRepo()
+	events := newFakeEventStore()
+	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
+	resched := &fakeRescheduler{}
+	svc := &TaskService{
+		tasks:       tasks,
+		triggers:    trigRepo,
+		events:      events,
+		now:         clk.now,
+		newID:       func() string { return "id-1" },
+		rescheduler: resched,
+	}
+
+	task, err := svc.Create(context.Background(), CreateTaskParams{Title: "t"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	newDue := time.Date(2024, 1, 5, 20, 0, 0, 0, time.UTC)
+	if _, err := svc.Update(context.Background(), task.ID, UpdateTaskParams{DueAt: &newDue}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if resched.count() != 1 {
+		t.Errorf("DueAt change should Wake the Scheduler once, got %d", resched.count())
+	}
+}
+
+func TestTaskUpdateWithoutDueAtDoesNotWakeScheduler(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	trigRepo := newFakeTriggerRepo()
+	events := newFakeEventStore()
+	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
+	resched := &fakeRescheduler{}
+	svc := &TaskService{
+		tasks:       tasks,
+		triggers:    trigRepo,
+		events:      events,
+		now:         clk.now,
+		newID:       func() string { return "id-1" },
+		rescheduler: resched,
+	}
+
+	task, err := svc.Create(context.Background(), CreateTaskParams{Title: "t"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := svc.Update(context.Background(), task.ID, UpdateTaskParams{Title: ptr("renamed")}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if resched.count() != 0 {
+		t.Errorf("update without DueAt change should not Wake, got %d", resched.count())
+	}
+}
+
 // --- Helpers --------------------------------------------------------------
 
 func ptr[T any](v T) *T { return &v }

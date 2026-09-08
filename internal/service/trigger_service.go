@@ -39,25 +39,43 @@ type UpdateTriggerParams struct {
 // TriggerService encapsulates application operations over domain.Trigger.
 // It depends only on domain interfaces; it never touches concrete storage.
 type TriggerService struct {
-	triggers domain.TriggerRepository
-	tasks    domain.TaskRepository
-	now      func() time.Time
-	newID    func() string
+	triggers    domain.TriggerRepository
+	tasks       domain.TaskRepository
+	now         func() time.Time
+	newID       func() string
+	rescheduler domain.Rescheduler
+}
+
+// TriggerOption configures a TriggerService (dependency injection for testing
+// and the optional Scheduler hint).
+type TriggerOption func(*TriggerService)
+
+// WithTriggerRescheduler wires the optional inbound port that hints the Scheduler
+// to rescan after a persisted trigger change. It is optional: without it the
+// service still works (the Scheduler re-reads SQLite on its next normal cycle);
+// Wake only accelerates re-evaluation.
+func WithTriggerRescheduler(r domain.Rescheduler) TriggerOption {
+	return func(s *TriggerService) { s.rescheduler = r }
 }
 
 // NewTriggerService builds a TriggerService with production defaults.
-func NewTriggerService(triggers domain.TriggerRepository, tasks domain.TaskRepository) *TriggerService {
-	return &TriggerService{
+func NewTriggerService(triggers domain.TriggerRepository, tasks domain.TaskRepository, opts ...TriggerOption) *TriggerService {
+	s := &TriggerService{
 		triggers: triggers,
 		tasks:    tasks,
 		now:      time.Now,
 		newID:    newLocalID,
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Create validates that the referenced task exists, then persists a new
 // trigger with an explicitly provided Enabled flag and a service-assigned
-// CreatedAt.
+// CreatedAt. A newly created (and enabled) trigger may be immediately due, so it
+// hints the Scheduler to rescan after the write is persisted.
 func (s *TriggerService) Create(ctx context.Context, p CreateTriggerParams) (domain.Trigger, error) {
 	if _, err := s.tasks.GetByID(ctx, p.TaskID); err != nil {
 		return domain.Trigger{}, fmt.Errorf("%w: %s", ErrTriggerTaskNotFound, p.TaskID)
@@ -75,6 +93,7 @@ func (s *TriggerService) Create(ctx context.Context, p CreateTriggerParams) (dom
 	if err := s.triggers.Create(ctx, trigger); err != nil {
 		return domain.Trigger{}, err
 	}
+	s.wake()
 	return trigger, nil
 }
 
@@ -89,24 +108,45 @@ func (s *TriggerService) GetByTaskID(ctx context.Context, taskID string) ([]doma
 }
 
 // Update applies optional Type/Value changes to an existing trigger and
-// persists it. Enabled, TaskID, NextFireAt, LastFiredAt and CreatedAt are left
-// untouched: the service fetches the full trigger and re-saves it unchanged
-// except for the requested fields, so execution bookkeeping is preserved.
+// persists it. Enabled, TaskID and CreatedAt are left untouched. NextFireAt is a
+// value derived from Type/Value/Task.DueAt, so changing Type and/or Value
+// invalidates it (set to nil) — the Scheduler recomputes it later via
+// CalculateNextFireAt. LastFiredAt is preserved (it records an actual past run,
+// independent of scheduling).
 func (s *TriggerService) Update(ctx context.Context, id string, p UpdateTriggerParams) (domain.Trigger, error) {
 	trigger, err := s.triggers.GetByID(ctx, id)
 	if err != nil {
 		return domain.Trigger{}, err
 	}
 
+	changed := false
 	if p.Type != nil {
 		trigger.Type = *p.Type
+		changed = true
 	}
 	if p.Value != nil {
 		trigger.Value = *p.Value
+		changed = true
+	}
+
+	if changed {
+		// Type/Value changed => the cached NextFireAt is stale (it was derived from
+		// the old Type/Value/DueAt). Invalidate it so the Scheduler re-arms from the
+		// new inputs. A pending RetryAt is stale too: it belonged to the old
+		// scheduling (a failed action on the old deadline) and must NOT carry over to
+		// the new one, or the retry could fire before the re-armed deadine. LastFiredAt
+		// and Enabled are preserved.
+		trigger.NextFireAt = nil
+		trigger.RetryAt = nil
 	}
 
 	if err := s.triggers.Update(ctx, trigger); err != nil {
 		return domain.Trigger{}, err
+	}
+	if changed {
+		// A Type/Value change may move the effective next deadline (earlier or
+		// later), so hint the Scheduler to rescan after the write is persisted.
+		s.wake()
 	}
 	return trigger, nil
 }
@@ -116,7 +156,8 @@ func (s *TriggerService) Update(ctx context.Context, id string, p UpdateTriggerP
 // for the fields they change. They are only recomputed by the future
 // Scheduler upon firing.
 
-// Enable sets Enabled to true and persists.
+// Enable sets Enabled to true and persists. Enabling may make an unarmed trigger
+// schedulable again, so it hints the Scheduler to rescan after the write.
 func (s *TriggerService) Enable(ctx context.Context, id string) (domain.Trigger, error) {
 	trigger, err := s.triggers.GetByID(ctx, id)
 	if err != nil {
@@ -127,10 +168,12 @@ func (s *TriggerService) Enable(ctx context.Context, id string) (domain.Trigger,
 	if err := s.triggers.Update(ctx, trigger); err != nil {
 		return domain.Trigger{}, err
 	}
+	s.wake()
 	return trigger, nil
 }
 
-// Disable sets Enabled to false and persists.
+// Disable sets Enabled to false and persists. Disabling may remove a trigger from
+// the active set, so it hints the Scheduler to rescan after the write.
 func (s *TriggerService) Disable(ctx context.Context, id string) (domain.Trigger, error) {
 	trigger, err := s.triggers.GetByID(ctx, id)
 	if err != nil {
@@ -141,10 +184,24 @@ func (s *TriggerService) Disable(ctx context.Context, id string) (domain.Trigger
 	if err := s.triggers.Update(ctx, trigger); err != nil {
 		return domain.Trigger{}, err
 	}
+	s.wake()
 	return trigger, nil
 }
 
-// Delete removes a trigger by ID.
+// Delete removes a trigger by ID. Removing a trigger may change the next deadline,
+// so it hints the Scheduler to rescan after the write.
 func (s *TriggerService) Delete(ctx context.Context, id string) error {
-	return s.triggers.Delete(ctx, id)
+	if err := s.triggers.Delete(ctx, id); err != nil {
+		return err
+	}
+	s.wake()
+	return nil
+}
+
+// wake hints the Scheduler to rescan. It is a no-op when no Rescheduler is wired
+// (the Scheduler re-reads SQLite on its next normal cycle regardless).
+func (s *TriggerService) wake() {
+	if s.rescheduler != nil {
+		s.rescheduler.Wake()
+	}
 }

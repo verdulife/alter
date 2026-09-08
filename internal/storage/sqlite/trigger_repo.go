@@ -15,12 +15,12 @@ type TriggerRepository struct {
 
 var _ domain.TriggerRepository = (*TriggerRepository)(nil)
 
-const triggerCols = `id, task_id, type, value, enabled, next_fire_at, last_fired_at, created_at`
+const triggerCols = `id, task_id, type, value, enabled, next_fire_at, last_fired_at, retry_at, created_at`
 
 // Create inserts a new trigger.
 func (r *TriggerRepository) Create(ctx context.Context, trigger domain.Trigger) error {
 	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO triggers (`+triggerCols+`) VALUES (?,?,?,?,?,?,?,?)`,
+		`INSERT INTO triggers (`+triggerCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
 		trigger.ID,
 		trigger.TaskID,
 		string(trigger.Type),
@@ -28,6 +28,7 @@ func (r *TriggerRepository) Create(ctx context.Context, trigger domain.Trigger) 
 		boolToInt(trigger.Enabled),
 		nullableTime(trigger.NextFireAt),
 		nullableTime(trigger.LastFiredAt),
+		nullableTime(trigger.RetryAt),
 		formatTime(trigger.CreatedAt),
 	)
 	return err
@@ -65,7 +66,7 @@ func (r *TriggerRepository) Update(ctx context.Context, trigger domain.Trigger) 
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE triggers SET
 			task_id = ?, type = ?, value = ?, enabled = ?,
-			next_fire_at = ?, last_fired_at = ?
+			next_fire_at = ?, last_fired_at = ?, retry_at = ?
 		 WHERE id = ?`,
 		trigger.TaskID,
 		string(trigger.Type),
@@ -73,6 +74,7 @@ func (r *TriggerRepository) Update(ctx context.Context, trigger domain.Trigger) 
 		boolToInt(trigger.Enabled),
 		nullableTime(trigger.NextFireAt),
 		nullableTime(trigger.LastFiredAt),
+		nullableTime(trigger.RetryAt),
 		trigger.ID,
 	)
 	if err != nil {
@@ -108,9 +110,12 @@ func (r *TriggerRepository) Delete(ctx context.Context, id string) error {
 // triggers of a task, preserving LastFiredAt and Enabled. Used to invalidate
 // time-derived schedules when Task.DueAt changes; the Scheduler recalculates
 // them via CalculateNextFireAt. "at" triggers are absolute and left untouched.
+// A pending RetryAt is cleared too: it belonged to the old scheduling (a failed
+// action against the previous derived deadline) and must not be associated with
+// the newly derived scheduling.
 func (r *TriggerRepository) ClearDerivedNextFireAt(ctx context.Context, taskID string) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE triggers SET next_fire_at = NULL
+		`UPDATE triggers SET next_fire_at = NULL, retry_at = NULL
 		 WHERE task_id = ? AND type IN ('before_due','after_due')`,
 		taskID)
 	return err
@@ -151,10 +156,11 @@ func scanTrigger(s rowScanner) (domain.Trigger, error) {
 	var sCreated string
 	var nextFire sql.NullString
 	var lastFired sql.NullString
+	var retry sql.NullString
 
 	if err := s.Scan(
 		&t.ID, &t.TaskID, &sType, &t.Value, &enabled,
-		&nextFire, &lastFired, &sCreated,
+		&nextFire, &lastFired, &retry, &sCreated,
 	); err != nil {
 		return domain.Trigger{}, err
 	}
@@ -167,6 +173,9 @@ func scanTrigger(s rowScanner) (domain.Trigger, error) {
 		return domain.Trigger{}, err
 	}
 	if t.LastFiredAt, err = scanNullableTime(lastFired); err != nil {
+		return domain.Trigger{}, err
+	}
+	if t.RetryAt, err = scanNullableTime(retry); err != nil {
 		return domain.Trigger{}, err
 	}
 	if t.CreatedAt, err = scanTime(sCreated); err != nil {

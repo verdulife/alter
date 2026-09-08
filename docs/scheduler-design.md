@@ -1,11 +1,12 @@
 # Scheduler — Diseño (V1, one-shot)
 
-> Estado: **diseño aprobado, sin implementar**. Este documento es el contrato de referencia
-> para la implementación del Scheduler en `internal/scheduler/`.
+> Estado: **implementado (V1 one-shot)**. El Scheduler vive en `internal/scheduler/` y está
+> funcional; las secciones describen su comportamiento efectivo. Siguen fuera de V1 las partes
+> marcadas como futuras (Telegram, notificaciones, recurrencia, event bus).
 
 ## Contexto y premisas
 
-- SQLite es la **fuente de verdad**: `Trigger.NextFireAt`, `LastFiredAt`, `Enabled` se persisten
+- SQLite es la **fuente de verdad**: `Trigger.NextFireAt`, `LastFiredAt`, `RetryAt`, `Enabled` se persisten
   y `TriggerRepository.ListEnabled()` devuelve triggers habilitados.
 - `CalculateNextFireAt(...)` y `ExecuteTrigger(...)` son **funciones puras** de dominio.
 - V1 = triggers **one-shot**. No hay bus de eventos, no hay Telegram, no hay notificaciones aún.
@@ -50,8 +51,12 @@ Run(ctx):
     for t in due:
         handleOne(ctx, t)                     // error aislado por trigger
 
-    // FASE PLANIFICAR — siguiente deadline futuro
-    nextDeadline := min(NextFireAt) over (enabled with NextFireAt != nil && NextFireAt.After(now))
+    // FASE PLANIFICAR — siguiente deadline futuro, sobre los triggers aún enabled.
+    // Tras DISPARAR se relee ListEnabled si se persistió algún cambio. El deadline es el
+    // primer instante futuro entre NextFireAt y RetryAt: un RetryAt futuro despierta el loop
+    // exactamente cuando la reintento se vuelve elegible; un NextFireAt ya pasado queda
+    // excluido (fue tratado en DISPARAR o está retenido por un RetryAt pendiente).
+    nextDeadline := min(NextFireAt_futuro, RetryAt_futuro) over (enabled still-enabled)
 
     if nextDeadline existe:
         wait(nextDeadline)                    // select: timer / wake / ctx.Done
@@ -105,18 +110,20 @@ task := TaskRepository.GetByID(t.TaskID)        // si no existe → terminal (ve
 executed, err := ExecuteTrigger(t, task, now)   // pura; valida due/executable
 if err != nil: manejar según severidad (terminal vs transitoria); NO persistir
 
-err := action.Execute(ctx, executed, task)      // inyectada; HOY no existe
-if err != nil: log & skip; NO persistir (queda due → reintenta en el próximo ciclo)
+err := action.Execute(ctx, executed, task)      // inyectada
+if err != nil: log; NO consumir; persistir backoff RetryAt = now + actionRetryDelay
+    (deja LastFiredAt intacto; el trigger sigue due, pero el RetryAt lo retiene hasta que elapse)
 
-TriggerRepository.Update(ctx, executed)         // persiste LastFiredAt, NextFireAt=nil, Enabled=false
+TriggerRepository.Update(ctx, executed)         // persiste LastFiredAt, NextFireAt=nil, RetryAt=nil, Enabled=false
 EventStore.Save(ctx, EventTriggerFired{...})    // best-effort, nunca bloquea el fire
 // recalcular deadline al terminar de procesar todos los due
 ```
 
-- `LastFiredAt` / `NextFireAt` / `Enabled` se persisten **juntos en un único `Update`**
+- `LastFiredAt` / `NextFireAt` / `RetryAt` / `Enabled` se persisten **juntos en un único `Update`**
   con el `executed` devuelto por `ExecuteTrigger` (atómico a nivel de fila).
-- La persistencia ocurre **después** de la acción exitosa: si la acción falla, el trigger queda due
-  y **reintenta**; nunca se marca «disparado» sin haber notificado.
+- La persistencia ocurre **después** de la acción exitosa: si la acción falla, el trigger no se
+  consume; se persiste un backoff `RetryAt` (now + delay, por defecto 30s) que lo retiene hasta
+  que elapse y luego reintenta. Nunca se marca «disparado» sin haber notificado.
 
 ### Semántica at-least-once
 
@@ -129,7 +136,9 @@ EventStore.Save(ctx, EventTriggerFired{...})    // best-effort, nunca bloquea el
 
 ## Detección de triggers due
 
-- `due = Enabled && NextFireAt != nil && NextFireAt <= now` (frontera inclusiva, igual que `ExecuteTrigger`).
+- `due = Enabled && NextFireAt != nil && NextFireAt <= now && (RetryAt == nil || RetryAt <= now)`
+  (frontera inclusiva, igual que `ExecuteTrigger`; un `RetryAt` futuro **retiene** el disparo aunque
+  `NextFireAt` ya haya pasado, hasta que el backoff elapse).
 - **Múltiples triggers con el mismo `NextFireAt`** entran todos (filtro `<= now`).
 - **Overdues tras downtime** entran todos y se **procesan todos antes** de planificar.
 - El deadline se calcula después de vaciar el conjunto de due.
@@ -207,7 +216,7 @@ reintenta sin retirarlo. Solo errores `ctx`/DB catastróficos abortan el ciclo.
 | Task completado/cancelado | `ErrTaskNotExecutable` | **terminal** | **Deshabilitar** el trigger (persistir `Enabled=false`) |
 | Task inexistente (huérfano) | `TaskRepository.GetByID` not-found | **terminal** | **Deshabilitar** el trigger |
 | Trigger malformado | `CalculateNextFireAt` error | **terminal (reversible)** | No persistir `NextFireAt` → queda `nil`, sin busy-loop; corregible |
-| Acción futura falla | `TriggerAction.Execute` error | transitorio (reintentable) | Log & skip; **no persistir** → reintenta en el próximo ciclo |
+| Acción falla | `TriggerAction.Execute` error | transitorio (reintentable) | **No consumir**; persistir `RetryAt = now + actionRetryDelay` (backoff). El trigger sigue due pero queda retenido hasta que elapse; reintenta entonces. |
 
 **Por qué terminales no provocan busy-loop:**
 
@@ -248,9 +257,18 @@ Solo errores transitorios (ej. DB) se re-intentan; un fallo de DB transitorio no
    Task↔Trigger queda fuera de V1**; la ventana de incoherencia se autodisuelve cuando el
    Scheduler relee SQLite (la fuente de verdad converge al siguiente ciclo).
 
+    3. **Error de `ListEnabled`: no se reanuda solo**: ante un error persistente de `ListEnabled`
+       (p. ej. `database is locked`) el ciclo aborta y `Run` espera solo en `Wake()` o `ctx.Done()`
+       (sin busy-loop). Una **recuperación espontánea de un error transitorio de DB, sin un
+       `Wake()` posterior, no reanuda el scheduler por sí sola**. Es una concesión conocida y
+       deliberada de V1: no se introduce retry periódico ni timer artificial para recuperar
+       errores de DB. Un `Wake()` de un servicio de escritura, o un reinicio del proceso, reanuda el ciclo.
+
 ---
 
 ## Fuera de alcance del Scheduler V1
 
-Loop, goroutines adicionales, timers múltiples, polling, Telegram, notificaciones, event bus,
-recurrencia, IA, nuevas dependencias. No se implementa nada de este documento todavía.
+Timers múltiples, polling, Telegram, notificaciones, event bus, recurrencia, IA, nuevas
+dependencias. El núcleo V1 descrito arriba (ARMAR → DISPARAR → PLANIFICAR, `RetryAt`, `Wake()`,
+at-least-once, shutdown limpio) **está implementado** en `internal/scheduler/`; lo marcado como
+«futuro» en este documento permanece fuera de V1.

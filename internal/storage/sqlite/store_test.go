@@ -312,6 +312,75 @@ func TestTriggerFireStateReopen(t *testing.T) {
 	}
 }
 
+// TestTriggerRetryAtPersist verifies RetryAt round-trips through Create/GetByID,
+// is preserved across Update (unless explicitly changed), and survives a
+// close/reopen (i.e. a process restart) independently of NextFireAt.
+func TestTriggerRetryAtPersist(t *testing.T) {
+	ctx := context.Background()
+
+	// Round-trip through Create then GetByID/GetByTaskID on an in-memory store.
+	store := openTestStore(t)
+	seedTriggerTask(t, store, "task-1")
+	repo := store.NewTriggerRepository()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	next := now.Add(2 * time.Hour)
+	retry := now.Add(time.Minute)
+	tr := domain.Trigger{
+		ID: "trg-1", TaskID: "task-1", Type: domain.TriggerTypeAt,
+		Value: "x", Enabled: true, NextFireAt: &next, RetryAt: &retry, CreatedAt: now,
+	}
+	if err := repo.Create(ctx, tr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := repo.GetByID(ctx, "trg-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.RetryAt == nil || !got.RetryAt.Equal(retry) {
+		t.Errorf("retry_at mismatch: %v want %v", got.RetryAt, retry)
+	}
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(next) {
+		t.Errorf("next_fire_at must be independent: %v want %v", got.NextFireAt, next)
+	}
+
+	// GetByTaskID must recover RetryAt too.
+	byTask, err := repo.GetByTaskID(ctx, "task-1")
+	if err != nil || len(byTask) != 1 || byTask[0].RetryAt == nil || !byTask[0].RetryAt.Equal(retry) {
+		t.Errorf("get by task retry_at mismatch: %+v err=%v", byTask, err)
+	}
+
+	// Update preserving RetryAt (e.g. a service re-save).
+	tr.Value = "y"
+	if err := repo.Update(ctx, tr); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got2, _ := repo.GetByID(ctx, "trg-1")
+	if got2.RetryAt == nil || !got2.RetryAt.Equal(retry) {
+		t.Errorf("retry_at must be preserved on Update, got %v", got2.RetryAt)
+	}
+
+	// Reopen (process restart) must recover the persisted RetryAt.
+	reopenStore, err := Open(filepath.Join(t.TempDir(), "restart.db"))
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopenStore.Close()
+	seedTriggerTask(t, reopenStore, "task-1")
+	repo2 := reopenStore.NewTriggerRepository()
+	if err := repo2.Create(ctx, tr); err != nil {
+		t.Fatalf("create on reopen store: %v", err)
+	}
+	reopened, err := repo2.GetByID(ctx, "trg-1")
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	if reopened.RetryAt == nil || !reopened.RetryAt.Equal(retry) {
+		t.Errorf("retry_at must survive restart: %v want %v", reopened.RetryAt, retry)
+	}
+}
+
+
 // TestTriggerClearDerivedNextFireAt verifies that changing a task's due date
 // invalidates only its time-derived triggers' NextFireAt, preserving LastFiredAt,
 // Enabled, and absolute "at" triggers.
@@ -324,12 +393,13 @@ func TestTriggerClearDerivedNextFireAt(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	next := now.Add(24 * time.Hour)
 	last := now.Add(-time.Hour)
+	retry := now.Add(time.Minute)
 
 	trigs := []domain.Trigger{
 		{ID: "trg-before", TaskID: "task-1", Type: domain.TriggerTypeBeforeDue,
-			Value: "24h", Enabled: true, NextFireAt: &next, LastFiredAt: &last, CreatedAt: now},
+			Value: "24h", Enabled: true, NextFireAt: &next, LastFiredAt: &last, RetryAt: &retry, CreatedAt: now},
 		{ID: "trg-after", TaskID: "task-1", Type: domain.TriggerTypeAfterDue,
-			Value: "1h", Enabled: true, NextFireAt: &next, CreatedAt: now},
+			Value: "1h", Enabled: true, NextFireAt: &next, RetryAt: &retry, CreatedAt: now},
 		{ID: "trg-at", TaskID: "task-1", Type: domain.TriggerTypeAt,
 			Value: "2099-01-01T00:00:00Z", Enabled: true, NextFireAt: &next, CreatedAt: now},
 	}
@@ -343,13 +413,17 @@ func TestTriggerClearDerivedNextFireAt(t *testing.T) {
 		t.Fatalf("clear: %v", err)
 	}
 
-	// Derived triggers: NextFireAt nil, LastFiredAt/Enabled preserved.
+	// Derived triggers: NextFireAt and the stale RetryAt nil, LastFiredAt/Enabled
+	// preserved.
 	before, err := repo.GetByID(ctx, "trg-before")
 	if err != nil {
 		t.Fatalf("get before: %v", err)
 	}
 	if before.NextFireAt != nil {
 		t.Errorf("before_due NextFireAt should be nil, got %v", before.NextFireAt)
+	}
+	if before.RetryAt != nil {
+		t.Errorf("before_due stale RetryAt should be nil, got %v", before.RetryAt)
 	}
 	if before.LastFiredAt == nil || !before.LastFiredAt.Equal(last) {
 		t.Errorf("before_due LastFiredAt should be preserved, got %v", before.LastFiredAt)
@@ -364,6 +438,9 @@ func TestTriggerClearDerivedNextFireAt(t *testing.T) {
 	}
 	if after.NextFireAt != nil {
 		t.Errorf("after_due NextFireAt should be nil, got %v", after.NextFireAt)
+	}
+	if after.RetryAt != nil {
+		t.Errorf("after_due stale RetryAt should be nil, got %v", after.RetryAt)
 	}
 
 	// Absolute "at" trigger untouched.
@@ -401,7 +478,7 @@ func TestMigrationsApplyFromScratch(t *testing.T) {
 		versions = append(versions, v)
 	}
 
-	want := []string{"0001_init.sql", "0002_trigger_fire_state.sql"}
+	want := []string{"0001_init.sql", "0002_trigger_fire_state.sql", "0003_trigger_retry_at.sql"}
 	if len(versions) != len(want) {
 		t.Fatalf("expected %d migrations, got %v", len(want), versions)
 	}

@@ -35,6 +35,7 @@ var (
 //   - LastFiredAt = executedAt
 //   - NextFireAt  = nil (one-shot, never re-fires)
 //   - Enabled     = false
+//   - RetryAt     = nil (clears any pending action-retry backoff)
 //
 // Recurring triggers are out of scope for V1.
 func ExecuteTrigger(trigger Trigger, task Task, executedAt time.Time) (Trigger, error) {
@@ -56,5 +57,6 @@ func ExecuteTrigger(trigger Trigger, task Task, executedAt time.Time) (Trigger, 
 	executed.LastFiredAt = &executedAt
 	executed.NextFireAt = nil
 	executed.Enabled = false
+	executed.RetryAt = nil // a successful fire clears any pending action-retry backoff
 	return executed, nil
 }

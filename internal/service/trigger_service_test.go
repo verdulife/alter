@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,6 +63,7 @@ func (f *fakeTriggerRepo) ClearDerivedNextFireAt(_ context.Context, taskID strin
 	for id, tr := range f.triggers {
 		if tr.TaskID == taskID && (tr.Type == domain.TriggerTypeBeforeDue || tr.Type == domain.TriggerTypeAfterDue) {
 			tr.NextFireAt = nil
+			tr.RetryAt = nil
 			f.triggers[id] = tr
 		}
 	}
@@ -84,6 +86,25 @@ func (f *fakeTriggerRepo) setFireState(id string, next, last *time.Time) {
 	tr.NextFireAt = next
 	tr.LastFiredAt = last
 	f.triggers[id] = tr
+}
+
+// fakeRescheduler records Wake hints so tests can assert when a service asks the
+// Scheduler to rescan. It is a recording domain.Rescheduler.
+type fakeRescheduler struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeRescheduler) Wake() {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+}
+
+func (f *fakeRescheduler) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // newTriggerHarness wires a TriggerService with fakes and a controllable clock.
@@ -305,12 +326,12 @@ func TestTriggerDelete(t *testing.T) {
 	}
 }
 
-func TestTriggerUpdatePreservesFireState(t *testing.T) {
+func TestTriggerUpdatePreservesLastFiredAndInvalidatesNextFireAtOnValueChange(t *testing.T) {
 	svc, repo, tasks, _ := newTriggerHarness()
 	seedTask(t, tasks, "task-1")
 
 	created, err := svc.Create(context.Background(), CreateTriggerParams{
-		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x",
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -326,11 +347,368 @@ func TestTriggerUpdatePreservesFireState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if got.NextFireAt == nil || !got.NextFireAt.Equal(next) {
-		t.Errorf("NextFireAt not preserved: %v want %v", got.NextFireAt, next)
+	// NextFireAt is derived from Type/Value/DueAt: a Value change invalidates it.
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt must be invalidated (nil) on Value change, got %v", got.NextFireAt)
 	}
+	// LastFiredAt records an actual past run and must be preserved.
 	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(last) {
 		t.Errorf("LastFiredAt not preserved: %v want %v", got.LastFiredAt, last)
+	}
+	if !got.Enabled {
+		t.Error("Enabled must be preserved")
+	}
+}
+
+func TestTriggerUpdateNoScheduleChangeKeepsFireState(t *testing.T) {
+	// When neither Type nor Value change, NextFireAt must be preserved untouched.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	next := time.Now().UTC().Add(time.Hour)
+	last := time.Now().UTC().Add(-time.Hour)
+	repo.setFireState(created.ID, &next, &last)
+
+	// No fields that affect scheduling change.
+	got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(next) {
+		t.Errorf("NextFireAt must be preserved when nothing changes, got %v", got.NextFireAt)
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(last) {
+		t.Errorf("LastFiredAt not preserved, got %v", got.LastFiredAt)
+	}
+	if !got.Enabled {
+		t.Error("Enabled must be preserved")
+	}
+}
+
+func TestTriggerUpdateAtValueChangeInvalidatesNextFireAt(t *testing.T) {
+	// \"at 20:00 -> 22:00\" and \"at 20:00 -> 18:00\": both are Value changes on an
+	// absolute \"at\" trigger and must invalidate the cached NextFireAt.
+	for _, newValue := range []string{"2024-04-02T22:00:00Z", "2024-04-02T18:00:00Z"} {
+		t.Run("value="+newValue, func(t *testing.T) {
+			svc, repo, tasks, _ := newTriggerHarness()
+			seedTask(t, tasks, "task-1")
+
+			created, err := svc.Create(context.Background(), CreateTriggerParams{
+				TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "2024-04-02T20:00:00Z", Enabled: true,
+			})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			stale := time.Date(2024, 4, 2, 20, 0, 0, 0, time.UTC)
+			repo.setFireState(created.ID, &stale, nil)
+
+			got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{Value: ptr(newValue)})
+			if err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			if got.NextFireAt != nil {
+				t.Errorf("NextFireAt must be nil after Value change, got %v", got.NextFireAt)
+			}
+			if got.Value != newValue {
+				t.Errorf("Value not applied: got %q want %q", got.Value, newValue)
+			}
+		})
+	}
+}
+
+func TestTriggerUpdateBeforeDueValueChangeInvalidatesNextFireAt(t *testing.T) {
+	// \"before_due 24h -> 1h\": a Value change on a derived trigger must invalidate
+	// the cached NextFireAt so the Scheduler recomputes it from the new duration.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeBeforeDue, Value: "24h", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	stale := time.Date(2024, 4, 2, 20, 0, 0, 0, time.UTC)
+	repo.setFireState(created.ID, &stale, nil)
+
+	got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{Value: ptr("1h")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt must be nil after Value change, got %v", got.NextFireAt)
+	}
+}
+
+func TestTriggerUpdateTypeChangeInvalidatesNextFireAt(t *testing.T) {
+	// \"before_due -> after_due\": a Type change invalidates the cached NextFireAt.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeBeforeDue, Value: "24h", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	stale := time.Date(2024, 4, 2, 20, 0, 0, 0, time.UTC)
+	last := time.Date(2024, 4, 1, 9, 0, 0, 0, time.UTC)
+	repo.setFireState(created.ID, &stale, &last)
+
+	got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{Type: ptr(domain.TriggerTypeAfterDue)})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt must be nil after Type change, got %v", got.NextFireAt)
+	}
+	if got.Type != domain.TriggerTypeAfterDue {
+		t.Errorf("Type not applied: got %q", got.Type)
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(last) {
+		t.Errorf("LastFiredAt must be preserved on Type change, got %v", got.LastFiredAt)
+	}
+}
+
+func TestTriggerUpdateTypeAndValueChangeInvalidatesNextFireAt(t *testing.T) {
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "2024-04-02T20:00:00Z", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	stale := time.Date(2024, 4, 2, 20, 0, 0, 0, time.UTC)
+	repo.setFireState(created.ID, &stale, nil)
+
+	got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{
+		Type:  ptr(domain.TriggerTypeBeforeDue),
+		Value: ptr("30m"),
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt must be nil after Type+Value change, got %v", got.NextFireAt)
+	}
+	if got.Type != domain.TriggerTypeBeforeDue || got.Value != "30m" {
+		t.Errorf("Type/Value not applied: %+v", got)
+	}
+}
+
+// --- Wake del Scheduler (Rescheduler) --------------------------------------
+
+func TestTriggerCreateWakesScheduler(t *testing.T) {
+	svc, _, tasks, _ := newTriggerHarness()
+	resched := &fakeRescheduler{}
+	svc.rescheduler = resched
+	seedTask(t, tasks, "task-1")
+
+	if _, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if resched.count() != 1 {
+		t.Errorf("Create should Wake the Scheduler once, got %d", resched.count())
+	}
+}
+
+func TestTriggerUpdateWakesSchedulerOnScheduleChange(t *testing.T) {
+	svc, _, tasks, _ := newTriggerHarness()
+	resched := &fakeRescheduler{}
+	svc.rescheduler = resched
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// An update that changes Type/Value must Wake.
+	if _, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{Value: ptr("y")}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if resched.count() != 2 { // 1 from Create + 1 from Update
+		t.Errorf("Update (schedule change) should Wake, total got %d", resched.count())
+	}
+}
+
+func TestTriggerUpdateNoScheduleChangeDoesNotWake(t *testing.T) {
+	svc, _, tasks, _ := newTriggerHarness()
+	resched := &fakeRescheduler{}
+	svc.rescheduler = resched
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// No Type/Value change: no Wake.
+	if _, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if resched.count() != 1 { // only the Create woke it
+		t.Errorf("Update without schedule change should not Wake, got %d", resched.count())
+	}
+}
+
+func TestTriggerEnableDisableDeleteWakeScheduler(t *testing.T) {
+	svc, _, tasks, _ := newTriggerHarness()
+	resched := &fakeRescheduler{}
+	svc.rescheduler = resched
+	seedTask(t, tasks, "task-1")
+
+	created, _ := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	})
+
+	if _, err := svc.Enable(context.Background(), created.ID); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if _, err := svc.Disable(context.Background(), created.ID); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if err := svc.Delete(context.Background(), created.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if resched.count() != 4 { // Create + Enable + Disable + Delete
+		t.Errorf("Create/Enable/Disable/Delete should each Wake, got %d", resched.count())
+	}
+}
+
+func TestTriggerServicePreservesRetryAtOnEnableDisable(t *testing.T) {
+	// RetryAt is operational state. Enable/Disable do NOT change scheduling, so like
+	// LastFiredAt it must survive them. Only a scheduling change or a successful
+	// fire clears it.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeBeforeDue, Value: "24h", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	retry := time.Now().UTC().Add(30 * time.Second)
+	tr := repo.triggers[created.ID]
+	tr.RetryAt = &retry
+	repo.triggers[created.ID] = tr
+
+	enabled, err := svc.Enable(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if enabled.RetryAt == nil || !enabled.RetryAt.Equal(retry) {
+		t.Errorf("RetryAt must be preserved on Enable, got %v", enabled.RetryAt)
+	}
+
+	disabled, err := svc.Disable(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if disabled.RetryAt == nil || !disabled.RetryAt.Equal(retry) {
+		t.Errorf("RetryAt must be preserved on Disable, got %v", disabled.RetryAt)
+	}
+}
+
+func TestTriggerServiceRetryAtNotAssociatedAfterScheduleChange(t *testing.T) {
+	// Precision: when scheduling changes (Type/Value invalidation), a pending
+	// RetryAt from the OLD scheduling must be cleared so it cannot fire against the
+	// newly re-armed deadline. LastFiredAt (a historical record) is preserved.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	created, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID: "task-1", Type: domain.TriggerTypeAt, Value: "x", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	retry := time.Now().UTC().Add(30 * time.Second)
+	stale := time.Now().UTC().Add(-time.Hour)
+	repo.setFireState(created.ID, &stale, &stale)
+	tr := repo.triggers[created.ID]
+	tr.RetryAt = &retry
+	repo.triggers[created.ID] = tr
+
+	// Value change (scheduling change): RetryAt and NextFireAt are cleared.
+	got, err := svc.Update(context.Background(), created.ID, UpdateTriggerParams{Value: ptr("y")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be cleared on scheduling change, got %v", got.RetryAt)
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("NextFireAt must be nil on scheduling change, got %v", got.NextFireAt)
+	}
+	if got.LastFiredAt == nil {
+		t.Error("LastFiredAt (historical) must be preserved on scheduling change")
+	}
+	if !got.Enabled {
+		t.Error("Enabled must be preserved on scheduling change")
+	}
+}
+
+func TestTaskUpdateDueAtClearsRetryAtOfDerivedTriggers(t *testing.T) {
+	// Precision: a DueAt change recalcs derived NextFireAt; the stale RetryAt of a
+	// derived trigger must not survive into the new scheduling.
+	tasks := newFakeTaskRepo()
+	trigRepo := newFakeTriggerRepo()
+	clk := &clock{t: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)}
+	svc := &TaskService{
+		tasks:    tasks,
+		triggers: trigRepo,
+		events:   newFakeEventStore(),
+		now:      clk.now,
+		newID:    func() string { return "id-1" },
+	}
+
+	due := time.Date(2024, 1, 5, 20, 0, 0, 0, time.UTC)
+	task, err := svc.Create(context.Background(), CreateTaskParams{Title: "t", DueAt: &due})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	stale := time.Date(2024, 1, 4, 20, 0, 0, 0, time.UTC)
+	retry := time.Date(2024, 1, 4, 20, 0, 30, 0, time.UTC)
+	trigRepo.triggers["trg-1"] = domain.Trigger{
+		ID: "trg-1", TaskID: task.ID, Type: domain.TriggerTypeBeforeDue,
+		Value: "24h", Enabled: true, NextFireAt: &stale, RetryAt: &retry,
+	}
+
+	newDue := time.Date(2024, 1, 6, 20, 0, 0, 0, time.UTC)
+	if _, err := svc.Update(context.Background(), task.ID, UpdateTaskParams{DueAt: &newDue}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got := trigRepo.triggers["trg-1"]
+	if got.NextFireAt != nil {
+		t.Errorf("derived NextFireAt must be nil after DueAt change, got %v", got.NextFireAt)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("stale RetryAt must be cleared on DueAt change, got %v", got.RetryAt)
+	}
+	if !got.Enabled {
+		t.Error("derived trigger must remain enabled")
 	}
 }
 

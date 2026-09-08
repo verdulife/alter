@@ -14,16 +14,22 @@ const (
 
 // Trigger represents a scheduled activation associated with a task.
 //
-// NextFireAt and LastFiredAt are execution bookkeeping used by a future
-// Scheduler; they may both be nil. NextFireAt is when the trigger should next
-// run, LastFiredAt records the last time it actually ran.
+// NextFireAt, LastFiredAt and RetryAt are execution bookkeeping used by the
+// Scheduler; they may all be nil.
+//   - NextFireAt is the derived scheduling deadline (from Type/Value/Task.DueAt),
+//     nil when not yet computed.
+//   - LastFiredAt records the last time the trigger actually fired.
+//   - RetryAt is transient operational state: it is set when a due trigger's
+//     TriggerAction failed, and holds the earliest time the retry becomes
+//     eligible. It is unrelated to the derived deadline.
 type Trigger struct {
 	ID          string
 	TaskID      string
 	Type        TriggerType
 	Value       string      // Encoded value: ISO timestamp for "at", duration string for before/after
 	Enabled     bool
-	NextFireAt  *time.Time  // Next scheduled run (nil when not yet computed)
+	NextFireAt  *time.Time  // Derived scheduling deadline (nil when not yet computed)
 	LastFiredAt *time.Time  // Last actual run (nil when never fired)
+	RetryAt     *time.Time  // Action-retry backoff deadline (nil when no retry pending)
 	CreatedAt   time.Time
 }
