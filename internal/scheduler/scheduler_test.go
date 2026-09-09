@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -1020,4 +1021,55 @@ func (a *failOnceSuccessAction) count() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.calls
+}
+
+// permanentAction returns an error permanently wrapped with domain.ErrActionPermanent,
+// modelling a non-retryable action (auth/billing/invalid request/quota).
+type permanentAction struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (a *permanentAction) Execute(context.Context, domain.Trigger, domain.Task) error {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	return fmt.Errorf("action permanently failed: %w", domain.ErrActionPermanent)
+}
+
+func (a *permanentAction) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+// A permanently-failing action must retire the trigger (Enabled=false) and must
+// NOT set a RetryAt backoff (retrying is useless) nor record a fired event.
+func TestPermanentActionRetiresTrigger(t *testing.T) {
+	action := &permanentAction{}
+	s, trig, tasks, events := newHarness(t, action)
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeAt, Enabled: true, NextFireAt: &fixedNow})
+	tasks.seed(dueTask("t"))
+
+	mustTick(t, s)
+
+	got, ok := trig.get("a")
+	if !ok {
+		t.Fatal("trigger should still exist (retired, not deleted)")
+	}
+	if got.Enabled {
+		t.Error("permanently-failed action must retire the trigger (Enabled=false)")
+	}
+	if got.RetryAt != nil {
+		t.Errorf("permanent failure must NOT set a RetryAt backoff, got %v", got.RetryAt)
+	}
+	if got.LastFiredAt != nil {
+		t.Errorf("permanent failure must not record LastFiredAt, got %v", got.LastFiredAt)
+	}
+	if action.count() != 1 {
+		t.Errorf("permanent action should be attempted once, got %d", action.count())
+	}
+	if len(events.fired()) != 0 {
+		t.Errorf("no fired event expected on permanent failure, got %d", len(events.fired()))
+	}
 }

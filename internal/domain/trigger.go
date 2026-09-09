@@ -6,10 +6,10 @@ import "time"
 type TriggerType string
 
 const (
-	TriggerTypeAt            TriggerType = "at"             // Fires at a specific datetime
-	TriggerTypeBeforeDue     TriggerType = "before_due"     // Fires N duration before DueAt
-	TriggerTypeAfterDue      TriggerType = "after_due"      // Fires N duration after DueAt
-	TriggerTypeCustom        TriggerType = "custom"         // Reserved for future use
+	TriggerTypeAt        TriggerType = "at"         // Fires at a specific datetime
+	TriggerTypeBeforeDue TriggerType = "before_due" // Fires N duration before DueAt
+	TriggerTypeAfterDue  TriggerType = "after_due"  // Fires N duration after DueAt
+	TriggerTypeCustom    TriggerType = "custom"     // Reserved for future use
 )
 
 // Trigger represents a scheduled activation associated with a task.
@@ -26,10 +26,10 @@ type Trigger struct {
 	ID          string
 	TaskID      string
 	Type        TriggerType
-	Value       string      // Encoded value: ISO timestamp for "at", duration string for before/after
+	Value       string // Encoded value: ISO timestamp for "at", duration string for before/after
 	Enabled     bool
-	NextFireAt  *time.Time  // Derived scheduling deadline (nil when not yet computed)
-	LastFiredAt *time.Time  // Last actual run (nil when never fired)
-	RetryAt     *time.Time  // Action-retry backoff deadline (nil when no retry pending)
+	NextFireAt  *time.Time // Derived scheduling deadline (nil when not yet computed)
+	LastFiredAt *time.Time // Last actual run (nil when never fired)
+	RetryAt     *time.Time // Action-retry backoff deadline (nil when no retry pending)
 	CreatedAt   time.Time
 }

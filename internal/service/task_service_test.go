@@ -463,4 +463,3 @@ func eventTypesEqual(a, b []domain.EventType) bool {
 	}
 	return true
 }
-

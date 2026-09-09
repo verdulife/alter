@@ -380,7 +380,6 @@ func TestTriggerRetryAtPersist(t *testing.T) {
 	}
 }
 
-
 // TestTriggerClearDerivedNextFireAt verifies that changing a task's due date
 // invalidates only its time-derived triggers' NextFireAt, preserving LastFiredAt,
 // Enabled, and absolute "at" triggers.

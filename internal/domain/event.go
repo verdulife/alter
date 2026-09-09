@@ -6,11 +6,12 @@ import "time"
 type EventType string
 
 const (
-	EventTaskCreated  EventType = "task.created"
-	EventTaskUpdated  EventType = "task.updated"
+	EventTaskCreated   EventType = "task.created"
+	EventTaskUpdated   EventType = "task.updated"
 	EventTaskCompleted EventType = "task.completed"
 	EventTaskCancelled EventType = "task.cancelled"
-	EventTriggerFired EventType = "trigger.fired"
+	EventTriggerFired  EventType = "trigger.fired"
+	EventAgentResult   EventType = "agent.result"
 )
 
 // Event represents a relevant occurrence in the system.

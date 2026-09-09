@@ -271,6 +271,15 @@ func (s *Scheduler) fireOne(ctx context.Context, t domain.Trigger, now time.Time
 	}
 
 	if err := s.action.Execute(ctx, executed, task); err != nil {
+		if errors.Is(err, domain.ErrActionPermanent) {
+			// Terminal: the consequence can never succeed as-is (e.g. auth, billing,
+			// invalid request, quota). Retrying is useless, so do NOT set a RetryAt
+			// backoff (which would re-attempt forever in a busy loop) and do NOT consume
+			// the trigger as fired. Retire it so it leaves the active set.
+			s.logger.Printf("scheduler: action for trigger %s failed permanently: %v", t.ID, err)
+			s.retire(ctx, t, "action failed permanently")
+			return true
+		}
 		// Transitory: do NOT consume the trigger. Set a minimal retry backoff via
 		// RetryAt (now + actionRetryDelay). NextFireAt is left untouched: it remains
 		// the derived deadline, now in the past; RetryAt is separate operational state
