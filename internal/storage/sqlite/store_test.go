@@ -452,8 +452,8 @@ func TestTriggerClearDerivedNextFireAt(t *testing.T) {
 	}
 }
 
-// TestMigrationsApplyFromScratch verifies 0001 and 0002 are both applied on a
-// brand-new database.
+// TestMigrationsApplyFromScratch verifies all versioned migrations are applied
+// in order on a brand-new database.
 func TestMigrationsApplyFromScratch(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "fresh.db")
 	store, err := Open(dbPath)
@@ -477,14 +477,33 @@ func TestMigrationsApplyFromScratch(t *testing.T) {
 		versions = append(versions, v)
 	}
 
-	want := []string{"0001_init.sql", "0002_trigger_fire_state.sql", "0003_trigger_retry_at.sql"}
-	if len(versions) != len(want) {
+	want := []string{"0001_init.sql", "0002_trigger_fire_state.sql", "0003_trigger_retry_at.sql", "0004_semantic_index.sql"}
+	if n := len(versions); n != len(want) {
 		t.Fatalf("expected %d migrations, got %v", len(want), versions)
 	}
 	for i := range want {
 		if versions[i] != want[i] {
 			t.Fatalf("migration order mismatch: got %v want %v", versions, want)
 		}
+	}
+}
+
+// TestSemanticStoreFactory verifies the composition seam: NewSemanticStore
+// exposes the semantic adapter over the same migrated connection.
+func TestSemanticStoreFactory(t *testing.T) {
+	store := openTestStore(t)
+	sem := store.NewSemanticStore(nil) // no provider: degrades, never fails
+	if sem == nil {
+		t.Fatal("NewSemanticStore(nil) must return a Store")
+	}
+	if err := sem.Reset(context.Background()); err != nil {
+		t.Fatalf("reset via factory: %v", err)
+	}
+
+	// The derived index table must exist after migrations.
+	var n int
+	if err := store.db.QueryRow(`SELECT COUNT(1) FROM search_docs`).Scan(&n); err != nil {
+		t.Fatalf("search_docs table missing: %v", err)
 	}
 }
 

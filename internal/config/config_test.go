@@ -16,6 +16,10 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("ALTER_PI_TIMEOUT", "")
 	t.Setenv("ALTER_PI_NO_TOOLS", "")
 	t.Setenv("ALTER_PI_SYSTEM_PROMPT", "")
+	t.Setenv("ALTER_SEARCH_ENABLED", "")
+	t.Setenv("ALTER_EMBEDDING_PROVIDER", "")
+	t.Setenv("ALTER_EMBEDDING_URL", "")
+	t.Setenv("ALTER_SEARCH_LIMIT", "")
 
 	cfg := Load()
 	if cfg.Version != "0.1.0" {
@@ -51,6 +55,19 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.PiSystemPrompt != "" {
 		t.Errorf("PiSystemPrompt = %q, want empty", cfg.PiSystemPrompt)
+	}
+	// Semantic search defaults: disabled, no provider, limit 5.
+	if cfg.SearchEnabled {
+		t.Error("SearchEnabled = true, want false by default")
+	}
+	if cfg.EmbeddingProvider != "" {
+		t.Errorf("EmbeddingProvider = %q, want empty", cfg.EmbeddingProvider)
+	}
+	if cfg.EmbeddingURL != "" {
+		t.Errorf("EmbeddingURL = %q, want empty", cfg.EmbeddingURL)
+	}
+	if cfg.SearchLimit != 5 {
+		t.Errorf("SearchLimit = %d, want 5", cfg.SearchLimit)
 	}
 }
 
@@ -122,5 +139,39 @@ func TestLoadPiMalformedFallsBack(t *testing.T) {
 	}
 	if !cfg.PiNoTools {
 		t.Error("PiNoTools = false, want true on malformed env")
+	}
+}
+
+func TestLoadSearchFromEnv(t *testing.T) {
+	t.Setenv("ALTER_SEARCH_ENABLED", "true")
+	t.Setenv("ALTER_EMBEDDING_PROVIDER", "ollama")
+	t.Setenv("ALTER_EMBEDDING_URL", "http://localhost:11434/api")
+	t.Setenv("ALTER_SEARCH_LIMIT", "10")
+
+	cfg := Load()
+	if !cfg.SearchEnabled {
+		t.Error("SearchEnabled = false, want true")
+	}
+	if cfg.EmbeddingProvider != "ollama" {
+		t.Errorf("EmbeddingProvider = %q, want ollama", cfg.EmbeddingProvider)
+	}
+	if cfg.EmbeddingURL != "http://localhost:11434/api" {
+		t.Errorf("EmbeddingURL = %q, want the configured URL", cfg.EmbeddingURL)
+	}
+	if cfg.SearchLimit != 10 {
+		t.Errorf("SearchLimit = %d, want 10", cfg.SearchLimit)
+	}
+}
+
+func TestLoadSearchMalformedFallsBack(t *testing.T) {
+	t.Setenv("ALTER_SEARCH_ENABLED", "maybe")
+	t.Setenv("ALTER_SEARCH_LIMIT", "lots")
+
+	cfg := Load()
+	if cfg.SearchEnabled {
+		t.Error("SearchEnabled = true, want false on malformed env")
+	}
+	if cfg.SearchLimit != 5 {
+		t.Errorf("SearchLimit = %d, want 5 on malformed env", cfg.SearchLimit)
 	}
 }

@@ -3,6 +3,13 @@
 // enabled — the real Pi Agent via the Orchestrator composite
 // (Agent → Channel → Event best-effort). When Pi is not enabled the Scheduler
 // action is the Telegram-only NotifyAction; no fake Agent exists in production.
+//
+// Optional semantic search (ALTER_SEARCH_ENABLED) wires the derived vector index
+// into that composite: the Orchestrator retrieves related context for the Agent
+// and feeds past agent responses back as memory, while SQLite stays the source
+// of truth and the index is rebuilt from it at boot. Without an embedding
+// provider the capability degrades to unavailable and every consumer behaves
+// exactly as V1.
 package main
 
 import (
@@ -14,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/verdu/alter/internal/adapter/agent"
+	"github.com/verdu/alter/internal/adapter/semantic"
 	"github.com/verdu/alter/internal/adapter/telegram"
 	"github.com/verdu/alter/internal/config"
 	"github.com/verdu/alter/internal/domain"
@@ -43,6 +51,31 @@ func main() {
 	triggers := store.NewTriggerRepository()
 	events := store.NewEventStore()
 
+	// Semantic search: opt-in via ALTER_SEARCH_ENABLED. It needs an embedding
+	// provider, and this phase ships none (NewEmbedder returns nil), so the
+	// capability degrades cleanly: when no provider is configured the searcher
+	// and indexer stay nil, every consumer behaves exactly as V1, and nothing
+	// blocks Tasks, Scheduler, Telegram or the Pi Agent. Only with a real
+	// provider is the derived search_docs index wired and rebuilt at boot.
+	var searcher domain.SemanticSearcher
+	var indexer domain.SemanticIndexer
+	if cfg.SearchEnabled {
+		embedder, err := semantic.NewEmbedder(semantic.EmbedderConfig{
+			Provider: cfg.EmbeddingProvider,
+			BaseURL:  cfg.EmbeddingURL,
+		})
+		if err != nil {
+			logger.Printf("runtime: semantic search disabled: %v", err)
+		} else if embedder == nil {
+			logger.Printf("runtime: semantic search enabled but no embedding provider configured (ALTER_EMBEDDING_PROVIDER); search is not wired and degrades to unavailable")
+		} else {
+			sem := store.NewSemanticStore(embedder, semantic.WithDefaultLimit(cfg.SearchLimit))
+			searcher = sem
+			indexer = sem
+			logger.Printf("runtime: semantic search enabled (embedder=%s, limit=%d)", embedder.Name(), cfg.SearchLimit)
+		}
+	}
+
 	client := telegram.NewClient(cfg.TelegramToken)
 	channel := telegram.NewChannel(client, cfg.TelegramChatID)
 
@@ -58,7 +91,14 @@ func main() {
 			NoTools:      cfg.PiNoTools,
 			SystemPrompt: cfg.PiSystemPrompt,
 		}, agent.WithPiLogger(logger))
-		action = agent.NewOrchestrator(piAgent, channel, events, agent.WithLogger(logger))
+		opts := []agent.Option{agent.WithLogger(logger)}
+		if searcher != nil {
+			opts = append(opts, agent.WithSearcher(searcher))
+		}
+		if indexer != nil {
+			opts = append(opts, agent.WithIndexer(indexer))
+		}
+		action = agent.NewOrchestrator(piAgent, channel, events, opts...)
 		logger.Printf("runtime: scheduler action = Pi Agent (orchestrator), bin=%q", cfg.PiBin)
 	} else {
 		action = telegram.NewNotifyAction(channel)
@@ -67,7 +107,11 @@ func main() {
 
 	sched := scheduler.NewScheduler(triggers, tasks, events, action, scheduler.WithLogger(logger))
 
-	taskSvc := service.NewTaskService(tasks, triggers, events, service.WithTaskRescheduler(sched))
+	taskOpts := []service.TaskOption{service.WithTaskRescheduler(sched)}
+	if indexer != nil {
+		taskOpts = append(taskOpts, service.WithTaskIndexer(indexer))
+	}
+	taskSvc := service.NewTaskService(tasks, triggers, events, taskOpts...)
 	triggerSvc := service.NewTriggerService(triggers, tasks, service.WithTriggerRescheduler(sched))
 
 	cmdSvc := commandService{tasks: taskSvc, triggers: triggerSvc}
@@ -81,6 +125,20 @@ func main() {
 	errCh := make(chan error, 2)
 	go func() { errCh <- inbound.Run(ctx) }()
 	go func() { errCh <- sched.Run(ctx) }()
+
+	// Rebuild the derived semantic index in the background: the runtime starts
+	// immediately (the index is not a boot dependency) and Reset + reindex from
+	// the SQLite source of truth converge any stale/orphaned rows. A failed
+	// rebuild leaves a partial index (reads fail open) and the next boot's
+	// rebuild converges again.
+	if indexer != nil {
+		reindexer := service.NewReindexer(tasks, events, indexer, service.WithReindexerLogger(logger))
+		go func() {
+			if err := reindexer.Rebuild(ctx); err != nil {
+				logger.Printf("runtime: semantic index rebuild failed (the next boot rebuilds again): %v", err)
+			}
+		}()
+	}
 
 	logger.Printf("runtime: alter %s started (db=%s)", cfg.Version, cfg.DBPath)
 

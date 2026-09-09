@@ -44,12 +44,25 @@ type Config struct {
 	PiNoTools bool
 	// PiSystemPrompt is an optional extra system prompt appended via --append-system-prompt.
 	PiSystemPrompt string
+
+	// Semantic search: a derived vector index over tasks and agent.result events
+	// that supplies retrievable context to the Agent at fire time. SQLite stays
+	// the source of truth; search_docs is a derived, rebuildable projection.
+	// Disabled by default; requires an embedding provider (none is shipped in
+	// this phase) and must never become a boot dependency of the runtime.
+	SearchEnabled     bool
+	EmbeddingProvider string
+	EmbeddingURL      string
+	SearchLimit       int
 }
 
 // Defaults for the optional Pi Agent configuration.
 const (
 	defaultPiBin     = "pi"
 	defaultPiTimeout = 60 * time.Second
+	// defaultSearchLimit caps semantic search results when ALTER_SEARCH_LIMIT
+	// is unset (0 in SearchOptions means "adapter default").
+	defaultSearchLimit = 5
 )
 
 // Load returns the application configuration from environment variables
@@ -71,6 +84,13 @@ func Load() Config {
 		PiTimeout:      parseDurationEnv("ALTER_PI_TIMEOUT", defaultPiTimeout),
 		PiNoTools:      parseBoolEnv("ALTER_PI_NO_TOOLS", true),
 		PiSystemPrompt: envOr("ALTER_PI_SYSTEM_PROMPT", ""),
+
+		// Semantic search: off by default; provider/URL optional and unused until
+		// a provider is implemented.
+		SearchEnabled:     parseBoolEnv("ALTER_SEARCH_ENABLED", false),
+		EmbeddingProvider: envOr("ALTER_EMBEDDING_PROVIDER", ""),
+		EmbeddingURL:      envOr("ALTER_EMBEDDING_URL", ""),
+		SearchLimit:       parseIntEnv("ALTER_SEARCH_LIMIT", defaultSearchLimit),
 	}
 }
 
@@ -108,6 +128,20 @@ func parseBoolEnv(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// parseIntEnv parses an integer environment variable, falling back to def when
+// unset or malformed.
+func parseIntEnv(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // parseDurationEnv parses a Go duration environment variable, falling back to

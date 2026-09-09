@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/verdu/alter/internal/adapter/semantic"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGO)
 )
 
@@ -64,4 +65,12 @@ func (s *Store) NewTriggerRepository() *TriggerRepository {
 // NewEventStore returns a SQLite-backed domain.EventStore.
 func (s *Store) NewEventStore() *EventStore {
 	return &EventStore{db: s.db}
+}
+
+// NewSemanticStore returns the semantic search adapter (domain.SemanticSearcher +
+// domain.SemanticIndexer) over this SQLite connection, backed by the derived
+// search_docs table. embedder may be nil (every index/search operation then
+// degrades to domain.ErrSemanticUnavailable; the runtime still runs normally).
+func (s *Store) NewSemanticStore(embedder semantic.Embedder, opts ...semantic.Option) *semantic.Store {
+	return semantic.NewStore(s.db, embedder, opts...)
 }

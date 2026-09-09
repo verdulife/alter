@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"time"
 
 	"github.com/verdu/alter/internal/domain"
@@ -45,9 +47,11 @@ type TaskService struct {
 	tasks       domain.TaskRepository
 	triggers    domain.TriggerRepository
 	events      domain.EventStore
+	indexer     domain.SemanticIndexer // optional: derived semantic index (best-effort)
 	now         func() time.Time
 	newID       func() string
 	rescheduler domain.Rescheduler
+	logger      *log.Logger
 }
 
 // TaskOption configures a TaskService (dependency injection for testing and the
@@ -62,6 +66,19 @@ func WithTaskRescheduler(r domain.Rescheduler) TaskOption {
 	return func(s *TaskService) { s.rescheduler = r }
 }
 
+// WithTaskIndexer wires the optional derived semantic index write side. It is
+// optional and never a correctness dependency: index sync is best-effort and a
+// failure must not break the authoritative task operation (the index is fully
+// derived and rebuilt from SQLite at boot).
+func WithTaskIndexer(i domain.SemanticIndexer) TaskOption {
+	return func(s *TaskService) { s.indexer = i }
+}
+
+// WithTaskLogger sets the logger used for non-fatal diagnostics.
+func WithTaskLogger(l *log.Logger) TaskOption {
+	return func(s *TaskService) { s.logger = l }
+}
+
 // NewTaskService builds a TaskService with production defaults.
 func NewTaskService(tasks domain.TaskRepository, triggers domain.TriggerRepository, events domain.EventStore, opts ...TaskOption) *TaskService {
 	s := &TaskService{
@@ -70,6 +87,7 @@ func NewTaskService(tasks domain.TaskRepository, triggers domain.TriggerReposito
 		events:   events,
 		now:      time.Now,
 		newID:    newLocalID,
+		logger:   log.New(io.Discard, "", 0),
 	}
 	for _, o := range opts {
 		o(s)
@@ -96,6 +114,7 @@ func (s *TaskService) Create(ctx context.Context, p CreateTaskParams) (domain.Ta
 		return domain.Task{}, err
 	}
 	s.emit(ctx, domain.EventTaskCreated, task.ID)
+	s.indexTask(ctx, task)
 	return task, nil
 }
 
@@ -153,6 +172,7 @@ func (s *TaskService) Update(ctx context.Context, id string, p UpdateTaskParams)
 	}
 
 	s.emit(ctx, domain.EventTaskUpdated, task.ID)
+	s.indexTask(ctx, task)
 	return task, nil
 }
 
@@ -196,7 +216,11 @@ func (s *TaskService) Cancel(ctx context.Context, id string) (domain.Task, error
 
 // Delete removes a task by ID.
 func (s *TaskService) Delete(ctx context.Context, id string) error {
-	return s.tasks.Delete(ctx, id)
+	if err := s.tasks.Delete(ctx, id); err != nil {
+		return err
+	}
+	s.removeTaskIndex(ctx, id)
+	return nil
 }
 
 // emit records a domain event. A failure in the event store is logged/ignored
@@ -216,5 +240,28 @@ func (s *TaskService) emit(ctx context.Context, eventType domain.EventType, task
 func (s *TaskService) wake() {
 	if s.rescheduler != nil {
 		s.rescheduler.Wake()
+	}
+}
+
+// indexTask propagates a task to the derived semantic index, best-effort: a
+// failure is logged (except the expected "unavailable" degraded state) and
+// never returned to the caller, mirroring emit. Correctness never depends on
+// the index: it is a derived projection rebuilt from SQLite at boot.
+func (s *TaskService) indexTask(ctx context.Context, task domain.Task) {
+	if s.indexer == nil {
+		return
+	}
+	if err := s.indexer.IndexTask(ctx, task); err != nil && !errors.Is(err, domain.ErrSemanticUnavailable) {
+		s.logger.Printf("task: index task %s: %v", task.ID, err)
+	}
+}
+
+// removeTaskIndex removes a task from the derived semantic index, best-effort.
+func (s *TaskService) removeTaskIndex(ctx context.Context, taskID string) {
+	if s.indexer == nil {
+		return
+	}
+	if err := s.indexer.RemoveTask(ctx, taskID); err != nil && !errors.Is(err, domain.ErrSemanticUnavailable) {
+		s.logger.Printf("task: remove task from index %s: %v", taskID, err)
 	}
 }

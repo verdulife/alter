@@ -448,6 +448,98 @@ func TestTaskUpdateWithoutDueAtDoesNotWakeScheduler(t *testing.T) {
 	}
 }
 
+// --- Semantic index hooks (best-effort, never break the task operation) ------
+
+type fakeTaskIndexer struct {
+	indexed   []domain.Task
+	removed   []string
+	indexErr  error
+	removeErr error
+}
+
+func (f *fakeTaskIndexer) Reset(context.Context) error { return nil }
+func (f *fakeTaskIndexer) IndexTask(_ context.Context, t domain.Task) error {
+	f.indexed = append(f.indexed, t)
+	return f.indexErr
+}
+func (f *fakeTaskIndexer) RemoveTask(_ context.Context, id string) error {
+	f.removed = append(f.removed, id)
+	return f.removeErr
+}
+func (f *fakeTaskIndexer) IndexEvent(context.Context, domain.Event) error { return nil }
+
+func newIndexedHarness(idx *fakeTaskIndexer) (*TaskService, *fakeTaskRepo) {
+	repo := newFakeTaskRepo()
+	events := newFakeEventStore()
+	svc := NewTaskService(repo, newFakeTriggerRepo(), events,
+		WithTaskIndexer(idx),
+	)
+	return svc, repo
+}
+
+func TestCreateIndexesTask(t *testing.T) {
+	idx := &fakeTaskIndexer{}
+	svc, _ := newIndexedHarness(idx)
+
+	task := mustCreate(t, svc)
+
+	if len(idx.indexed) != 1 || idx.indexed[0].ID != task.ID {
+		t.Errorf("IndexTask calls = %+v, want the created task", idx.indexed)
+	}
+	if len(idx.removed) != 0 {
+		t.Errorf("unexpected RemoveTask calls: %v", idx.removed)
+	}
+}
+
+func TestUpdateIndexesTask(t *testing.T) {
+	ctx := context.Background()
+	idx := &fakeTaskIndexer{}
+	svc, _ := newIndexedHarness(idx)
+	task := mustCreate(t, svc)
+
+	if _, err := svc.Update(ctx, task.ID, UpdateTaskParams{Title: ptr("renamed")}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if len(idx.indexed) != 2 {
+		t.Errorf("IndexTask calls = %d, want 2 (create + update)", len(idx.indexed))
+	}
+	if last := idx.indexed[len(idx.indexed)-1]; last.ID != task.ID || last.Title != "renamed" {
+		t.Errorf("last indexed task = %+v, want the updated task", last)
+	}
+}
+
+func TestDeleteRemovesTaskIndex(t *testing.T) {
+	ctx := context.Background()
+	idx := &fakeTaskIndexer{}
+	svc, _ := newIndexedHarness(idx)
+	task := mustCreate(t, svc)
+
+	if err := svc.Delete(ctx, task.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(idx.removed) != 1 || idx.removed[0] != task.ID {
+		t.Errorf("RemoveTask calls = %v, want [%s]", idx.removed, task.ID)
+	}
+}
+
+func TestIndexFailureNeverBreaksTaskOperations(t *testing.T) {
+	ctx := context.Background()
+	idx := &fakeTaskIndexer{indexErr: errors.New("embedder down"), removeErr: errors.New("embedder down")}
+	svc, _ := newIndexedHarness(idx)
+
+	task, err := svc.Create(ctx, CreateTaskParams{Title: "t"})
+	if err != nil {
+		t.Fatalf("create must not fail on index error: %v", err)
+	}
+	if _, err := svc.Update(ctx, task.ID, UpdateTaskParams{Title: ptr("x")}); err != nil {
+		t.Fatalf("update must not fail on index error: %v", err)
+	}
+	if err := svc.Delete(ctx, task.ID); err != nil {
+		t.Fatalf("delete must not fail on index error: %v", err)
+	}
+}
+
 // --- Helpers --------------------------------------------------------------
 
 func ptr[T any](v T) *T { return &v }

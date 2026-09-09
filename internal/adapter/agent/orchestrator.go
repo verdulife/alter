@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,9 +40,11 @@ import (
 // enabled). The in-memory fakes of its tests are never part of production
 // wiring, and no fake Agent exists in the runtime path.
 type Orchestrator struct {
-	agent   domain.Agent
-	channel domain.Channel
-	events  domain.EventStore
+	agent    domain.Agent
+	channel  domain.Channel
+	events   domain.EventStore
+	searcher domain.SemanticSearcher // optional: semantic retrieval for the Agent context
+	indexer  domain.SemanticIndexer  // optional: derived index write side (agent memory)
 
 	now    func() time.Time
 	newID  func() string
@@ -78,6 +81,21 @@ func WithID(f func() string) Option { return func(o *Orchestrator) { o.newID = f
 // WithLogger sets the logger used for non-fatal diagnostics.
 func WithLogger(l *log.Logger) Option { return func(o *Orchestrator) { o.logger = l } }
 
+// WithSearcher wires the optional semantic search read side. When absent (or
+// failing), the Orchestrator enriches nothing and behaves exactly as V1: the
+// fire is never blocked by search.
+func WithSearcher(s domain.SemanticSearcher) Option {
+	return func(o *Orchestrator) { o.searcher = s }
+}
+
+// WithIndexer wires the optional derived semantic index write side: after a
+// confirmed delivery, the agent.result Event is also fed to the index so past
+// agent responses become retrievable memory. Best-effort: a failure never
+// breaks the delivery.
+func WithIndexer(i domain.SemanticIndexer) Option {
+	return func(o *Orchestrator) { o.indexer = i }
+}
+
 // Execute runs the Agent -> Channel -> Event(best-effort) flow for a fired
 // trigger and its task. It returns only an error when the consequence has not
 // happened: an Agent failure or a Channel failure. After a confirmed delivery the
@@ -87,7 +105,7 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 	result, err := o.agent.Execute(ctx, domain.AgentRequest{
 		Task:        task,
 		Trigger:     trigger,
-		Instruction: defaultInstruction(task),
+		Instruction: o.instruction(ctx, task),
 	})
 	if err != nil {
 		// Agent failed: no consequence happened. Propagate so the Scheduler applies
@@ -104,8 +122,9 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 	}
 
 	// Delivery confirmed. Persist the audit Event best-effort; failure is logged and
-	// the delivery is NOT retried.
-	if err := o.events.Save(ctx, domain.Event{
+	// the delivery is NOT retried. The semantic memory write (IndexEvent) happens
+	// only after a confirmed delivery and only when an indexer is wired.
+	event := domain.Event{
 		ID:   o.newID(),
 		Type: domain.EventAgentResult,
 		Payload: map[string]any{
@@ -114,10 +133,50 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 			"response":   result.Response,
 		},
 		CreatedAt: o.now().UTC(),
-	}); err != nil {
+	}
+	if err := o.events.Save(ctx, event); err != nil {
 		o.logger.Printf("orchestrator: persist agent result event for trigger %s: %v", trigger.ID, err)
 	}
+	o.indexEvent(ctx, event)
 	return nil
+}
+
+// instruction derives the Agent instruction for a fired task: the neutral V1
+// default plus, when a searcher is wired and returns related context, a bounded
+// digest of the best results with the task itself excluded. Retrieval is
+// fail-open: any error (including domain.ErrSemanticUnavailable) or an empty
+// result set falls back to the default instruction, and the fire is never
+// blocked by search. The Orchestrator only ever sees the domain port: it never
+// touches SQLite, the vector tables or the embedding provider.
+func (o *Orchestrator) instruction(ctx context.Context, task domain.Task) string {
+	if o.searcher == nil {
+		return defaultInstruction(task)
+	}
+	results, err := o.searcher.Search(ctx, searchQuery(task), domain.SearchOptions{
+		// Limit 0: the adapter applies its configured default (runtime 5).
+		Exclude: []domain.Ref{{Kind: domain.RefKindTask, ID: task.ID}},
+	})
+	if err != nil {
+		if !errors.Is(err, domain.ErrSemanticUnavailable) {
+			// Unavailable is the expected degraded state (already logged at
+			// startup); log only genuine failures.
+			o.logger.Printf("orchestrator: semantic search skipped: %v", err)
+		}
+		return defaultInstruction(task)
+	}
+	return assembleInstruction(task, results)
+}
+
+// indexEvent feeds a confirmed agent.result Event to the derived semantic index
+// (best-effort, same resilience as EventStore.Save: a failure never breaks the
+// delivery and is not retried; the boot rebuild converges any gap).
+func (o *Orchestrator) indexEvent(ctx context.Context, event domain.Event) {
+	if o.indexer == nil {
+		return
+	}
+	if err := o.indexer.IndexEvent(ctx, event); err != nil && !errors.Is(err, domain.ErrSemanticUnavailable) {
+		o.logger.Printf("orchestrator: index agent result event %s: %v", event.ID, err)
+	}
 }
 
 // defaultInstruction derives the V1 Agent instruction from the task. No schema

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,16 +66,49 @@ func (f *fakeEventStore) ListByType(context.Context, domain.EventType) ([]domain
 	return nil, nil
 }
 
+// fakeSearcher records the queries/options it receives and returns canned
+// results, so tests can assert retrieval behavior without a real index.
+type fakeSearcher struct {
+	results []domain.SearchResult
+	err     error
+	queries []string
+	opts    []domain.SearchOptions
+}
+
+func (f *fakeSearcher) Search(_ context.Context, query string, opts domain.SearchOptions) ([]domain.SearchResult, error) {
+	f.queries = append(f.queries, query)
+	f.opts = append(f.opts, opts)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.results, nil
+}
+
+// fakeIndexer records index writes so tests can assert agent-result memory sync.
+type fakeIndexer struct {
+	events []domain.Event
+	err    error
+}
+
+func (f *fakeIndexer) Reset(context.Context) error                  { return nil }
+func (f *fakeIndexer) IndexTask(context.Context, domain.Task) error { return nil }
+func (f *fakeIndexer) RemoveTask(context.Context, string) error     { return nil }
+func (f *fakeIndexer) IndexEvent(_ context.Context, e domain.Event) error {
+	f.events = append(f.events, e)
+	return f.err
+}
+
 // --- Harness ----------------------------------------------------------------
 
-func newHarness(t *testing.T, a *fakeAgent, ch *fakeChannel, ev *fakeEventStore) *Orchestrator {
+func newHarness(t *testing.T, a *fakeAgent, ch *fakeChannel, ev *fakeEventStore, opts ...Option) *Orchestrator {
 	t.Helper()
 	discard := log.New(io.Discard, "", 0)
-	return NewOrchestrator(a, ch, ev,
+	all := append([]Option{
 		WithNow(func() time.Time { return fixedNow }),
 		WithID(func() string { return "evt-1" }),
 		WithLogger(discard),
-	)
+	}, opts...)
+	return NewOrchestrator(a, ch, ev, all...)
 }
 
 func fixedTriggerTask() (domain.Trigger, domain.Task) {
@@ -224,5 +258,159 @@ func TestHappyFlowOrderAndEvent(t *testing.T) {
 	}
 	if !e.CreatedAt.Equal(fixedNow) {
 		t.Errorf("event CreatedAt = %v, want %v", e.CreatedAt, fixedNow)
+	}
+}
+
+// --- Semantic search: context enrichment and memory indexing -----------------
+
+func TestSearchEnrichesInstruction(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	src := &fakeSearcher{results: []domain.SearchResult{
+		{Ref: domain.Ref{Kind: domain.RefKindTask, ID: "other-1"}, Text: "buy milk tomorrow morning", Score: 0.9},
+		{Ref: domain.Ref{Kind: domain.RefKindEvent, ID: "evt-past"}, Text: "the dentist is booked for Friday", Score: 0.7},
+	}}
+	o := newHarness(t, a, ch, ev, WithSearcher(src))
+	trg, task := fixedTriggerTask()
+	// Give the task a description so the query carries it.
+	task.Title = "buy milk"
+	task.Description = "urgent"
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// The query derives from title+description, and the fired task itself is
+	// excluded; limit stays 0 (adapter default).
+	if len(src.queries) != 1 || src.queries[0] != "buy milk urgent" {
+		t.Errorf("query = %q, want the task title+description", src.queries)
+	}
+	opts := src.opts[0]
+	if opts.Limit != 0 {
+		t.Errorf("Limit = %d, want 0 (adapter default)", opts.Limit)
+	}
+	if len(opts.Exclude) != 1 || opts.Exclude[0] != (domain.Ref{Kind: domain.RefKindTask, ID: task.ID}) {
+		t.Errorf("Exclude = %+v, want the fired task itself", opts.Exclude)
+	}
+
+	// The instruction carries the default plus labeled, bounded context.
+	instr := a.calls[0].Instruction
+	if !strings.Contains(instr, "Related context:") {
+		t.Errorf("instruction lacks context: %q", instr)
+	}
+	if !strings.Contains(instr, "Task: buy milk tomorrow morning") {
+		t.Errorf("instruction lacks the task fragment: %q", instr)
+	}
+	if !strings.Contains(instr, "Previous agent response: the dentist is booked for Friday") {
+		t.Errorf("instruction lacks the agent-memory fragment: %q", instr)
+	}
+}
+
+func TestSearchErrorFallsBackToDefault(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	src := &fakeSearcher{err: errors.New("embedder down")}
+	o := newHarness(t, a, ch, ev, WithSearcher(src))
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
+		t.Errorf("instruction = %q, want the plain default on search error", got)
+	}
+}
+
+func TestSearchUnavailableFallsBackSilently(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	src := &fakeSearcher{err: domain.ErrSemanticUnavailable}
+	o := newHarness(t, a, ch, ev, WithSearcher(src))
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute again: %v", err)
+	}
+	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
+		t.Errorf("instruction = %q, want the plain default on unavailable", got)
+	}
+}
+
+func TestNoSearcherNoContext(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newHarness(t, a, ch, ev)
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
+		t.Errorf("instruction = %q, want the plain default without a searcher", got)
+	}
+}
+
+func TestEmptySearchResultsNoContext(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	src := &fakeSearcher{} // no results
+	o := newHarness(t, a, ch, ev, WithSearcher(src))
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
+		t.Errorf("instruction = %q, want the plain default on empty results", got)
+	}
+}
+
+func TestIndexesAgentResultAfterDelivery(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "remember this"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	idx := &fakeIndexer{}
+	o := newHarness(t, a, ch, ev, WithIndexer(idx))
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(ev.events) != 1 {
+		t.Fatalf("audit event saves = %d, want 1", len(ev.events))
+	}
+	if len(idx.events) != 1 {
+		t.Fatalf("indexed events = %d, want 1", len(idx.events))
+	}
+	got := idx.events[0]
+	if got.Type != domain.EventAgentResult || got.Payload["response"] != "remember this" {
+		t.Errorf("indexed event = %+v, want the confirmed agent.result", got)
+	}
+	if !got.CreatedAt.Equal(fixedNow) {
+		t.Errorf("indexed event CreatedAt = %v, want %v", got.CreatedAt, fixedNow)
+	}
+}
+
+func TestIndexEventFailureNeverBreaksFlow(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	idx := &fakeIndexer{err: errors.New("embedder down")}
+	o := newHarness(t, a, ch, ev, WithIndexer(idx))
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute must succeed despite index failure: %v", err)
+	}
+	if len(ev.events) != 1 {
+		t.Errorf("delivery/audit must be unaffected by index failure")
 	}
 }
