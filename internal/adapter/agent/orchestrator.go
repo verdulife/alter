@@ -1,9 +1,8 @@
 // Package agent implements the agent side of alter: the domain.Agent port is
-// implemented here (Slice 3 only defines the boundary + an in-memory fake for
-// tests of the composite TriggerAction), and the concrete Pi transport protocol
-// is explicitly pending until its protocol is known — nothing fictitious is wired
-// here. It also holds the Orchestrator: a concrete domain.TriggerAction that
-// composes Agent -> Channel -> Event(best-effort) on the Scheduler seam.
+// implemented here by the PiAgent RPC adapter (pi.go), which drives the pi CLI
+// RPC mode as a one-shot subprocess per execution. It also holds the
+// Orchestrator: a concrete domain.TriggerAction that composes
+// Agent -> Channel -> Event(best-effort) on the Scheduler seam.
 //
 // Dependency direction: this package depends only on internal/domain and the
 // standard library. It never imports the scheduler, storage, or telegram
@@ -35,8 +34,10 @@ import (
 //     delivery. It is strictly best-effort: a failure is logged and ignored and
 //     must never trigger a retry (the delivery already happened).
 //
-// Orchestrator is intentionally not wired into main.go in Slice 3: the runtime
-// wiring stays on NotifyAction until the real Pi transport exists.
+// Orchestrator is intentionally the runtime action only when a real Agent is
+// wired (see cmd/alter/main.go: it is chosen over NotifyAction when Pi is
+// enabled). The in-memory fakes of its tests are never part of production
+// wiring, and no fake Agent exists in the runtime path.
 type Orchestrator struct {
 	agent   domain.Agent
 	channel domain.Channel

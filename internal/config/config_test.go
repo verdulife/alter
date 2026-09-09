@@ -1,11 +1,21 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadDefaults(t *testing.T) {
 	t.Setenv("ALTER_DB_PATH", "")
 	t.Setenv("TELEGRAM_TOKEN", "")
 	t.Setenv("TELEGRAM_CHAT_ID", "")
+	t.Setenv("ALTER_PI_ENABLED", "")
+	t.Setenv("ALTER_PI_BIN", "")
+	t.Setenv("ALTER_PI_PROVIDER", "")
+	t.Setenv("ALTER_PI_MODEL", "")
+	t.Setenv("ALTER_PI_TIMEOUT", "")
+	t.Setenv("ALTER_PI_NO_TOOLS", "")
+	t.Setenv("ALTER_PI_SYSTEM_PROMPT", "")
 
 	cfg := Load()
 	if cfg.Version != "0.1.0" {
@@ -19,6 +29,28 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.TelegramChatID != 0 {
 		t.Errorf("TelegramChatID = %d, want 0", cfg.TelegramChatID)
+	}
+	// Pi Agent defaults: disabled unless opted in, safe/restricted by default.
+	if cfg.PiEnabled {
+		t.Error("PiEnabled = true, want false by default")
+	}
+	if cfg.PiBin != "pi" {
+		t.Errorf("PiBin = %q, want pi", cfg.PiBin)
+	}
+	if cfg.PiProvider != "" {
+		t.Errorf("PiProvider = %q, want empty (pi default)", cfg.PiProvider)
+	}
+	if cfg.PiModel != "" {
+		t.Errorf("PiModel = %q, want empty (pi default)", cfg.PiModel)
+	}
+	if cfg.PiTimeout != 60*time.Second {
+		t.Errorf("PiTimeout = %v, want 60s", cfg.PiTimeout)
+	}
+	if !cfg.PiNoTools {
+		t.Error("PiNoTools = false, want true by default")
+	}
+	if cfg.PiSystemPrompt != "" {
+		t.Errorf("PiSystemPrompt = %q, want empty", cfg.PiSystemPrompt)
 	}
 }
 
@@ -44,5 +76,51 @@ func TestLoadMalformedChatIDFallsBack(t *testing.T) {
 	cfg := Load()
 	if cfg.TelegramChatID != 0 {
 		t.Errorf("TelegramChatID = %d, want 0 on malformed env", cfg.TelegramChatID)
+	}
+}
+
+func TestLoadPiFromEnv(t *testing.T) {
+	t.Setenv("ALTER_PI_ENABLED", "true")
+	t.Setenv("ALTER_PI_BIN", "/home/user/.local/bin/pi")
+	t.Setenv("ALTER_PI_PROVIDER", "anthropic")
+	t.Setenv("ALTER_PI_MODEL", "anthropic/claude-sonnet-4:high")
+	t.Setenv("ALTER_PI_TIMEOUT", "90s")
+	t.Setenv("ALTER_PI_NO_TOOLS", "false")
+	t.Setenv("ALTER_PI_SYSTEM_PROMPT", "Be brief.")
+
+	cfg := Load()
+	if !cfg.PiEnabled {
+		t.Error("PiEnabled = false, want true")
+	}
+	if cfg.PiBin != "/home/user/.local/bin/pi" {
+		t.Errorf("PiBin = %q, want the configured path", cfg.PiBin)
+	}
+	if cfg.PiProvider != "anthropic" {
+		t.Errorf("PiProvider = %q, want anthropic", cfg.PiProvider)
+	}
+	if cfg.PiModel != "anthropic/claude-sonnet-4:high" {
+		t.Errorf("PiModel = %q, want the configured pattern", cfg.PiModel)
+	}
+	if cfg.PiTimeout != 90*time.Second {
+		t.Errorf("PiTimeout = %v, want 90s", cfg.PiTimeout)
+	}
+	if cfg.PiNoTools {
+		t.Error("PiNoTools = true, want false after explicit override")
+	}
+	if cfg.PiSystemPrompt != "Be brief." {
+		t.Errorf("PiSystemPrompt = %q, want the configured prompt", cfg.PiSystemPrompt)
+	}
+}
+
+func TestLoadPiMalformedFallsBack(t *testing.T) {
+	t.Setenv("ALTER_PI_TIMEOUT", "not-a-duration")
+	t.Setenv("ALTER_PI_NO_TOOLS", "maybe")
+
+	cfg := Load()
+	if cfg.PiTimeout != 60*time.Second {
+		t.Errorf("PiTimeout = %v, want 60s on malformed env", cfg.PiTimeout)
+	}
+	if !cfg.PiNoTools {
+		t.Error("PiNoTools = false, want true on malformed env")
 	}
 }

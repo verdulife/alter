@@ -1,5 +1,5 @@
 # Binaries
-alter
+/alter
 *.exe
 
 # SQLite databases
