@@ -2,7 +2,8 @@
 
 > Estado: **implementado (V1 one-shot)**. El Scheduler vive en `internal/scheduler/` y está
 > funcional; las secciones describen su comportamiento efectivo. Siguen fuera de V1 las partes
-> marcadas como futuras (Telegram, notificaciones, recurrencia, event bus).
+> marcadas como futuras (Telegram, notificaciones, event bus); la **recurrencia** tiene su propia
+> sección más abajo (`## Recurrencia (B3)`), cuyo dominio recurrente (S0) está implementado.
 
 ## Contexto y premisas
 
@@ -266,9 +267,115 @@ Solo errores transitorios (ej. DB) se re-intentan; un fallo de DB transitorio no
 
 ---
 
+## Recurrencia (B3) — S0: dominio recurrente
+
+> Estado: **implementado (S0)** en `internal/domain/recurrence.go` (tipo, validación y función
+> pura). La integración con el Scheduler (S3), `ExecuteTrigger` (S1), servicios y naturalintent
+> quedan fuera de S0; las reglas de avance de esta sección son su contrato.
+
+### Contrato general
+
+- **El `RecurrenceSpec` define el calendario determinista.** La secuencia de ocurrencias es una
+  función pura del spec: no depende de `LastFiredAt`, de cuándo se ejecute un fire ni de ningún
+  estado. Tras reinicios, el mismo spec produce el mismo calendario.
+- `NextFireAt` (en S1/S3) es solo una **caché derivada** de la siguiente ocurrencia; nunca la
+  fuente de verdad de la cadencia.
+- `NextOccurrence(spec, after)` devuelve la **mínima ocurrencia estrictamente posterior** a
+  `after` (instante absoluto, con la location del spec; los callers lo convierten a UTC al
+  persistir una caché).
+- `RetryAt` conserva la misma ocurrencia: si la acción falla, la ocurrencia no se consume y el
+  reintento dispara la misma `Sₖ`; el avance ocurre solo tras acción exitosa.
+- `Conditions` quedan fuera de B3.
+
+### Regla de avance (cadencia anclada al calendario)
+
+El `spec` define `S₀ < S₁ < S₂ < …`. La referencia para `NextOccurrence` se elige así:
+
+- **ARMAR** (`NextFireAt == nil`, por creación o invalidation): referencia = `now`.
+- **Fire exitoso** de la ocurrencia `Sₖ` (la cacheada en `NextFireAt`): referencia =
+  `max(Sₖ, now)` — se avanza desde la **ocurrencia calendarizada**, y si el resultado ya está en
+  el pasado se salta a la primera ocurrencia estrictamente posterior a `now`. (Bajo el invariante
+  del Scheduler `Sₖ ≤ now` ambas formulaciones coinciden; `max` es la formulación segura.)
+
+Consecuencia (semántica de downtime): como máximo **un fire atrasado** y después se **saltan las
+ocurrencias intermedias** — `now` solo poda el pasado, nunca desplaza el calendario. El único
+posible duplicado es el at-least-once de una misma ocurrencia (crash entre acción y persist),
+aceptado igual que en V1.
+
+### Formato del spec (JSON canónico en `Trigger.Value`)
+
+```json
+{"freq":"daily|weekly|monthly","interval":1,"weekdays":5,"day_of_month":1,
+ "time":"08:00","timezone":"Europe/Madrid","anchor":"2026-01-05"}
+```
+
+- `freq`: `daily` | `weekly` | `monthly` (obligatorio).
+- `interval`: ≥ 1, default 1. `every N days/weeks/months`.
+- `weekdays`: bitmask Lun=1 … Dom=64 (default 0). Obligatorio (no vacío) para `weekly`;
+  ignorado para daily/monthly. "weekday" = máscara Lun–Vie (31). Semana ISO (lunes primero).
+- `day_of_month`: 1–31, default 1; usado por `monthly` con **clamp** al último día del mes
+  (día 31 → 28/29 en febrero).
+- `time`: `"HH:MM"` local (obligatorio; minuto con dos dígitos).
+- `timezone`: nombre IANA (obligatorio), capturado en creación desde `ALTER_TIMEZONE`/`time.Local`.
+- `anchor`: `"YYYY-MM-DD"` local, fecha de la **primera ocurrencia** (obligatorio). Determina la
+  fase, incluida la de `weekly + interval`; debe ser una fecha de ocurrencia válida para su
+  propio spec (weekly: su día está en la máscara; monthly: cumple la regla de clamp).
+
+### Reglas de pertenencia al calendario (fecha candidata `d`, en el timezone del spec)
+
+- `daily`: `(d − anchor) mod interval == 0`.
+- `weekly`: `semanas(anchor) − semanas(d) ≡ 0 (mod interval)` **y** día de `d` en la máscara.
+  `semanas(x)` = días desde el lunes de la semana de `x`, en unidades de 7 días — aritmética de
+  días civiles, sin numeración ISO de semana, sin ambigüedad entre reinicios.
+- `monthly`: `meses(anchor) − meses(d) ≡ 0 (mod interval)` **y** `d.day == clamp(day_of_month)`.
+
+Toda la aritmética de fase es civil (componentes Y/M/D, no duración de reloj de pared): el DST no
+puede sesgar la fase.
+
+### Timezone y DST
+
+- Cada ocurrencia se construye con `time.Date(y, mo, d, hh, mm, 0, 0, loc)` en el timezone del
+  spec y se compara por **instante**.
+- Hora local estable: un `daily 08:00` se mantiene a las 08:00 local a través de los cambios de
+  hora (el instante UTC se desplaza), por construcción del calendario en hora local.
+- Hora inexistente (salto de primavera): normalización de Go (`02:30 → 03:30 CEST`), documentada.
+- Hora ambigua (retroceso de otoño): exactamente lo que produce `time.Date` para esa
+  (fecha, hora) — a fecha de Go 1.25, el primer instante — con reloj de pared preservado.
+
+### Búsqueda acotada y determinista
+
+Para un spec validado (`interval ≥ 1`, máscara weekly no vacía), la primera ocurrencia futura
+está a lo sumo `interval+1` (daily), `7·interval+7` (weekly) o `31·interval+31` (monthly) días
+calendario de la fecha de referencia; el escaneo día a día está limitado por esa cota y termina
+siempre. `NextOccurrence` re-validar el spec antes de escanear, así que una spec construida a
+mano (sin pasar por `ParseRecurrence`) no puede romper la cota.
+
+### API de dominio (S0)
+
+```go
+func ParseRecurrence(json string) (RecurrenceSpec, error) // constructor validado (JSON estricto)
+func NextOccurrence(spec RecurrenceSpec, after time.Time) (time.Time, error)
+```
+
+- `ParseRecurrence` rechaza: JSON malformado, campos desconocidos, campos obligatorios ausentes,
+  freq desconocido, interval < 1, máscara weekly vacía/fuera de rango, `day_of_month` fuera de
+  1–31, hora o zona inválidas, anchor malformado o no-ocurrencia.
+- Errores centinela: `ErrInvalidRecurrenceJSON`, `ErrRecurrenceUnknownField`,
+  `ErrMissingRecurrenceField`, `ErrInvalidRecurrenceFreq`, `ErrInvalidRecurrenceInterval`,
+  `ErrInvalidRecurrenceWeekdays`, `ErrInvalidRecurrenceDayOfMonth`, `ErrInvalidRecurrenceTime`,
+  `ErrInvalidRecurrenceTimezone`, `ErrInvalidRecurrenceAnchor`,
+  `ErrRecurrenceSearchExceeded` (invariante interno, inalcanzable para spec validada).
+- Sin migraciones ni campos nuevos en `Trigger`: el spec viaja en `Value` (TEXT ya existente).
+  Un futuro tipo `TriggerTypeRecurring` + rama en `ExecuteTrigger` (S1) y en ARMAR (S3) lo
+  consumirán sin tocar el almacenamiento.
+
+---
+
 ## Fuera de alcance del Scheduler V1
 
-Timers múltiples, polling, Telegram, notificaciones, event bus, recurrencia, IA, nuevas
-dependencias. El núcleo V1 descrito arriba (ARMAR → DISPARAR → PLANIFICAR, `RetryAt`, `Wake()`,
-at-least-once, shutdown limpio) **está implementado** en `internal/scheduler/`; lo marcado como
-«futuro» en este documento permanece fuera de V1.
+Timers múltiples, polling, Telegram, notificaciones, event bus, IA, nuevas dependencias. El núcleo
+V1 descrito arriba (ARMAR → DISPARAR → PLANIFICAR, `RetryAt`, `Wake()`, at-least-once, shutdown
+limpio) **está implementado** en `internal/scheduler/`; lo marcado como «futuro» en este
+documento permanece fuera de V1. La **recurrencia** del dominio recurrente se describe en su
+sección (`## Recurrencia (B3)`); su integración en el Scheduler (S1/S3) queda fuera de V1 y se
+hará en B3.
