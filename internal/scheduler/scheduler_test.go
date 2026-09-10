@@ -311,6 +311,119 @@ func TestArmAfterDue(t *testing.T) {
 	}
 }
 
+func TestArmRecurringDaily(t *testing.T) {
+	// A recurring trigger (NextFireAt == nil) is armed from now: NextFireAt is
+	// the first calendar occurrence strictly after the fixed clock, persisted, and
+	// the trigger stays enabled (ARMAR sets the derived cache, the phase lives in
+	// the spec's Anchor).
+	s, trig, tasks, _ := newHarness(t, newFakeAction())
+	tasks.seed(dueTask("t"))
+	const recJSON = `{"freq":"daily","interval":1,"time":"09:00","timezone":"UTC","anchor":"2024-05-01"}`
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeRecurring, Value: recJSON, Enabled: true})
+
+	next := mustTick(t, s)
+
+	spec, err := domain.ParseRecurrence(recJSON)
+	if err != nil {
+		t.Fatalf("ParseRecurrence: %v", err)
+	}
+	wantNext, err := domain.NextOccurrence(spec, fixedNow)
+	if err != nil {
+		t.Fatalf("NextOccurrence: %v", err)
+	}
+	if !next.Equal(wantNext) {
+		t.Errorf("next deadline = %v, want %v", next, wantNext)
+	}
+	got, _ := trig.get("a")
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(wantNext) {
+		t.Errorf("recurring trigger not armed: NextFireAt=%v, want %v", got.NextFireAt, wantNext)
+	}
+	if !got.Enabled {
+		t.Error("armed recurring trigger should remain enabled")
+	}
+}
+
+func TestArmRecurringWeekly(t *testing.T) {
+	// Weekly calendar (Mon+Wed 09:00 UTC, anchor Mon 2024-04-29). At the fixed
+	// clock (Wed 2024-05-01 10:00) the next occurrence is the following Monday:
+	// ARMAR must compute the same instant as NextOccurrence and preserve the
+	// spec's weekday phase.
+	s, trig, tasks, _ := newHarness(t, newFakeAction())
+	tasks.seed(dueTask("t"))
+	const recJSON = `{"freq":"weekly","interval":1,"weekdays":5,"time":"09:00","timezone":"UTC","anchor":"2024-04-29"}`
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeRecurring, Value: recJSON, Enabled: true})
+
+	next := mustTick(t, s)
+
+	spec, err := domain.ParseRecurrence(recJSON)
+	if err != nil {
+		t.Fatalf("ParseRecurrence: %v", err)
+	}
+	wantNext, err := domain.NextOccurrence(spec, fixedNow)
+	if err != nil {
+		t.Fatalf("NextOccurrence: %v", err)
+	}
+	if !next.Equal(wantNext) {
+		t.Errorf("next deadline = %v, want %v", next, wantNext)
+	}
+	if wd := wantNext.Weekday(); wd != time.Monday {
+		t.Errorf("expected a Monday occurrence (phase from anchor), got %v", wd)
+	}
+	got, _ := trig.get("a")
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(wantNext) {
+		t.Errorf("recurring trigger not armed: NextFireAt=%v, want %v", got.NextFireAt, wantNext)
+	}
+	if !got.Enabled {
+		t.Error("armed recurring trigger should remain enabled")
+	}
+}
+
+func TestArmRecurringMalformedValueNotArmedNoFire(t *testing.T) {
+	// An invalid recurrence Value is treated exactly like a malformed "at"
+	// timestamp: no deadline, no arm, trigger stays enabled and unarmed, no fire
+	// and no event (terminal but reversible, so never retired).
+	s, trig, tasks, events := newHarness(t, newFakeAction())
+	tasks.seed(dueTask("t"))
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeRecurring, Value: "not-a-recurrence", Enabled: true})
+
+	next := mustTick(t, s)
+	if !next.IsZero() {
+		t.Errorf("malformed recurring trigger must contribute no deadline, got %v", next)
+	}
+	got, _ := trig.get("a")
+	if got.NextFireAt != nil {
+		t.Errorf("malformed recurring trigger must stay unarmed, got %v", got.NextFireAt)
+	}
+	if !got.Enabled {
+		t.Error("malformed (reversible) recurring trigger must remain enabled")
+	}
+	if got.LastFiredAt != nil {
+		t.Error("malformed recurring trigger must not fire")
+	}
+	if n := len(events.fired()); n != 0 {
+		t.Errorf("no fired event expected, got %d", n)
+	}
+}
+
+func TestArmRecurringMissingTaskRetiresTrigger(t *testing.T) {
+	// Same retirement contract as a one-shot trigger: an enabled recurring
+	// trigger whose task no longer exists is retired (disabled), never armed.
+	s, trig, _, _ := newHarness(t, newFakeAction())
+	const recJSON = `{"freq":"daily","interval":1,"time":"09:00","timezone":"UTC","anchor":"2024-05-01"}`
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "missing", Type: domain.TriggerTypeRecurring, Value: recJSON, Enabled: true})
+
+	mustTick(t, s)
+
+	got, _ := trig.get("a")
+	if got.Enabled {
+		t.Error("orphan recurring trigger should be retired (disabled)")
+	}
+	if got.NextFireAt != nil {
+		t.Errorf("retired recurring trigger must not be armed, got %v", got.NextFireAt)
+	}
+}
+
+
 func TestArmThenFireWhenAlreadyDue(t *testing.T) {
 	// An unarmed "at" trigger whose timestamp is already in the past is armed and
 	// then fired in the same cycle (overdue recovery).
@@ -498,6 +611,162 @@ func TestActionFailureDoesNotConsumeTrigger(t *testing.T) {
 		t.Errorf("no fired event expected on action failure, got %d", n)
 	}
 }
+
+// --- Recurrencia end-to-end (B3 S3) ----------------------------------------
+// These tests pin the integrated contract S0+S1+S2: no production change is
+// needed, the existing ARMAR -> DISPARAR -> ExecuteTrigger -> Action -> Update
+// -> PLANIFICAR cycle already carries a recurring trigger across occurrences.
+
+// recCycleDaily is a daily 09:00 UTC calendar anchored 2024-05-01.
+const recCycleDaily = `{"freq":"daily","interval":1,"time":"09:00","timezone":"UTC","anchor":"2024-05-01"}`
+
+// nextRecurringAfter parses the spec and returns the calendar occurrence strictly
+// after the reference instant (the S1 advance contract: reference =
+// max(NextFireAt, executedAt)).
+func nextRecurringAfter(t *testing.T, specJSON string, after time.Time) time.Time {
+	t.Helper()
+	spec, err := domain.ParseRecurrence(specJSON)
+	if err != nil {
+		t.Fatalf("ParseRecurrence: %v", err)
+	}
+	next, err := domain.NextOccurrence(spec, after)
+	if err != nil {
+		t.Fatalf("NextOccurrence: %v", err)
+	}
+	return next
+}
+
+func TestRecurringCycleEndToEnd(t *testing.T) {
+	// Full recurring cycle on an already-armed trigger: fire -> persist re-arm
+	// (Enabled stays true, RetryAt cleared) -> no re-fire at the same instant ->
+	// fire again at the next occurrence and re-arm again.
+	clock := fixedNow // 2024-05-01 10:00 UTC
+	action := newFakeAction()
+	s, trig, tasks, events := newHarness(t, action, WithNow(func() time.Time { return clock }))
+	tasks.seed(dueTask("t"))
+
+	// The 09:00 UTC occurrence of the day is already past at clock 10:00: due.
+	first := time.Date(2024, 5, 1, 9, 0, 0, 0, time.UTC)
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeRecurring, Value: recCycleDaily, Enabled: true, NextFireAt: &first})
+
+	// Tick 1: fires the overdue occurrence and re-arms to the next one.
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Fatalf("first tick must execute the action once, got %d", action.count())
+	}
+	want1 := nextRecurringAfter(t, recCycleDaily, clock) // reference = max(first, clock) = clock
+	got, _ := trig.get("a")
+	if !got.Enabled {
+		t.Error("recurring trigger must stay enabled after a successful fire")
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(clock) {
+		t.Errorf("LastFiredAt should be %v, got %v", clock, got.LastFiredAt)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be cleared after a successful fire, got %v", got.RetryAt)
+	}
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(want1) {
+		t.Errorf("NextFireAt should advance to %v, got %v", want1, got.NextFireAt)
+	}
+	if n := len(events.fired()); n != 1 {
+		t.Errorf("expected 1 fired event, got %d", n)
+	}
+
+	// Tick 2 at the same instant: the advanced NextFireAt is strictly future, so
+	// the same occurrence must NOT fire again.
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Errorf("same instant must not re-fire the occurrence, got %d action runs", action.count())
+	}
+
+	// Tick 3 after advancing the clock to the next occurrence's day: fires again
+	// and re-arms one more step forward.
+	clock = clock.Add(24 * time.Hour) // 2024-05-02 10:00 UTC, past the 09:00 occurrence
+	mustTick(t, s)
+	if action.count() != 2 {
+		t.Errorf("expected a second action run at the next occurrence, got %d", action.count())
+	}
+	want2 := nextRecurringAfter(t, recCycleDaily, clock)
+	got, _ = trig.get("a")
+	if !got.Enabled {
+		t.Error("recurring trigger must stay enabled after the second fire")
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(clock) {
+		t.Errorf("LastFiredAt should be %v, got %v", clock, got.LastFiredAt)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be cleared after the second fire, got %v", got.RetryAt)
+	}
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(want2) {
+		t.Errorf("NextFireAt should advance to %v, got %v", want2, got.NextFireAt)
+	}
+	if n := len(events.fired()); n != 2 {
+		t.Errorf("expected 2 fired events, got %d", n)
+	}
+}
+
+func TestRecurringActionFailureKeepsOccurrenceAndRetries(t *testing.T) {
+	// A transient action failure on a recurring trigger must NOT advance the
+	// calendar: the current occurrence is preserved, RetryAt holds the retry off,
+	// no fire event, no LastFiredAt. Once the backoff elapses and the action
+	// succeeds, the occurrence finally fires: NextFireAt advances, LastFiredAt is
+	// recorded and RetryAt is cleared.
+	clock := fixedNow
+	action := newFakeAction()
+	action.fail = true
+	s, trig, tasks, events := newHarness(t, action, WithNow(func() time.Time { return clock }))
+	tasks.seed(dueTask("t"))
+
+	first := time.Date(2024, 5, 1, 9, 0, 0, 0, time.UTC) // occurrence, already past
+	_ = trig.Create(context.Background(), domain.Trigger{ID: "a", TaskID: "t", Type: domain.TriggerTypeRecurring, Value: recCycleDaily, Enabled: true, NextFireAt: &first})
+
+	// Tick 1: transient failure -> backoff, occurrence kept, no advance.
+	mustTick(t, s)
+	if action.count() != 1 {
+		t.Fatalf("action should be attempted once, got %d", action.count())
+	}
+	got, _ := trig.get("a")
+	if !got.Enabled {
+		t.Error("recurring trigger must remain enabled on a transient action failure")
+	}
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(first) {
+		t.Errorf("NextFireAt must keep the current occurrence (%v), got %v", first, got.NextFireAt)
+	}
+	wantRetry := clock.Add(defaultActionRetryDelay)
+	if got.RetryAt == nil || !got.RetryAt.Equal(wantRetry) {
+		t.Errorf("RetryAt should be %v, got %v", wantRetry, got.RetryAt)
+	}
+	if got.LastFiredAt != nil {
+		t.Errorf("LastFiredAt must not be set on action failure, got %v", got.LastFiredAt)
+	}
+	if n := len(events.fired()); n != 0 {
+		t.Errorf("no fired event expected on action failure, got %d", n)
+	}
+
+	// Advance past RetryAt and let the action succeed: the retried occurrence
+	// fires and the calendar advances exactly once.
+	action.fail = false
+	clock = clock.Add(defaultActionRetryDelay + time.Second)
+	mustTick(t, s)
+	if action.count() != 2 {
+		t.Errorf("expected a second action run after the backoff elapsed, got %d", action.count())
+	}
+	wantNext := nextRecurringAfter(t, recCycleDaily, clock) // reference = max(first, clock) = clock
+	got, _ = trig.get("a")
+	if got.NextFireAt == nil || !got.NextFireAt.Equal(wantNext) {
+		t.Errorf("NextFireAt should advance to %v after the retried success, got %v", wantNext, got.NextFireAt)
+	}
+	if got.RetryAt != nil {
+		t.Errorf("RetryAt must be cleared after the retried success, got %v", got.RetryAt)
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(clock) {
+		t.Errorf("LastFiredAt should be %v after the retried success, got %v", clock, got.LastFiredAt)
+	}
+	if n := len(events.fired()); n != 1 {
+		t.Errorf("expected exactly 1 fired event (the successful retry), got %d", n)
+	}
+}
+
 
 func TestActionFailureBackoff(t *testing.T) {
 	// The RetryAt backoff must re-arm the scheduler's next deadline to RetryAt

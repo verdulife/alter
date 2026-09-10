@@ -228,7 +228,21 @@ func (s *Scheduler) arm(ctx context.Context, t domain.Trigger) (time.Time, bool)
 		return time.Time{}, false
 	}
 
-	next, err := domain.CalculateNextFireAt(t, task)
+	var next time.Time
+	if t.Type == domain.TriggerTypeRecurring {
+		// Recurring (B3 S2): the calendar in Value is the source of truth. The
+		// derived cache is initialized from now (NextFireAt == nil); the phase
+		// comes from the spec's Anchor, never from execution state. Invalid
+		// specs fail below exactly like malformed one-shot values: no arm, no
+		// persist, no busy loop (terminal but reversible).
+		var spec domain.RecurrenceSpec
+		spec, err = domain.ParseRecurrence(t.Value)
+		if err == nil {
+			next, err = domain.NextOccurrence(spec, s.now())
+		}
+	} else {
+		next, err = domain.CalculateNextFireAt(t, task)
+	}
 	if err != nil {
 		// Malformed / DueAt missing: terminal but reversible; leave unarmed.
 		s.logger.Printf("scheduler: cannot arm trigger %s: %v", t.ID, err)
