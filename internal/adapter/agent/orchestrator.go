@@ -149,22 +149,26 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 // blocked by search. The Orchestrator only ever sees the domain port: it never
 // touches SQLite, the vector tables or the embedding provider.
 func (o *Orchestrator) instruction(ctx context.Context, task domain.Task) string {
+	var base string
 	if o.searcher == nil {
-		return defaultInstruction(task)
-	}
-	results, err := o.searcher.Search(ctx, searchQuery(task), domain.SearchOptions{
-		// Limit 0: the adapter applies its configured default (runtime 5).
-		Exclude: []domain.Ref{{Kind: domain.RefKindTask, ID: task.ID}},
-	})
-	if err != nil {
-		if !errors.Is(err, domain.ErrSemanticUnavailable) {
-			// Unavailable is the expected degraded state (already logged at
-			// startup); log only genuine failures.
-			o.logger.Printf("orchestrator: semantic search skipped: %v", err)
+		base = defaultInstruction(task)
+	} else {
+		results, err := o.searcher.Search(ctx, searchQuery(task), domain.SearchOptions{
+			// Limit 0: the adapter applies its configured default (runtime 5).
+			Exclude: []domain.Ref{{Kind: domain.RefKindTask, ID: task.ID}},
+		})
+		if err != nil {
+			if !errors.Is(err, domain.ErrSemanticUnavailable) {
+				// Unavailable is the expected degraded state (already logged at
+				// startup); log only genuine failures.
+				o.logger.Printf("orchestrator: semantic search skipped: %v", err)
+			}
+			base = defaultInstruction(task)
+		} else {
+			base = assembleInstruction(task, results)
 		}
-		return defaultInstruction(task)
 	}
-	return assembleInstruction(task, results)
+	return reminderPrompt + "\n\nUser message: " + base
 }
 
 // indexEvent feeds a confirmed agent.result Event to the derived semantic index

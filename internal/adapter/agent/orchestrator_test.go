@@ -294,8 +294,12 @@ func TestSearchEnrichesInstruction(t *testing.T) {
 		t.Errorf("Exclude = %+v, want the fired task itself", opts.Exclude)
 	}
 
-	// The instruction carries the default plus labeled, bounded context.
+	// The instruction carries the reminder prompt, the default, and labeled,
+	// bounded context.
 	instr := a.calls[0].Instruction
+	if !strings.HasPrefix(instr, reminderPrompt+"\n\nUser message: ") {
+		t.Errorf("instruction lacks the reminder prompt prefix: %q", instr)
+	}
 	if !strings.Contains(instr, "Related context:") {
 		t.Errorf("instruction lacks context: %q", instr)
 	}
@@ -318,8 +322,9 @@ func TestSearchErrorFallsBackToDefault(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
-		t.Errorf("instruction = %q, want the plain default on search error", got)
+	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	if got := a.calls[0].Instruction; got != want {
+		t.Errorf("instruction = %q, want %q", got, want)
 	}
 }
 
@@ -337,8 +342,9 @@ func TestSearchUnavailableFallsBackSilently(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute again: %v", err)
 	}
-	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
-		t.Errorf("instruction = %q, want the plain default on unavailable", got)
+	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	if got := a.calls[0].Instruction; got != want {
+		t.Errorf("instruction = %q, want %q", got, want)
 	}
 }
 
@@ -352,8 +358,9 @@ func TestNoSearcherNoContext(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
-		t.Errorf("instruction = %q, want the plain default without a searcher", got)
+	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	if got := a.calls[0].Instruction; got != want {
+		t.Errorf("instruction = %q, want %q", got, want)
 	}
 }
 
@@ -368,8 +375,9 @@ func TestEmptySearchResultsNoContext(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if got := a.calls[0].Instruction; got != defaultInstruction(task) {
-		t.Errorf("instruction = %q, want the plain default on empty results", got)
+	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	if got := a.calls[0].Instruction; got != want {
+		t.Errorf("instruction = %q, want %q", got, want)
 	}
 }
 
