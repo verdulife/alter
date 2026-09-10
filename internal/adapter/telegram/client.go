@@ -68,12 +68,14 @@ func (c *Client) GetUpdates(ctx context.Context, offset int) ([]Update, error) {
 	return result, nil
 }
 
-// SendMessage posts a text message to the given chat.
+// SendMessage posts a text message to the given chat. The message is sent with
+// parse_mode "HTML" so the adapter can use <b>, <i>, etc. for formatting.
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
 	var result Message
 	if err := c.call(ctx, "sendMessage", map[string]any{
-		"chat_id": chatID,
-		"text":    text,
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "HTML",
 	}, &result); err != nil {
 		return err
 	}

@@ -162,7 +162,7 @@ func TestHandleAppErrorSurfaces(t *testing.T) {
 	}
 }
 
-// --- /recordar -------------------------------------------------------------- 
+// --- /recordar --------------------------------------------------------------
 
 func parseCall(t *testing.T, text string) (string, time.Duration, error) {
 	t.Helper()
@@ -222,7 +222,7 @@ func TestHandleRecordarValid(t *testing.T) {
 	if len(svc.reminderDurs) != 1 || svc.reminderDurs[0] != 10*time.Second {
 		t.Errorf("durations = %v, want [10s]", svc.reminderDurs)
 	}
-	if !strings.Contains(reply, "Recordatorio creado") {
+	if !strings.Contains(reply, "⏰") || !strings.Contains(reply, "<b>recoger pedido</b>") {
 		t.Errorf("reply = %q, want confirmation", reply)
 	}
 	if strings.Contains(reply, "task-") {
@@ -255,7 +255,7 @@ func TestHandleRecordarAppErrorSurfaces(t *testing.T) {
 	}
 }
 
-// --- /listar ---------------------------------------------------------------------- 
+// --- /listar ----------------------------------------------------------------------
 
 func TestHandleListarEmpty(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{}}
@@ -263,7 +263,7 @@ func TestHandleListarEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if !strings.Contains(reply, "No tenés tareas pendientes") {
+	if !strings.Contains(reply, "No hay tareas pendientes") {
 		t.Errorf("reply = %q, want empty message", reply)
 	}
 }
@@ -313,7 +313,7 @@ func TestHandleListarError(t *testing.T) {
 	}
 }
 
-// --- /completar ------------------------------------------------------------------- 
+// --- /completar -------------------------------------------------------------------
 
 func TestHandleCompletarValid(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
@@ -326,7 +326,7 @@ func TestHandleCompletarValid(t *testing.T) {
 	if len(svc.completedTasks) != 1 {
 		t.Errorf("expected 1 completed task, got %d", len(svc.completedTasks))
 	}
-	if !strings.Contains(reply, "completé") {
+	if !strings.Contains(reply, "✅") || !strings.Contains(reply, "completada") {
 		t.Errorf("reply = %q, want completion confirmation", reply)
 	}
 }
@@ -369,7 +369,7 @@ func TestHandleCompletarMultipleMatches(t *testing.T) {
 	}
 }
 
-// --- /cancelar -------------------------------------------------------------------- 
+// --- /cancelar --------------------------------------------------------------------
 
 func TestHandleCancelarValid(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
@@ -382,7 +382,7 @@ func TestHandleCancelarValid(t *testing.T) {
 	if len(svc.cancelledTasks) != 1 {
 		t.Errorf("expected 1 cancelled task, got %d", len(svc.cancelledTasks))
 	}
-	if !strings.Contains(reply, "Cancelé") {
+	if !strings.Contains(reply, "❌") || !strings.Contains(reply, "cancelada") {
 		t.Errorf("reply = %q, want cancel confirmation", reply)
 	}
 }
@@ -425,7 +425,7 @@ func TestHandleCancelarMultipleMatches(t *testing.T) {
 	}
 }
 
-// --- Natural language fallback -------------------------------------------------------------- 
+// --- Natural language fallback --------------------------------------------------------------
 
 func TestHandleNaturalLanguageFallback(t *testing.T) {
 	svc := &fakeCommandService{}
@@ -458,8 +458,8 @@ func TestHandleNaturalLanguageNilFallsBackToHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if !strings.Contains(reply, "Comando no reconocido") {
-		t.Errorf("reply = %q, want legacy help when natural handler is nil", reply)
+	if !strings.Contains(reply, "ALTER") {
+		t.Errorf("reply = %q, want help when natural handler is nil", reply)
 	}
 }
 

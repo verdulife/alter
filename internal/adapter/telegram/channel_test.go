@@ -22,8 +22,8 @@ func TestChannelSendUsesOwnerChat(t *testing.T) {
 	if client.sent[0].chatID != 4242 {
 		t.Errorf("channel delivered to chat %d, want owner 4242", client.sent[0].chatID)
 	}
-	if client.sent[0].text != "hola" {
-		t.Errorf("channel text = %q, want hola", client.sent[0].text)
+	if client.sent[0].text != "⏰ <b>hola</b>" {
+		t.Errorf("channel text = %q, want framed hola", client.sent[0].text)
 	}
 }
 

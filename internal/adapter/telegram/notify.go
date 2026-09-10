@@ -32,9 +32,5 @@ func (a *NotifyAction) Execute(ctx context.Context, _ domain.Trigger, task domai
 
 // notifyMessage renders the user-facing notification text from a task.
 func notifyMessage(task domain.Task) string {
-	msg := "⏰ Recordatorio: " + task.Title
-	if task.Description != "" {
-		msg += "\n" + task.Description
-	}
-	return msg
+	return MsgReminderFired(task.Title, task.Description)
 }

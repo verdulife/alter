@@ -29,7 +29,10 @@ func NewChannel(client APIClient, ownerID int64) *Channel {
 // Name reports the transport name.
 func (c *Channel) Name() string { return "telegram" }
 
-// Send delivers a notification message to the configured owner chat.
+// Send delivers a plain-text notification to the configured owner chat. The
+// channel is the presentation boundary: producers (NotifyAction, Orchestrator)
+// only provide semantic content, and the channel applies the Telegram HTML
+// framing (see frameNotification) before sending.
 func (c *Channel) Send(ctx context.Context, message string) error {
-	return c.client.SendMessage(ctx, c.ownerID, message)
+	return c.client.SendMessage(ctx, c.ownerID, frameNotification(message))
 }

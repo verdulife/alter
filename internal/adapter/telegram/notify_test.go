@@ -55,3 +55,23 @@ func TestNotifyActionChannelError(t *testing.T) {
 		t.Errorf("no send should be recorded on failure, got %d", len(ch.sent))
 	}
 }
+
+// TestNotifyActionFramingAtChannel pins the fired-notification contract: the
+// action passes semantic plain content and the telegram Channel applies the
+// HTML framing (⏰ + bold subject) before the send.
+func TestNotifyActionFramingAtChannel(t *testing.T) {
+	client := &recordingClient{}
+	ch := NewChannel(client, 4242)
+	a := NewNotifyAction(ch)
+
+	task := domain.Task{Title: "Comprar pan", Description: "pan integral"}
+	if err := a.Execute(context.Background(), domain.Trigger{}, task); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(client.sent) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(client.sent))
+	}
+	if want := "⏰ <b>Comprar pan</b>\n\npan integral"; client.sent[0].text != want {
+		t.Errorf("fired notification = %q, want %q", client.sent[0].text, want)
+	}
+}

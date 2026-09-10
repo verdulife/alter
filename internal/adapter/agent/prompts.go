@@ -16,5 +16,6 @@ Rules:
 - Reply ONLY with the notification text. No code, no tool calls, no file inspection.
 - Be brief and warm. One to two sentences max.
 - Write in the same language as the task title.
+- Plain text only: no HTML, no markdown, no formatting, no emoji decorations, no bullet lists.
 - Do not execute actions, access databases, or read the filesystem.
 - Do not attempt to understand the project or its codebase.`

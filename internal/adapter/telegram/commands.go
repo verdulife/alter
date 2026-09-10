@@ -3,7 +3,6 @@ package telegram
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -11,9 +10,9 @@ import (
 )
 
 const (
-	cmdNueva    = "/nueva"
-	cmdRecordar = "/recordar"
-	cmdListar   = "/listar"
+	cmdNueva     = "/nueva"
+	cmdRecordar  = "/recordar"
+	cmdListar    = "/listar"
 	cmdCompletar = "/completar"
 	cmdCancelar  = "/cancelar"
 )
@@ -58,6 +57,12 @@ type NaturalHandler func(ctx context.Context, text string) (string, error)
 //  3. If no NaturalHandler is configured, unknown messages produce a help reply.
 //
 // Internal task/trigger IDs are deliberately not exposed to the user in replies.
+//
+// Presentation ownership: every reply returned by Handle is either produced by
+// format.go (HTML-safe) or, for the natural language path, the plain-text reply
+// of the application service escaped by the adapter before it reaches the
+// HTML-parsed Telegram send. The application layers (naturalintent, command
+// service) never know about Telegram formatting.
 func Handle(ctx context.Context, svc CommandService, text string, natural NaturalHandler) (string, error) {
 	trimmed := strings.TrimSpace(text)
 
@@ -66,83 +71,84 @@ func Handle(ctx context.Context, svc CommandService, text string, natural Natura
 	case strings.HasPrefix(trimmed, cmdNueva):
 		title := strings.TrimSpace(strings.TrimPrefix(trimmed, cmdNueva))
 		if title == "" {
-			return "Uso: /nueva <título>", nil
+			return MsgUsageNueva(), nil
 		}
 		if _, err := svc.CreateTask(ctx, title); err != nil {
-			return "No pude crear la tarea: " + err.Error(), err
+			return MsgErrorCreating("la tarea", err.Error()), err
 		}
-		return "Tarea creada ✓", nil
+		return MsgTaskCreated(title), nil
 
 	case strings.HasPrefix(trimmed, cmdRecordar):
 		title, d, err := parseReminder(trimmed)
 		if err != nil {
-			return "Uso: /recordar <título> in <duración> (p. ej. 10s, 5m, 1h)", nil
+			return MsgUsageRecordar(), nil
 		}
 		task, err := svc.CreateReminder(ctx, title, d)
 		if err != nil {
-			return "No pude crear el recordatorio: " + err.Error(), err
+			return MsgErrorCreating("el recordatorio", err.Error()), err
 		}
-		return fmt.Sprintf("Recordatorio creado ✓ para «%s» en %s", task.Title, d), nil
+		return MsgReminderCreated(task.Title, d.String()), nil
 
 	case strings.HasPrefix(trimmed, cmdListar):
 		tasks, err := svc.ListPendingTasks(ctx)
 		if err != nil {
-			return "No pude obtener las tareas.", err
+			return MsgErrorAction("obtener las tareas"), err
 		}
-		return formatTaskList(tasks), nil
+		titles := pendingTitles(tasks)
+		if len(titles) == 0 {
+			return MsgTaskListEmpty(), nil
+		}
+		return MsgTaskList(titles), nil
 
 	case strings.HasPrefix(trimmed, cmdCompletar):
 		ref := strings.TrimSpace(strings.TrimPrefix(trimmed, cmdCompletar))
 		if ref == "" {
-			return "Uso: /completar <referencia de la tarea>", nil
+			return MsgUsageCompletar(), nil
 		}
-		_, reply, err := svc.CompleteTaskByRef(ctx, ref)
+		task, reply, err := svc.CompleteTaskByRef(ctx, ref)
 		if err != nil {
-			return reply, err
+			// The service reply is plain text (the adapter owns presentation);
+			// escape it so the HTML-parsed send cannot be broken.
+			return escapeHTML(reply), err
 		}
-		return reply, nil
+		return MsgTaskCompleted(task.Title), nil
 
 	case strings.HasPrefix(trimmed, cmdCancelar):
 		ref := strings.TrimSpace(strings.TrimPrefix(trimmed, cmdCancelar))
 		if ref == "" {
-			return "Uso: /cancelar <referencia de la tarea>", nil
+			return MsgUsageCancelar(), nil
 		}
-		_, reply, err := svc.CancelTaskByRef(ctx, ref)
+		task, reply, err := svc.CancelTaskByRef(ctx, ref)
 		if err != nil {
-			return reply, err
+			return escapeHTML(reply), err
 		}
-		return reply, nil
+		return MsgTaskCancelled(task.Title), nil
 	}
 
-	// 2. Natural language: delegate to the interpreter if configured.
+	// 2. Natural language: delegate to the interpreter if configured. The reply
+	// is Go-generated plain text (it may embed Pi-authored clarification text);
+	// the adapter escapes it before it reaches the HTML-parsed Telegram send.
 	if natural != nil {
-		return natural(ctx, trimmed)
+		reply, err := natural(ctx, trimmed)
+		if err != nil {
+			return escapeHTML(reply), err
+		}
+		return escapeHTML(reply), nil
 	}
 
-	// 3. Fallback: no natural handler configured, show legacy help.
-	return "Comando no reconocido. Usa /nueva <título>, /recordar <título> in <duración>, /listar, /completar <ref> o /cancelar <ref>", nil
+	// 3. Fallback: no natural handler configured, show help.
+	return MsgUnrecognized(), nil
 }
 
-// formatTaskList formats a list of tasks for the user.
-func formatTaskList(tasks []domain.Task) string {
-	// Filter to pending only.
-	var pending []domain.Task
+// pendingTitles returns the titles of pending tasks only, in list order.
+func pendingTitles(tasks []domain.Task) []string {
+	var titles []string
 	for _, t := range tasks {
 		if t.Status == domain.TaskStatusPending {
-			pending = append(pending, t)
+			titles = append(titles, t.Title)
 		}
 	}
-
-	if len(pending) == 0 {
-		return "No tenés tareas pendientes."
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Tenes %d tarea(s) pendiente(s):\n", len(pending)))
-	for i, t := range pending {
-		sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
-	}
-	return sb.String()
+	return titles
 }
 
 // parseReminder parses "<title> in <duration>" from a /recordar message. It
