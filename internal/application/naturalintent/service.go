@@ -2,9 +2,11 @@ package naturalintent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/verdu/alter/internal/domain"
@@ -21,6 +23,7 @@ type Service struct {
 	interpreter IntentInterpreter
 	tasks       TaskCreator
 	triggers    TriggerCreator
+	manager     TaskManager
 	now         func() time.Time
 	timezone    *time.Location
 	logger      *log.Logger
@@ -34,6 +37,14 @@ type TaskCreator interface {
 // TriggerCreator abstracts trigger creation for testability.
 type TriggerCreator interface {
 	Create(ctx context.Context, params appservice.CreateTriggerParams) (domain.Trigger, error)
+}
+
+// TaskManager abstracts task listing, completion and cancellation for testability.
+// It is satisfied by service.TaskService.
+type TaskManager interface {
+	List(ctx context.Context) ([]domain.Task, error)
+	Complete(ctx context.Context, id string) (domain.Task, error)
+	Cancel(ctx context.Context, id string) (domain.Task, error)
 }
 
 // Option configures a Service.
@@ -54,6 +65,7 @@ func NewService(
 	interpreter IntentInterpreter,
 	tasks TaskCreator,
 	triggers TriggerCreator,
+	manager TaskManager,
 	timezone *time.Location,
 	opts ...Option,
 ) *Service {
@@ -61,6 +73,7 @@ func NewService(
 		interpreter: interpreter,
 		tasks:       tasks,
 		triggers:    triggers,
+		manager:     manager,
 		now:         time.Now,
 		timezone:    timezone,
 		logger:      log.New(io.Discard, "", 0),
@@ -108,6 +121,12 @@ func (s *Service) executeRecognized(ctx context.Context, intent *RecognizedInten
 		return s.createTask(ctx, intent.Title)
 	case ActionCreateReminder:
 		return s.createReminder(ctx, intent.Title, intent.Reminder)
+	case ActionListTasks:
+		return s.listTasks(ctx)
+	case ActionCompleteTask:
+		return s.completeTask(ctx, intent.TaskRef)
+	case ActionCancelTask:
+		return s.cancelTask(ctx, intent.TaskRef)
 	default:
 		return fmt.Sprintf("Acción no soportada: %s", intent.Action), nil
 	}
@@ -159,4 +178,89 @@ func (s *Service) createReminder(ctx context.Context, title string, spec *Remind
 
 	return fmt.Sprintf("Recordatorio creado ✓ \"%s\" para %s",
 		title, at.In(s.timezone).Format("02/01 15:04")), nil
+}
+
+// listTasks returns all pending tasks formatted for the user.
+func (s *Service) listTasks(ctx context.Context) (string, error) {
+	tasks, err := s.manager.List(ctx)
+	if err != nil {
+		return "No pude obtener las tareas.", err
+	}
+
+	// Filter to pending only.
+	var pending []domain.Task
+	for _, t := range tasks {
+		if t.Status == domain.TaskStatusPending {
+			pending = append(pending, t)
+		}
+	}
+
+	if len(pending) == 0 {
+		return "No tenés tareas pendientes.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Tenes %d tarea(s) pendiente(s):\n", len(pending)))
+	for i, t := range pending {
+		sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
+	}
+	return sb.String(), nil
+}
+
+// completeTask finds a pending task by reference and marks it as completed.
+func (s *Service) completeTask(ctx context.Context, taskRef string) (string, error) {
+	task, err := s.resolveTask(ctx, taskRef)
+	if err != nil {
+		return err.Error(), err
+	}
+
+	if _, err := s.manager.Complete(ctx, task.ID); err != nil {
+		return "No pude completar la tarea: " + err.Error(), err
+	}
+	return fmt.Sprintf("Listo, completé «%s» ✓", task.Title), nil
+}
+
+// cancelTask finds a pending task by reference and cancels it.
+func (s *Service) cancelTask(ctx context.Context, taskRef string) (string, error) {
+	task, err := s.resolveTask(ctx, taskRef)
+	if err != nil {
+		return err.Error(), err
+	}
+
+	if _, err := s.manager.Cancel(ctx, task.ID); err != nil {
+		return "No pude cancelar la tarea: " + err.Error(), err
+	}
+	return fmt.Sprintf("Cancelé «%s» ✓", task.Title), nil
+}
+
+// resolveTask finds a single pending task matching the given reference.
+// Returns an error reply if 0 or 2+ tasks match.
+func (s *Service) resolveTask(ctx context.Context, ref string) (domain.Task, error) {
+	tasks, err := s.manager.List(ctx)
+	if err != nil {
+		return domain.Task{}, fmt.Errorf("No pude obtener las tareas: %w", err)
+	}
+
+	refLower := strings.ToLower(ref)
+	var matches []domain.Task
+	for _, t := range tasks {
+		if t.Status == domain.TaskStatusPending && strings.Contains(strings.ToLower(t.Title), refLower) {
+			matches = append(matches, t)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return domain.Task{}, fmt.Errorf("No encontré ninguna tarea pendiente que coincida con «%s».", ref)
+	case 1:
+		return matches[0], nil
+	default:
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Encontré varias tareas que coinciden con «%s»:\n", ref))
+		for i, t := range matches {
+			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
+		}
+		sb.WriteString("¿Cuál?")
+		return domain.Task{}, errors.New(sb.String())
+	}
 }

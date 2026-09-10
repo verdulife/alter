@@ -144,7 +144,7 @@ func main() {
 		natInterpreter := naturalintent.NewPiNaturalInterpreter(
 			naturalintent.NewPiRunnerAdapter(piAgent),
 		)
-		natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, tz,
+		natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, taskSvc, tz,
 			naturalintent.WithLogger(logger),
 		)
 		naturalHandler = natSvc.HandleMessage

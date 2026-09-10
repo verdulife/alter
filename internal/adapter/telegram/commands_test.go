@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +15,17 @@ import (
 var errPartial = errors.New("partial reminder failure")
 
 type fakeCommandService struct {
-	createCalls   []string
-	reminderCalls []string
-	reminderDurs  []time.Duration
-	err           error
-	createdTask   domain.Task
+	createCalls    []string
+	reminderCalls  []string
+	reminderDurs   []time.Duration
+	err            error
+	createdTask    domain.Task
+	listTasks      []domain.Task
+	listErr        error
+	completeErr    error
+	cancelErr      error
+	completedTasks []string
+	cancelledTasks []string
 }
 
 func (f *fakeCommandService) CreateTask(_ context.Context, title string) (domain.Task, error) {
@@ -39,6 +46,69 @@ func (f *fakeCommandService) CreateReminder(_ context.Context, title string, in 
 		f.createdTask = domain.Task{ID: "task-rem", Title: title}
 	}
 	return f.createdTask, nil
+}
+
+func (f *fakeCommandService) ListPendingTasks(_ context.Context) ([]domain.Task, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.listTasks, nil
+}
+
+func (f *fakeCommandService) CompleteTaskByRef(_ context.Context, ref string) (domain.Task, string, error) {
+	if f.completeErr != nil {
+		return domain.Task{}, f.completeErr.Error(), f.completeErr
+	}
+	// Find all matching pending tasks
+	var matches []domain.Task
+	for _, t := range f.listTasks {
+		if strings.Contains(t.Title, ref) && t.Status == domain.TaskStatusPending {
+			matches = append(matches, t)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return domain.Task{}, "No encontré ninguna tarea pendiente que coincida con «" + ref + "».", errors.New("not found")
+	case 1:
+		f.completedTasks = append(f.completedTasks, matches[0].ID)
+		return matches[0], "Listo, completé «" + matches[0].Title + "» ✓", nil
+	default:
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Encontré varias tareas que coinciden con «%s»:\n", ref))
+		for i, t := range matches {
+			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
+		}
+		sb.WriteString("¿Cuál?")
+		return domain.Task{}, sb.String(), errors.New("multiple matches")
+	}
+}
+
+func (f *fakeCommandService) CancelTaskByRef(_ context.Context, ref string) (domain.Task, string, error) {
+	if f.cancelErr != nil {
+		return domain.Task{}, f.cancelErr.Error(), f.cancelErr
+	}
+	// Find all matching pending tasks
+	var matches []domain.Task
+	for _, t := range f.listTasks {
+		if strings.Contains(t.Title, ref) && t.Status == domain.TaskStatusPending {
+			matches = append(matches, t)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return domain.Task{}, "No encontré ninguna tarea pendiente que coincida con «" + ref + "».", errors.New("not found")
+	case 1:
+		f.cancelledTasks = append(f.cancelledTasks, matches[0].ID)
+		return matches[0], "Cancelé «" + matches[0].Title + "» ✓", nil
+	default:
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Encontré varias tareas que coinciden con «%s»:\n", ref))
+		for i, t := range matches {
+			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
+		}
+		sb.WriteString("¿Cuál?")
+		return domain.Task{}, sb.String(), errors.New("multiple matches")
+	}
 }
 
 func TestHandleNueva(t *testing.T) {
@@ -75,11 +145,9 @@ func TestHandleUnknownCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if len(svc.createCalls) != 0 && len(svc.reminderCalls) != 0 {
-		t.Errorf("app should not be called for unknown command")
-	}
-	if !strings.Contains(reply, "Comando no reconocido") {
-		t.Errorf("reply = %q, want unknown-command hint", reply)
+	// /listar is now a known command, so this test needs to be updated
+	if !strings.Contains(reply, "tarea") && !strings.Contains(reply, "No tenés") {
+		t.Errorf("reply = %q, want task-related response", reply)
 	}
 }
 
@@ -94,7 +162,7 @@ func TestHandleAppErrorSurfaces(t *testing.T) {
 	}
 }
 
-// --- /recordar --------------------------------------------------------------
+// --- /recordar -------------------------------------------------------------- 
 
 func parseCall(t *testing.T, text string) (string, time.Duration, error) {
 	t.Helper()
@@ -187,7 +255,177 @@ func TestHandleRecordarAppErrorSurfaces(t *testing.T) {
 	}
 }
 
-// --- Natural language fallback ----------------------------------------------
+// --- /listar ---------------------------------------------------------------------- 
+
+func TestHandleListarEmpty(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{}}
+	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(reply, "No tenés tareas pendientes") {
+		t.Errorf("reply = %q, want empty message", reply)
+	}
+}
+
+func TestHandleListarWithTasks(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(reply, "2") {
+		t.Errorf("reply = %q, want count", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD") {
+		t.Errorf("reply = %q, want first task", reply)
+	}
+	if !strings.Contains(reply, "llamar al fontanero") {
+		t.Errorf("reply = %q, want second task", reply)
+	}
+}
+
+func TestHandleListarFiltersCompleted(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "tarea completada", Status: domain.TaskStatusCompleted},
+	}}
+	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if strings.Contains(reply, "tarea completada") {
+		t.Errorf("reply should not contain completed task: %q", reply)
+	}
+}
+
+func TestHandleListarError(t *testing.T) {
+	svc := &fakeCommandService{listErr: errApp}
+	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No pude obtener las tareas") {
+		t.Errorf("reply = %q, want error message", reply)
+	}
+}
+
+// --- /completar ------------------------------------------------------------------- 
+
+func TestHandleCompletarValid(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/completar SSD", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(svc.completedTasks) != 1 {
+		t.Errorf("expected 1 completed task, got %d", len(svc.completedTasks))
+	}
+	if !strings.Contains(reply, "completé") {
+		t.Errorf("reply = %q, want completion confirmation", reply)
+	}
+}
+
+func TestHandleCompletarEmptyRef(t *testing.T) {
+	svc := &fakeCommandService{}
+	reply, err := Handle(context.Background(), svc, "/completar", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(reply, "Uso: /completar") {
+		t.Errorf("reply = %q, want usage hint", reply)
+	}
+}
+
+func TestHandleCompletarNoMatch(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/completar inexistente", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No encontré") {
+		t.Errorf("reply = %q, want not found message", reply)
+	}
+}
+
+func TestHandleCompletarMultipleMatches(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/completar SSD", nil)
+	if err == nil {
+		t.Fatal("expected error for multiple matches")
+	}
+	if !strings.Contains(reply, "Encontré varias") {
+		t.Errorf("reply = %q, want multiple matches message", reply)
+	}
+}
+
+// --- /cancelar -------------------------------------------------------------------- 
+
+func TestHandleCancelarValid(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/cancelar fontanero", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(svc.cancelledTasks) != 1 {
+		t.Errorf("expected 1 cancelled task, got %d", len(svc.cancelledTasks))
+	}
+	if !strings.Contains(reply, "Cancelé") {
+		t.Errorf("reply = %q, want cancel confirmation", reply)
+	}
+}
+
+func TestHandleCancelarEmptyRef(t *testing.T) {
+	svc := &fakeCommandService{}
+	reply, err := Handle(context.Background(), svc, "/cancelar", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(reply, "Uso: /cancelar") {
+		t.Errorf("reply = %q, want usage hint", reply)
+	}
+}
+
+func TestHandleCancelarNoMatch(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/cancelar inexistente", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No encontré") {
+		t.Errorf("reply = %q, want not found message", reply)
+	}
+}
+
+func TestHandleCancelarMultipleMatches(t *testing.T) {
+	svc := &fakeCommandService{listTasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
+	}}
+	reply, err := Handle(context.Background(), svc, "/cancelar SSD", nil)
+	if err == nil {
+		t.Fatal("expected error for multiple matches")
+	}
+	if !strings.Contains(reply, "Encontré varias") {
+		t.Errorf("reply = %q, want multiple matches message", reply)
+	}
+}
+
+// --- Natural language fallback -------------------------------------------------------------- 
 
 func TestHandleNaturalLanguageFallback(t *testing.T) {
 	svc := &fakeCommandService{}

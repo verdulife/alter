@@ -287,6 +287,116 @@ func TestInterpretReminderNoTimeFields(t *testing.T) {
 	}
 }
 
+// --- list_tasks ----------------------------------------------------------------
+
+func TestInterpretListTasks(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"list_tasks"}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "qué tareas tengo", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Recognized == nil {
+		t.Fatal("expected Recognized intent")
+	}
+	if result.Recognized.Action != ActionListTasks {
+		t.Errorf("action = %q, want %q", result.Recognized.Action, ActionListTasks)
+	}
+}
+
+// --- complete_task ---------------------------------------------------------------
+
+func TestInterpretCompleteTask(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"complete_task","task_ref":"compra SSD"}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "compra SSD lista", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Recognized == nil {
+		t.Fatal("expected Recognized intent")
+	}
+	if result.Recognized.Action != ActionCompleteTask {
+		t.Errorf("action = %q, want %q", result.Recognized.Action, ActionCompleteTask)
+	}
+	if result.Recognized.TaskRef != "compra SSD" {
+		t.Errorf("task_ref = %q, want %q", result.Recognized.TaskRef, "compra SSD")
+	}
+}
+
+func TestInterpretCompleteTaskMissingRef(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"complete_task","missing_fields":["task_ref"],"clarification_prompt":"¿Qué tarea querés completar?"}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "completá algo", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Ambiguous == nil {
+		t.Fatal("expected Ambiguous intent")
+	}
+	if result.Ambiguous.Action != ActionCompleteTask {
+		t.Errorf("action = %q, want %q", result.Ambiguous.Action, ActionCompleteTask)
+	}
+	if len(result.Ambiguous.MissingFields) != 1 || result.Ambiguous.MissingFields[0] != "task_ref" {
+		t.Errorf("missing_fields = %v, want [task_ref]", result.Ambiguous.MissingFields)
+	}
+}
+
+// --- cancel_task -----------------------------------------------------------------
+
+func TestInterpretCancelTask(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"cancel_task","task_ref":"fontanero"}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "cancelá la del fontanero", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Recognized == nil {
+		t.Fatal("expected Recognized intent")
+	}
+	if result.Recognized.Action != ActionCancelTask {
+		t.Errorf("action = %q, want %q", result.Recognized.Action, ActionCancelTask)
+	}
+	if result.Recognized.TaskRef != "fontanero" {
+		t.Errorf("task_ref = %q, want %q", result.Recognized.TaskRef, "fontanero")
+	}
+}
+
+func TestInterpretCancelTaskMissingRef(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"cancel_task","missing_fields":["task_ref"]}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "cancelá", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Ambiguous == nil {
+		t.Fatal("expected Ambiguous intent")
+	}
+	if result.Ambiguous.Action != ActionCancelTask {
+		t.Errorf("action = %q, want %q", result.Ambiguous.Action, ActionCancelTask)
+	}
+}
+
 func TestInterpretPassesUserTextToPi(t *testing.T) {
 	runner := &fakePiRunner{
 		response: `{"action":"unrecognized"}`,

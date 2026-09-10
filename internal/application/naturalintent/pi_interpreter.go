@@ -31,11 +31,12 @@ func NewPiNaturalInterpreter(runner piRunner) *PiNaturalInterpreter {
 // piIntentJSON is the raw JSON structure Pi is expected to produce.
 // Fields are pointers so we can distinguish "not present" from "zero value".
 type piIntentJSON struct {
-	Action              *string  `json:"action"`
-	Title               *string  `json:"title"`
+	Action              *string       `json:"action"`
+	Title               *string       `json:"title"`
+	TaskRef             *string       `json:"task_ref,omitempty"`
 	Reminder            *reminderJSON `json:"reminder,omitempty"`
-	MissingFields       []string `json:"missing_fields,omitempty"`
-	ClarificationPrompt *string  `json:"clarification_prompt,omitempty"`
+	MissingFields       []string      `json:"missing_fields,omitempty"`
+	ClarificationPrompt *string       `json:"clarification_prompt,omitempty"`
 }
 
 type reminderJSON struct {
@@ -102,8 +103,69 @@ func normalizeIntent(parsed piIntentJSON) (IntentResult, error) {
 	case "create_task", "create_reminder":
 		return normalizeRecognizedOrAmbiguous(parsed, action)
 
+	case "list_tasks":
+		return IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionListTasks,
+			},
+		}, nil
+
+	case "complete_task", "cancel_task":
+		return normalizeTaskAction(parsed, action)
+
 	default:
 		return IntentResult{}, fmt.Errorf("natural interpreter: unknown action %q", action)
+	}
+}
+
+// normalizeTaskAction handles complete_task and cancel_task, validating that a task_ref is present.
+func normalizeTaskAction(parsed piIntentJSON, action string) (IntentResult, error) {
+	taskRef := derefStr(parsed.TaskRef)
+	missing := parsed.MissingFields
+
+	// If Pi declared missing fields, it's ambiguous.
+	if len(missing) > 0 {
+		prompt := derefStr(parsed.ClarificationPrompt)
+		if prompt == "" {
+			prompt = "¿Qué tarea quieres " + actionVerb(action) + "?"
+		}
+		return IntentResult{
+			Ambiguous: &AmbiguousIntent{
+				Action:              Action(action),
+				MissingFields:       missing,
+				ClarificationPrompt: prompt,
+			},
+		}, nil
+	}
+
+	// TaskRef is required for complete/cancel.
+	if taskRef == "" {
+		return IntentResult{
+			Ambiguous: &AmbiguousIntent{
+				Action:              Action(action),
+				MissingFields:       []string{"task_ref"},
+				ClarificationPrompt: "¿Qué tarea quieres " + actionVerb(action) + "?",
+			},
+		}, nil
+	}
+
+	return IntentResult{
+		Recognized: &RecognizedIntent{
+			Action:  Action(action),
+			TaskRef: taskRef,
+		},
+		}, nil
+}
+
+// actionVerb returns a human-readable verb for the action's clarification prompt.
+func actionVerb(action string) string {
+	switch action {
+	case "complete_task":
+		return "completar"
+	case "cancel_task":
+		return "cancelar"
+	default:
+		return "procesar"
 	}
 }
 

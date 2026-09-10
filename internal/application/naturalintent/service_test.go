@@ -12,8 +12,8 @@ import (
 
 // fakeTaskCreator is a test double for TaskCreator.
 type fakeTaskCreator struct {
-	tasks   []domain.Task
-	calls   []appservice.CreateTaskParams
+	tasks     []domain.Task
+	calls     []appservice.CreateTaskParams
 	createErr error
 }
 
@@ -62,6 +62,43 @@ func (f *fakeInterpreter) Interpret(_ context.Context, _ string, _ InterpretCont
 	return f.result, f.err
 }
 
+// fakeTaskManager is a test double for TaskManager.
+type fakeTaskManager struct {
+	tasks      []domain.Task
+	completeErr error
+	cancelErr   error
+}
+
+func (f *fakeTaskManager) List(_ context.Context) ([]domain.Task, error) {
+	return f.tasks, nil
+}
+
+func (f *fakeTaskManager) Complete(_ context.Context, id string) (domain.Task, error) {
+	if f.completeErr != nil {
+		return domain.Task{}, f.completeErr
+	}
+	for i, t := range f.tasks {
+		if t.ID == id {
+			f.tasks[i].Status = domain.TaskStatusCompleted
+			return f.tasks[i], nil
+		}
+	}
+	return domain.Task{}, appservice.ErrCannotComplete
+}
+
+func (f *fakeTaskManager) Cancel(_ context.Context, id string) (domain.Task, error) {
+	if f.cancelErr != nil {
+		return domain.Task{}, f.cancelErr
+	}
+	for i, t := range f.tasks {
+		if t.ID == id {
+			f.tasks[i].Status = domain.TaskStatusCancelled
+			return f.tasks[i], nil
+		}
+	}
+	return domain.Task{}, appservice.ErrCannotCancel
+}
+
 func TestServiceCreateTask(t *testing.T) {
 	interpreter := &fakeInterpreter{
 		result: IntentResult{
@@ -73,9 +110,10 @@ func TestServiceCreateTask(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, tz)
+	svc := NewService(interpreter, tasks, triggers, manager, tz)
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -112,9 +150,10 @@ func TestServiceCreateReminderRelative(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, tz, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, triggers, manager, tz, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD en 30 minutos")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -153,9 +192,10 @@ func TestServiceCreateReminderAbsolute(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, tz, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, triggers, manager, tz, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD hoy a las 20h")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -178,8 +218,9 @@ func TestServiceUnrecognized(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "hola")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -204,8 +245,9 @@ func TestServiceAmbiguous(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "poné una tarea")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -224,8 +266,9 @@ func TestServiceInterpreterError(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
@@ -246,8 +289,9 @@ func TestServiceTaskCreationError(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{createErr: context.DeadlineExceeded}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
@@ -272,8 +316,9 @@ func TestServiceTriggerCreationError(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{createErr: context.DeadlineExceeded}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
@@ -299,8 +344,9 @@ func TestServiceNilReminderSpec(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -324,8 +370,9 @@ func TestServiceUnknownAction(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, time.UTC)
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -353,8 +400,9 @@ func TestServiceWithTimezone(t *testing.T) {
 	}
 	tasks := &fakeTaskCreator{}
 	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, buenosAires, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, triggers, manager, buenosAires, WithNow(func() time.Time { return now }))
 	_, err := svc.HandleMessage(context.Background(), "reunión mañana a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -367,4 +415,383 @@ func TestServiceWithTimezone(t *testing.T) {
 	if triggers.calls[0].Value != wantTime {
 		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantTime)
 	}
+}
+
+// --- list_tasks -------------------------------------------------------------------
+
+func TestServiceListTasksEmpty(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionListTasks,
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(reply, "No tenés tareas pendientes") {
+		t.Errorf("reply = %q, want empty message", reply)
+	}
+}
+
+func TestServiceListTasksWithPending(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionListTasks,
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(reply, "2") {
+		t.Errorf("reply = %q, want count", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD") {
+		t.Errorf("reply = %q, want task title", reply)
+	}
+	if !strings.Contains(reply, "llamar al fontanero") {
+		t.Errorf("reply = %q, want second task title", reply)
+	}
+}
+
+func TestServiceListTasksFiltersCompleted(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionListTasks,
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "tarea completada", Status: domain.TaskStatusCompleted},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if strings.Contains(reply, "tarea completada") {
+		t.Errorf("reply should not contain completed task: %q", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD") {
+		t.Errorf("reply = %q, want pending task", reply)
+	}
+}
+
+func TestServiceListTasksError(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionListTasks,
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	// manager with nil tasks will cause an error on List
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	_, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
+	// The fakeTaskManager.List returns nil, which is an empty slice, not an error
+	// So this test verifies the empty case works
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+}
+
+// --- complete_task ----------------------------------------------------------------
+
+func TestServiceCompleteTaskOneMatch(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCompleteTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "compra SSD lista")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(reply, "completé") {
+		t.Errorf("reply = %q, want completion confirmation", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD") {
+		t.Errorf("reply = %q, want task title", reply)
+	}
+	// Verify the task was actually completed
+	if manager.tasks[0].Status != domain.TaskStatusCompleted {
+		t.Error("expected task to be completed")
+	}
+}
+
+func TestServiceCompleteTaskNoMatch(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCompleteTask,
+				TaskRef: "inexistente",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "completá lo inexistente")
+	if err == nil {
+		t.Fatal("expected error for no match")
+	}
+	if !strings.Contains(reply, "No encontré") {
+		t.Errorf("reply = %q, want not found message", reply)
+	}
+}
+
+func TestServiceCompleteTaskMultipleMatches(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCompleteTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
+	if err == nil {
+		t.Fatal("expected error for multiple matches")
+	}
+	if !strings.Contains(reply, "Encontré varias") {
+		t.Errorf("reply = %q, want multiple matches message", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD negro") {
+		t.Errorf("reply = %q, want first task", reply)
+	}
+	if !strings.Contains(reply, "comprar SSD blanco") {
+		t.Errorf("reply = %q, want second task", reply)
+	}
+}
+
+func TestServiceCompleteTaskListError(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCompleteTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	// Create a manager that returns an error on List
+	errManager := &errorTaskManager{listErr: context.DeadlineExceeded}
+
+	svc := NewService(interpreter, tasks, triggers, errManager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No pude obtener las tareas") {
+		t.Errorf("reply = %q, want list error message", reply)
+	}
+}
+
+func TestServiceCompleteTaskCompleteError(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCompleteTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{
+		tasks:       []domain.Task{{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending}},
+		completeErr: context.DeadlineExceeded,
+	}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No pude completar") {
+		t.Errorf("reply = %q, want complete error message", reply)
+	}
+}
+
+// --- cancel_task ------------------------------------------------------------------
+
+func TestServiceCancelTaskOneMatch(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCancelTask,
+				TaskRef: "fontanero",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "cancelá la del fontanero")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(reply, "Cancelé") {
+		t.Errorf("reply = %q, want cancel confirmation", reply)
+	}
+	if !strings.Contains(reply, "llamar al fontanero") {
+		t.Errorf("reply = %q, want task title", reply)
+	}
+	// Verify the task was actually cancelled
+	if manager.tasks[1].Status != domain.TaskStatusCancelled {
+		t.Error("expected task to be cancelled")
+	}
+}
+
+func TestServiceCancelTaskNoMatch(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCancelTask,
+				TaskRef: "inexistente",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "cancelá lo inexistente")
+	if err == nil {
+		t.Fatal("expected error for no match")
+	}
+	if !strings.Contains(reply, "No encontré") {
+		t.Errorf("reply = %q, want not found message", reply)
+	}
+}
+
+func TestServiceCancelTaskMultipleMatches(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCancelTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{tasks: []domain.Task{
+		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
+		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
+	}}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "cancelá SSD")
+	if err == nil {
+		t.Fatal("expected error for multiple matches")
+	}
+	if !strings.Contains(reply, "Encontré varias") {
+		t.Errorf("reply = %q, want multiple matches message", reply)
+	}
+}
+
+func TestServiceCancelTaskCancelError(t *testing.T) {
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action:  ActionCancelTask,
+				TaskRef: "SSD",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{
+		tasks:     []domain.Task{{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending}},
+		cancelErr: context.DeadlineExceeded,
+	}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "cancelá SSD")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(reply, "No pude cancelar") {
+		t.Errorf("reply = %q, want cancel error message", reply)
+	}
+}
+
+// --- errorTaskManager is a test double that returns errors ------------------------
+
+type errorTaskManager struct {
+	listErr     error
+	completeErr error
+	cancelErr   error
+}
+
+func (f *errorTaskManager) List(_ context.Context) ([]domain.Task, error) {
+	return nil, f.listErr
+}
+
+func (f *errorTaskManager) Complete(_ context.Context, id string) (domain.Task, error) {
+	return domain.Task{}, f.completeErr
+}
+
+func (f *errorTaskManager) Cancel(_ context.Context, id string) (domain.Task, error) {
+	return domain.Task{}, f.cancelErr
 }

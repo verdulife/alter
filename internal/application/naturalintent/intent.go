@@ -17,6 +17,12 @@ const (
 	ActionCreateTask Action = "create_task"
 	// ActionCreateReminder is a task plus a scheduled reminder trigger.
 	ActionCreateReminder Action = "create_reminder"
+	// ActionListTasks lists pending tasks.
+	ActionListTasks Action = "list_tasks"
+	// ActionCompleteTask marks an existing pending task as completed.
+	ActionCompleteTask Action = "complete_task"
+	// ActionCancelTask marks an existing pending task as cancelled.
+	ActionCancelTask Action = "cancel_task"
 )
 
 // IntentResult is the three-state output of the natural language interpreter.
@@ -43,6 +49,9 @@ type RecognizedIntent struct {
 	Action   Action        `json:"action"`
 	Title    string        `json:"title"`
 	Reminder *ReminderSpec `json:"reminder,omitempty"`
+	// TaskRef is the textual reference to an existing task (for complete/cancel).
+	// Pi extracts this from the user's message; Go resolves it against the database.
+	TaskRef string `json:"task_ref,omitempty"`
 }
 
 // ReminderSpec describes when the reminder should fire.
