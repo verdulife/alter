@@ -23,11 +23,13 @@ import (
 	"github.com/verdu/alter/internal/adapter/agent"
 	"github.com/verdu/alter/internal/adapter/semantic"
 	"github.com/verdu/alter/internal/adapter/telegram"
+	"github.com/verdu/alter/internal/application/naturalintent"
 	"github.com/verdu/alter/internal/config"
 	"github.com/verdu/alter/internal/domain"
 	"github.com/verdu/alter/internal/scheduler"
 	"github.com/verdu/alter/internal/service"
 	"github.com/verdu/alter/internal/storage/sqlite"
+	"time"
 )
 
 func main() {
@@ -79,11 +81,11 @@ func main() {
 	client := telegram.NewClient(cfg.TelegramToken)
 	channel := telegram.NewChannel(client, cfg.TelegramChatID)
 
-	// Scheduler action: the real Pi Agent composite when explicitly enabled, the
-	// Telegram-only NotifyAction otherwise.
-	var action domain.TriggerAction
+	// Pi Agent: shared between the Scheduler action (notifications) and
+	// natural language interpretation. Declared here so both can reuse it.
+	var piAgent *agent.PiAgent
 	if cfg.PiEnabled {
-		piAgent := agent.NewPiAgent(agent.PiConfig{
+		piAgent = agent.NewPiAgent(agent.PiConfig{
 			Bin:          cfg.PiBin,
 			Provider:     cfg.PiProvider,
 			Model:        cfg.PiModel,
@@ -91,6 +93,12 @@ func main() {
 			NoTools:      cfg.PiNoTools,
 			SystemPrompt: cfg.PiSystemPrompt,
 		}, agent.WithPiLogger(logger))
+	}
+
+	// Scheduler action: the real Pi Agent composite when explicitly enabled, the
+	// Telegram-only NotifyAction otherwise.
+	var action domain.TriggerAction
+	if piAgent != nil {
 		opts := []agent.Option{agent.WithLogger(logger)}
 		if searcher != nil {
 			opts = append(opts, agent.WithSearcher(searcher))
@@ -115,8 +123,38 @@ func main() {
 	triggerSvc := service.NewTriggerService(triggers, tasks, service.WithTriggerRescheduler(sched))
 
 	cmdSvc := commandService{tasks: taskSvc, triggers: triggerSvc}
+
+	// Natural language interpretation: requires Pi to be enabled (for the LLM)
+	// and NaturalEnabled to be explicitly opted-in.
+	var naturalHandler telegram.NaturalHandler
+	if piAgent != nil && cfg.NaturalEnabled {
+		// Parse timezone.
+		tz := time.Local
+		if cfg.Timezone != "" {
+			loc, err := time.LoadLocation(cfg.Timezone)
+			if err != nil {
+				logger.Printf("runtime: invalid ALTER_TIMEZONE %q, using system timezone: %v", cfg.Timezone, err)
+			} else {
+				tz = loc
+			}
+		}
+
+		// Reuse the same PiAgent instance for interpretation.
+		// The interpreter wraps it via PiRunnerAdapter.
+		natInterpreter := naturalintent.NewPiNaturalInterpreter(
+			naturalintent.NewPiRunnerAdapter(piAgent),
+		)
+		natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, tz,
+			naturalintent.WithLogger(logger),
+		)
+		naturalHandler = natSvc.HandleMessage
+		logger.Printf("runtime: natural language interpretation enabled (timezone=%s)", tz)
+	} else {
+		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true and ALTER_NATURAL_ENABLED=true)")
+	}
+
 	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {
-		return telegram.Handle(ctx, cmdSvc, text)
+		return telegram.Handle(ctx, cmdSvc, text, naturalHandler)
 	}, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

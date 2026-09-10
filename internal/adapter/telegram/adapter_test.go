@@ -40,7 +40,7 @@ func TestHandleUpdateRepliesToOriginatingChat(t *testing.T) {
 	svc := &fakeCommandService{}
 	client := &recordingClient{}
 	adapter := newTestAdapter(client, func(ctx context.Context, text string) (string, error) {
-		return Handle(ctx, svc, text)
+		return Handle(ctx, svc, text, nil)
 	})
 
 	adapter.handleUpdate(context.Background(), Update{

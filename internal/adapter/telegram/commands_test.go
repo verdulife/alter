@@ -43,7 +43,7 @@ func (f *fakeCommandService) CreateReminder(_ context.Context, title string, in 
 
 func TestHandleNueva(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/nueva comprar pan")
+	reply, err := Handle(context.Background(), svc, "/nueva comprar pan", nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestHandleNueva(t *testing.T) {
 
 func TestHandleNuevaEmptyTitle(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/nueva")
+	reply, err := Handle(context.Background(), svc, "/nueva", nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestHandleNuevaEmptyTitle(t *testing.T) {
 
 func TestHandleUnknownCommand(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/listar")
+	reply, err := Handle(context.Background(), svc, "/listar", nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestHandleUnknownCommand(t *testing.T) {
 
 func TestHandleAppErrorSurfaces(t *testing.T) {
 	svc := &fakeCommandService{err: errApp}
-	reply, err := Handle(context.Background(), svc, "/nueva algo")
+	reply, err := Handle(context.Background(), svc, "/nueva algo", nil)
 	if err == nil {
 		t.Fatal("expected the application error to be returned")
 	}
@@ -144,7 +144,7 @@ func TestParseReminderEmptyTitle(t *testing.T) {
 
 func TestHandleRecordarValid(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/recordar recoger pedido in 10s")
+	reply, err := Handle(context.Background(), svc, "/recordar recoger pedido in 10s", nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestHandleRecordarValid(t *testing.T) {
 
 func TestHandleRecordarBadSyntaxShowsUsage(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/recordar sin duración")
+	reply, err := Handle(context.Background(), svc, "/recordar sin duración", nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -178,11 +178,71 @@ func TestHandleRecordarBadSyntaxShowsUsage(t *testing.T) {
 
 func TestHandleRecordarAppErrorSurfaces(t *testing.T) {
 	svc := &fakeCommandService{err: errPartial}
-	reply, err := Handle(context.Background(), svc, "/recordar algo in 5s")
+	reply, err := Handle(context.Background(), svc, "/recordar algo in 5s", nil)
 	if err == nil {
 		t.Fatal("expected the application error to be returned")
 	}
 	if !strings.Contains(reply, "No pude crear el recordatorio") {
 		t.Errorf("reply = %q, want failure text", reply)
+	}
+}
+
+// --- Natural language fallback ----------------------------------------------
+
+func TestHandleNaturalLanguageFallback(t *testing.T) {
+	svc := &fakeCommandService{}
+	called := false
+	natural := func(_ context.Context, text string) (string, error) {
+		called = true
+		if text == "comprar SSD" {
+			return "Tarea creada ✓ \"comprar SSD\"", nil
+		}
+		return "fallback", nil
+	}
+	reply, err := Handle(context.Background(), svc, "comprar SSD", natural)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !called {
+		t.Error("natural handler was not called for non-slash message")
+	}
+	if len(svc.createCalls) != 0 {
+		t.Error("slash CommandService should not be called for natural language")
+	}
+	if !strings.Contains(reply, "Tarea creada") {
+		t.Errorf("reply = %q, want confirmation from natural handler", reply)
+	}
+}
+
+func TestHandleNaturalLanguageNilFallsBackToHelp(t *testing.T) {
+	svc := &fakeCommandService{}
+	reply, err := Handle(context.Background(), svc, "comprar SSD", nil)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(reply, "Comando no reconocido") {
+		t.Errorf("reply = %q, want legacy help when natural handler is nil", reply)
+	}
+}
+
+func TestHandleSlashCommandPrecedesNatural(t *testing.T) {
+	svc := &fakeCommandService{}
+	naturalCalled := false
+	natural := func(_ context.Context, text string) (string, error) {
+		naturalCalled = true
+		return "natural", nil
+	}
+	reply, err := Handle(context.Background(), svc, "/nueva SSD", natural)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if naturalCalled {
+		t.Error("natural handler should not be called when slash command matches")
+	}
+	if len(svc.createCalls) != 1 || svc.createCalls[0] != "SSD" {
+		t.Errorf("CreateTask calls = %v, want [SSD]", svc.createCalls)
+	}
+	if !strings.Contains(reply, "Tarea creada") {
+		t.Errorf("reply = %q, want confirmation", reply)
 	}
 }
