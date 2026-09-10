@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/verdu/alter/internal/domain"
 )
 
 // piRunner abstracts the Pi RPC execution so tests can substitute a fake.
@@ -40,9 +42,25 @@ type piIntentJSON struct {
 }
 
 type reminderJSON struct {
-	Relative      *string `json:"relative,omitempty"`
-	AbsoluteTime  *string `json:"absolute_time,omitempty"`
-	AbsoluteDate  *string `json:"absolute_date,omitempty"`
+	Relative     *string         `json:"relative,omitempty"`
+	AbsoluteTime *string         `json:"absolute_time,omitempty"`
+	AbsoluteDate *string         `json:"absolute_date,omitempty"`
+	Recurrence   *recurrenceJSON `json:"recurrence,omitempty"`
+}
+
+// recurrenceJSON is the raw recurrence object Pi is expected to produce (B3 S4).
+// All scalar fields are pointers so "absent" is distinguishable from a zero
+// value; weekdays is a slice (empty = absent). Pi never emits timezone and
+// never needs to know the current date.
+type recurrenceJSON struct {
+	Freq        *string `json:"freq,omitempty"`
+	Interval    *int    `json:"interval,omitempty"`
+	Time        *string `json:"time,omitempty"`
+	Weekdays    []int   `json:"weekdays,omitempty"`
+	DayOfMonth  *int    `json:"day_of_month,omitempty"`
+	AnchorMonth *int    `json:"anchor_month,omitempty"`
+	AnchorDay   *int    `json:"anchor_day,omitempty"`
+	AnchorYear  *int    `json:"anchor_year,omitempty"`
 }
 
 // Interpret sends the user's text to Pi, parses the JSON response, and
@@ -154,7 +172,7 @@ func normalizeTaskAction(parsed piIntentJSON, action string) (IntentResult, erro
 			Action:  Action(action),
 			TaskRef: taskRef,
 		},
-		}, nil
+	}, nil
 }
 
 // actionVerb returns a human-readable verb for the action's clarification prompt.
@@ -252,6 +270,20 @@ func normalizeReminderSpec(r *reminderJSON) (*ReminderSpec, error) {
 	absTime := derefStr(r.AbsoluteTime)
 	absDate := derefStr(r.AbsoluteDate)
 
+	// Recurrence is mutually exclusive with the one-shot forms: never guess.
+	if r.Recurrence != nil && (rel != "" || absTime != "") {
+		return nil, fmt.Errorf("ambiguous: recurrence cannot be combined with a one-shot time")
+	}
+
+	if r.Recurrence != nil {
+		rec, err := normalizeRecurrence(r.Recurrence)
+		if err != nil {
+			return nil, err
+		}
+		spec.Recurrence = rec
+		return spec, nil
+	}
+
 	if rel != "" && absTime != "" {
 		return nil, fmt.Errorf("ambiguous: both relative and absolute time specified")
 	}
@@ -269,6 +301,87 @@ func normalizeReminderSpec(r *reminderJSON) (*ReminderSpec, error) {
 	}
 
 	return nil, fmt.Errorf("no time specified in reminder")
+}
+
+// normalizeRecurrence validates the structural fields Pi produced and maps them
+// into RecurrenceParams (B3 S4). Absent or contradictory data is an error, so
+// the caller turns it into an AmbiguousIntent: Go never invents cadence data.
+func normalizeRecurrence(r *recurrenceJSON) (*RecurrenceParams, error) {
+	p := &RecurrenceParams{}
+
+	freqStr := derefStr(r.Freq)
+	switch domain.RecurrenceFreq(freqStr) {
+	case domain.RecurrenceFreqDaily, domain.RecurrenceFreqWeekly, domain.RecurrenceFreqMonthly, domain.RecurrenceFreqYearly:
+		p.Freq = domain.RecurrenceFreq(freqStr)
+	default:
+		return nil, fmt.Errorf("recurrence frequency is required (daily|weekly|monthly|yearly)")
+	}
+
+	timeStr := derefStr(r.Time)
+	if timeStr == "" {
+		return nil, fmt.Errorf("recurrence time is required")
+	}
+	p.Time = timeStr
+
+	if r.Interval != nil {
+		if *r.Interval < 1 {
+			return nil, fmt.Errorf("recurrence interval must be >= 1")
+		}
+		p.Interval = r.Interval
+	}
+
+	// Weekdays: only meaningful for weekly; any non-empty value elsewhere is
+	// contradictory, and values outside 1..7 are rejected.
+	for _, wd := range r.Weekdays {
+		if wd < 1 || wd > 7 {
+			return nil, fmt.Errorf("recurrence weekday out of range 1..7")
+		}
+	}
+	if p.Freq == domain.RecurrenceFreqWeekly {
+		if len(r.Weekdays) == 0 {
+			return nil, fmt.Errorf("weekly recurrence requires weekdays")
+		}
+		p.Weekdays = r.Weekdays
+	} else if len(r.Weekdays) > 0 {
+		return nil, fmt.Errorf("recurrence weekdays only apply to weekly")
+	}
+
+	// DayOfMonth: only for monthly.
+	if p.Freq == domain.RecurrenceFreqMonthly {
+		if r.DayOfMonth == nil || *r.DayOfMonth < 1 || *r.DayOfMonth > 31 {
+			return nil, fmt.Errorf("monthly recurrence requires day_of_month in 1..31")
+		}
+		p.DayOfMonth = r.DayOfMonth
+	} else if r.DayOfMonth != nil {
+		return nil, fmt.Errorf("recurrence day_of_month only applies to monthly")
+	}
+
+	// Anchor month/day together; required for yearly.
+	if (r.AnchorMonth == nil) != (r.AnchorDay == nil) {
+		return nil, fmt.Errorf("recurrence anchor month and day must be provided together")
+	}
+	if r.AnchorMonth != nil && (*r.AnchorMonth < 1 || *r.AnchorMonth > 12) {
+		return nil, fmt.Errorf("recurrence anchor month out of range 1..12")
+	}
+	if r.AnchorDay != nil && (*r.AnchorDay < 1 || *r.AnchorDay > 31) {
+		return nil, fmt.Errorf("recurrence anchor day out of range 1..31")
+	}
+	if p.Freq == domain.RecurrenceFreqYearly {
+		if r.AnchorMonth == nil {
+			return nil, fmt.Errorf("yearly recurrence requires an anchor month and day")
+		}
+	}
+	// For non-yearly frequencies the user may still state an explicit start date
+	// ("a partir del lunes 9 de marzo"): the components are kept as-is.
+	p.AnchorMonth, p.AnchorDay = r.AnchorMonth, r.AnchorDay
+	if r.AnchorYear != nil {
+		if *r.AnchorYear < 1 {
+			return nil, fmt.Errorf("recurrence anchor year out of range")
+		}
+		p.AnchorYear = r.AnchorYear
+	}
+
+	return p, nil
 }
 
 // derefStr returns the string value of a pointer, or "" if nil.

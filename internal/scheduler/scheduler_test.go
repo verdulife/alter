@@ -423,7 +423,6 @@ func TestArmRecurringMissingTaskRetiresTrigger(t *testing.T) {
 	}
 }
 
-
 func TestArmThenFireWhenAlreadyDue(t *testing.T) {
 	// An unarmed "at" trigger whose timestamp is already in the past is armed and
 	// then fired in the same cycle (overdue recovery).
@@ -766,7 +765,6 @@ func TestRecurringActionFailureKeepsOccurrenceAndRetries(t *testing.T) {
 		t.Errorf("expected exactly 1 fired event (the successful retry), got %d", n)
 	}
 }
-
 
 func TestActionFailureBackoff(t *testing.T) {
 	// The RetryAt backoff must re-arm the scheduler's next deadline to RetryAt

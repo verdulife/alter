@@ -13,6 +13,12 @@ import (
 // does not reference an existing task.
 var ErrTriggerTaskNotFound = errors.New("task not found for trigger")
 
+// ErrInvalidRecurrenceValue is returned when creating a TriggerTypeRecurring
+// trigger whose Value is not a valid canonical recurrence spec (B3 S4). It is
+// an additional integrity barrier: the domain's ParseRecurrence is the single
+// authority for recurrence validation (no duplicated rules here).
+var ErrInvalidRecurrenceValue = errors.New("invalid recurrence value")
+
 // Note (possible future evolution): changes to triggers (created/updated,
 // enabled/disabled) are not represented as domain events yet. If auditing or
 // notifications require them, new EventType values such as "trigger.created"
@@ -79,6 +85,15 @@ func NewTriggerService(triggers domain.TriggerRepository, tasks domain.TaskRepos
 func (s *TriggerService) Create(ctx context.Context, p CreateTriggerParams) (domain.Trigger, error) {
 	if _, err := s.tasks.GetByID(ctx, p.TaskID); err != nil {
 		return domain.Trigger{}, fmt.Errorf("%w: %s", ErrTriggerTaskNotFound, p.TaskID)
+	}
+
+	// B3 S4 integrity barrier: a recurring trigger must carry a valid canonical
+	// recurrence spec, or it is rejected before persisting. Non-recurring types
+	// keep their exact previous behavior (no validation of Value).
+	if p.Type == domain.TriggerTypeRecurring {
+		if _, err := domain.ParseRecurrence(p.Value); err != nil {
+			return domain.Trigger{}, fmt.Errorf("%w: %v", ErrInvalidRecurrenceValue, err)
+		}
 	}
 
 	trigger := domain.Trigger{

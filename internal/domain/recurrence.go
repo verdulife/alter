@@ -32,6 +32,12 @@ import (
 //   - monthly: months since the anchor's year-month satisfy
 //     (months) mod interval == 0 AND candidate.day ==
 //     min(DayOfMonth, days-in-month) (clamped to the month's last day).
+//   - yearly:  years since the anchor's year satisfy (years) mod interval == 0
+//     AND candidate (month, day) == anchor (month, day). The phase is anchored
+//     by the anchor's month+day, so e.g. anchor 2026-09-10 with interval 1
+//     yields 2027-09-10, 2028-09-10, ... A Feb-29 anchor is NOT clamped to
+//     Feb 28: the phase only exists in leap years, so only leap years that
+//     respect the interval/phase are occurrences.
 //
 // A NextFireAt computed from any reference point is therefore reproducible
 // across restarts: the phase comes from the spec, never from execution state.
@@ -47,8 +53,11 @@ import (
 //
 // The search is bounded and deterministic: for a validated spec (interval >= 1,
 // weekly mask non-empty) the first eligible future occurrence is provably at
-// most Interval+1 (daily), 7*Interval+7 (weekly) or 31*Interval+31 (monthly)
-// calendar days from the reference date, so the scan always terminates.
+// most Interval+1 (daily), 7*Interval+7 (weekly), 31*Interval+31 (monthly) or
+// 366*(400*Interval)+366 (yearly: a Feb-29 phase only exists in leap years, and
+// consecutive aligned leap years are at most lcm(400, Interval) <= 400*Interval
+// years apart because the Gregorian leap pattern is 400-year periodic) calendar
+// days from the reference date, so the scan always terminates.
 
 // RecurrenceFreq identifies the cadence unit of a RecurrenceSpec.
 type RecurrenceFreq string
@@ -60,6 +69,8 @@ const (
 	RecurrenceFreqWeekly RecurrenceFreq = "weekly"
 	// RecurrenceFreqMonthly fires every Interval months on DayOfMonth (clamped).
 	RecurrenceFreqMonthly RecurrenceFreq = "monthly"
+	// RecurrenceFreqYearly fires every Interval years on the anchor's month+day.
+	RecurrenceFreqYearly RecurrenceFreq = "yearly"
 )
 
 // Weekday bitmask values (Monday=1 ... Sunday=64). The mask is used by weekly
@@ -97,7 +108,7 @@ var (
 	ErrRecurrenceUnknownField = errors.New("recurrence JSON has an unknown field")
 	// ErrMissingRecurrenceField means a required field (freq, time, timezone, anchor) is absent.
 	ErrMissingRecurrenceField = errors.New("missing recurrence field")
-	// ErrInvalidRecurrenceFreq means Freq is not daily/weekly/monthly.
+	// ErrInvalidRecurrenceFreq means Freq is not daily/weekly/monthly/yearly.
 	ErrInvalidRecurrenceFreq = errors.New("unknown recurrence frequency")
 	// ErrInvalidRecurrenceInterval means Interval is < 1.
 	ErrInvalidRecurrenceInterval = errors.New("recurrence interval must be >= 1")
@@ -110,7 +121,9 @@ var (
 	// ErrInvalidRecurrenceTimezone means Timezone is not a loadable IANA name.
 	ErrInvalidRecurrenceTimezone = errors.New("invalid recurrence timezone (IANA name)")
 	// ErrInvalidRecurrenceAnchor means Anchor is not "YYYY-MM-DD" or is not an
-	// occurrence date of its own spec (weekly: weekday in mask; monthly: day matches the clamp).
+	// occurrence date of its own spec (weekly: weekday in mask; monthly: day matches
+	// the clamp; yearly: month+day is the annual phase, and Feb 29 must be a real
+	// leap-year date).
 	ErrInvalidRecurrenceAnchor = errors.New("invalid recurrence anchor (expected YYYY-MM-DD as an occurrence date)")
 	// ErrRecurrenceSearchExceeded is an internal invariant guard: the bounded
 	// scan ran out of days, which is unreachable for a validated spec.
@@ -175,7 +188,7 @@ func ParseRecurrence(s string) (RecurrenceSpec, error) {
 // Interval >= 1 and a non-empty weekly mask even for hand-built specs.
 func (s RecurrenceSpec) validate() error {
 	switch s.Freq {
-	case RecurrenceFreqDaily, RecurrenceFreqWeekly, RecurrenceFreqMonthly:
+	case RecurrenceFreqDaily, RecurrenceFreqWeekly, RecurrenceFreqMonthly, RecurrenceFreqYearly:
 	default:
 		return fmt.Errorf("%w: %q", ErrInvalidRecurrenceFreq, s.Freq)
 	}
@@ -207,6 +220,9 @@ func (s RecurrenceSpec) validate() error {
 		if anchor.Day() != clampDay(s.DayOfMonth, anchor.Year(), anchor.Month()) {
 			return fmt.Errorf("%w: anchor day does not match day_of_month (with clamp)", ErrInvalidRecurrenceAnchor)
 		}
+		// yearly: any real date is a valid phase anchor (the anchor's month+day is
+		// the phase, so the anchor matches itself trivially; impossible dates like
+		// 2023-02-29 were already rejected by parseRecAnchor above).
 	}
 	return nil
 }
@@ -286,6 +302,15 @@ func occursOn(spec RecurrenceSpec, anchor time.Time, d time.Time) bool {
 		}
 		return d.Day() == clampDay(spec.DayOfMonth, d.Year(), d.Month())
 
+	case RecurrenceFreqYearly:
+		years := d.Year() - anchor.Year()
+		if years%spec.Interval != 0 {
+			return false
+		}
+		// Exact month+day match. A Feb-29 phase never clamps: the day check can
+		// only hold in a leap year, so non-leap years have no occurrence.
+		return d.Month() == anchor.Month() && d.Day() == anchor.Day()
+
 	default:
 		return false // unreachable: spec is validated
 	}
@@ -304,6 +329,15 @@ func (s RecurrenceSpec) scanBound() int {
 		return 7*s.Interval + 7
 	case RecurrenceFreqMonthly:
 		return 31*s.Interval + 31
+	case RecurrenceFreqYearly:
+		// Feb-29 phases only exist in leap years. The leap pattern is 400-year
+		// periodic, and consecutive aligned leap years are at most
+		// lcm(400, Interval) <= 400*Interval years apart: if y is an aligned leap
+		// year, y + lcm(400, Interval) is still aligned (a multiple of Interval)
+		// and still leap (a multiple of 400). 366 days per year plus a slack day
+		// covers the phase-date offset inside the target year. Non-Feb-29 phases
+		// exist every year, so the same bound is trivially safe for them.
+		return 366*(400*s.Interval) + 366
 	default:
 		return s.Interval + 1
 	}

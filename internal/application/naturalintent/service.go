@@ -15,7 +15,8 @@ import (
 
 // Service is the application-layer service that bridges natural language
 // interpretation to domain operations. It owns the full flow:
-//   text → interpret → validate → resolve time → execute → reply.
+//
+//	text → interpret → validate → resolve time → execute → reply.
 //
 // It depends on domain.TaskService-like operations (via the interfaces below)
 // and never exposes internal state to Pi or the interpreter.
@@ -144,10 +145,15 @@ func (s *Service) createTask(ctx context.Context, title string) (string, error) 
 	return fmt.Sprintf("Tarea creada ✓ \"%s\"", title), nil
 }
 
-// createReminder creates a task plus a one-shot "at" trigger.
+// createReminder creates a task plus a trigger: one-shot "at" for relative/
+// absolute reminders, recurring for RecurrenceParams (B3 S4).
 func (s *Service) createReminder(ctx context.Context, title string, spec *ReminderSpec) (string, error) {
 	if spec == nil {
 		return "No pude entender cuándo quieres el recordatorio.", nil
+	}
+
+	if spec.Recurrence != nil {
+		return s.createRecurringReminder(ctx, title, spec.Recurrence)
 	}
 
 	at, err := ResolveTime(*spec, InterpretContext{
@@ -178,6 +184,42 @@ func (s *Service) createReminder(ctx context.Context, title string, spec *Remind
 
 	return fmt.Sprintf("Recordatorio creado ✓ \"%s\" para %s",
 		title, at.In(s.timezone).Format("02/01 15:04")), nil
+}
+
+// createRecurringReminder creates a task + a TriggerTypeRecurring trigger whose
+// Value is the canonical RecurrenceSpec JSON. Go derives and validates the whole
+// spec; if the recurrence cannot be represented, nothing is persisted and the
+// reply asks for clarification (same visible behavior as an AmbiguousIntent, so
+// Pi never decides execution).
+func (s *Service) createRecurringReminder(ctx context.Context, title string, rec *RecurrenceParams) (string, error) {
+	value, err := BuildRecurrenceJSON(*rec, InterpretContext{
+		Now:      s.now(),
+		Timezone: s.timezone,
+	})
+	if err != nil {
+		return fmt.Sprintf("No pude entender la recurrencia: %v. ¿Me la describes de nuevo?", err), nil
+	}
+
+	task, err := s.tasks.Create(ctx, appservice.CreateTaskParams{
+		Title:  title,
+		Source: "telegram:natural",
+	})
+	if err != nil {
+		return "No pude crear la tarea: " + err.Error(), err
+	}
+
+	_, err = s.triggers.Create(ctx, appservice.CreateTriggerParams{
+		TaskID:  task.ID,
+		Type:    domain.TriggerTypeRecurring,
+		Value:   value,
+		Enabled: true,
+	})
+	if err != nil {
+		return "Tarea creada pero no pude programar el recordatorio recurrente: " + err.Error(), err
+	}
+
+	return fmt.Sprintf("Recordatorio creado: %s — %s.",
+		title, describeCadence(*rec)), nil
 }
 
 // listTasks returns all pending tasks formatted for the user.
@@ -262,5 +304,91 @@ func (s *Service) resolveTask(ctx context.Context, ref string) (domain.Task, err
 		}
 		sb.WriteString("¿Cuál?")
 		return domain.Task{}, errors.New(sb.String())
+	}
+}
+
+// --- Recurring cadence (B3 S4) ----------------------------------------------
+
+// weekdayNames and monthNames are the Spanish day/month names used to describe a
+// cadence to the user. Go owns the reply (Pi never produces user-facing text).
+var weekdayNames = []string{"lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"}
+var monthNames = []string{"", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"}
+
+// describeCadence renders the recurrence as a human cadence, e.g.
+// "todos los días a las 21:00" or "cada lunes y jueves a las 09:00".
+func describeCadence(rec RecurrenceParams) string {
+	interval := 1
+	if rec.Interval != nil {
+		interval = *rec.Interval
+	}
+
+	hh, mm, err := parseHHMM(rec.Time)
+	if err != nil {
+		// Unreachable in practice: BuildRecurrenceJSON validated the time first.
+		hh, mm = 0, 0
+	}
+	at := fmt.Sprintf("a las %02d:%02d", hh, mm)
+
+	switch rec.Freq {
+	case domain.RecurrenceFreqDaily:
+		if interval == 1 {
+			return "todos los días " + at
+		}
+		return fmt.Sprintf("cada %d días %s", interval, at)
+
+	case domain.RecurrenceFreqWeekly:
+		days := joinWeekdays(rec.Weekdays)
+		if interval == 1 {
+			return fmt.Sprintf("cada %s %s", days, at)
+		}
+		return fmt.Sprintf("cada %d semanas, %s %s", interval, days, at)
+
+	case domain.RecurrenceFreqMonthly:
+		day := 1
+		if rec.DayOfMonth != nil {
+			day = *rec.DayOfMonth
+		}
+		if interval == 1 {
+			return fmt.Sprintf("el día %d de cada mes %s", day, at)
+		}
+		return fmt.Sprintf("cada %d meses, el día %d %s", interval, day, at)
+
+	case domain.RecurrenceFreqYearly:
+		month, day := 1, 1
+		if rec.AnchorMonth != nil {
+			month = *rec.AnchorMonth
+		}
+		if rec.AnchorDay != nil {
+			day = *rec.AnchorDay
+		}
+		monthName := ""
+		if month >= 1 && month <= 12 {
+			monthName = monthNames[month]
+		}
+		if interval == 1 {
+			return fmt.Sprintf("cada año, el %d de %s %s", day, monthName, at)
+		}
+		return fmt.Sprintf("cada %d años, el %d de %s %s", interval, day, monthName, at)
+	}
+	return at
+}
+
+// joinWeekdays joins NL weekday numbers into "lunes y jueves" / "lunes, miércoles y viernes".
+func joinWeekdays(weekdays []int) string {
+	names := make([]string, 0, len(weekdays))
+	for _, wd := range weekdays {
+		if wd >= 1 && wd <= 7 {
+			names = append(names, weekdayNames[wd-1])
+		}
+	}
+	switch len(names) {
+	case 0:
+		return "?"
+	case 1:
+		return names[0]
+	case 2:
+		return names[0] + " y " + names[1]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " y " + names[len(names)-1]
 	}
 }

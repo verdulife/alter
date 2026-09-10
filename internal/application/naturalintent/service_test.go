@@ -64,7 +64,7 @@ func (f *fakeInterpreter) Interpret(_ context.Context, _ string, _ InterpretCont
 
 // fakeTaskManager is a test double for TaskManager.
 type fakeTaskManager struct {
-	tasks      []domain.Task
+	tasks       []domain.Task
 	completeErr error
 	cancelErr   error
 }
@@ -212,6 +212,244 @@ func TestServiceCreateReminderAbsolute(t *testing.T) {
 	}
 }
 
+func TestServiceCreateRecurringReminderDaily(t *testing.T) {
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "sacar la basura",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{Freq: domain.RecurrenceFreqDaily, Time: "21:00"},
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	reply, err := svc.HandleMessage(context.Background(), "sacar la basura todos los días a las 21")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if len(tasks.calls) != 1 {
+		t.Fatalf("expected 1 task creation, got %d", len(tasks.calls))
+	}
+	if len(triggers.calls) != 1 {
+		t.Fatalf("expected 1 trigger creation, got %d", len(triggers.calls))
+	}
+	if triggers.calls[0].Type != domain.TriggerTypeRecurring {
+		t.Errorf("trigger type = %q, want %q", triggers.calls[0].Type, domain.TriggerTypeRecurring)
+	}
+	wantJSON := `{"freq":"daily","interval":1,"weekdays":0,"day_of_month":1,"time":"21:00","timezone":"UTC","anchor":"2026-09-10"}`
+	if triggers.calls[0].Value != wantJSON {
+		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	}
+	if !triggers.calls[0].Enabled {
+		t.Error("recurring trigger must be created enabled")
+	}
+	if !strings.Contains(reply, "Recordatorio creado") || !strings.Contains(reply, "todos los días a las 21:00") {
+		t.Errorf("reply = %q, want confirmation with cadence", reply)
+	}
+}
+
+func TestServiceCreateRecurringReminderWeekly(t *testing.T) {
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC) // Thursday
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "llamar a mamá",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{
+						Freq:     domain.RecurrenceFreqWeekly,
+						Time:     "09:00",
+						Weekdays: []int{1, 4},
+					},
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	reply, err := svc.HandleMessage(context.Background(), "llamar a mamá cada lunes y jueves a las 9")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	wantJSON := `{"freq":"weekly","interval":1,"weekdays":9,"day_of_month":1,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`
+	if triggers.calls[0].Value != wantJSON {
+		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	}
+	if !strings.Contains(reply, "cada lunes y jueves a las 09:00") {
+		t.Errorf("reply = %q, want weekly cadence", reply)
+	}
+}
+
+func TestServiceCreateRecurringReminderMonthly(t *testing.T) {
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	day := 1
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "pagar alquiler",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{Freq: domain.RecurrenceFreqMonthly, Time: "08:00", DayOfMonth: &day},
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	reply, err := svc.HandleMessage(context.Background(), "pagar alquiler el día 1 de cada mes a las 8")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(reply, "el día 1 de cada mes a las 08:00") {
+		t.Errorf("reply = %q, want monthly cadence", reply)
+	}
+}
+
+func TestServiceCreateRecurringReminderYearly(t *testing.T) {
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	m, d := 9, 10
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "aniversario",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{Freq: domain.RecurrenceFreqYearly, Time: "09:00", AnchorMonth: &m, AnchorDay: &d},
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	reply, err := svc.HandleMessage(context.Background(), "aniversario cada año el 10 de septiembre a las 9")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	wantJSON := `{"freq":"yearly","interval":1,"weekdays":0,"day_of_month":1,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`
+	if triggers.calls[0].Value != wantJSON {
+		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	}
+	if !strings.Contains(reply, "cada año, el 10 de septiembre a las 09:00") {
+		t.Errorf("reply = %q, want yearly cadence", reply)
+	}
+}
+
+func TestServiceCreateRecurringReminderUserTimezone(t *testing.T) {
+	// The timezone must come from Go (the service's), never from the message.
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	ba, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Fatal(err)
+	}
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "sacar la basura",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{Freq: domain.RecurrenceFreqDaily, Time: "21:00"},
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, ba, WithNow(func() time.Time { return now }))
+	_, err = svc.HandleMessage(context.Background(), "sacar la basura todos los días a las 21")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if !strings.Contains(triggers.calls[0].Value, `"timezone":"America/Argentina/Buenos_Aires"`) {
+		t.Errorf("trigger value = %q, want user timezone", triggers.calls[0].Value)
+	}
+	// 2026-09-10 14:00 UTC = 11:00 ART: the anchor is the local date (Sep 10).
+	if !strings.Contains(triggers.calls[0].Value, `"anchor":"2026-09-10"`) {
+		t.Errorf("trigger value = %q, want local-date anchor", triggers.calls[0].Value)
+	}
+}
+
+func TestServiceRecurringReminderInvalidNoPersist(t *testing.T) {
+	// A recurrence Go cannot turn into a valid spec must not persist anything:
+	// the reply asks for clarification and no task/trigger is created.
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{
+				Action: ActionCreateReminder,
+				Title:  "sacar la basura",
+				Reminder: &ReminderSpec{
+					Recurrence: &RecurrenceParams{Freq: domain.RecurrenceFreqYearly, Time: "09:00"}, // missing anchor month/day
+				},
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	reply, err := svc.HandleMessage(context.Background(), "cada año a las 9")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if len(tasks.calls) != 0 {
+		t.Errorf("no task must be created, got %d", len(tasks.calls))
+	}
+	if len(triggers.calls) != 0 {
+		t.Errorf("no trigger must be created, got %d", len(triggers.calls))
+	}
+	if !strings.Contains(reply, "recurrencia") {
+		t.Errorf("reply = %q, want a clarification about the recurrence", reply)
+	}
+}
+
+func TestServiceAmbiguousRecurringNoPersist(t *testing.T) {
+	// Weekly without weekdays is ambiguous at interpretation time: nothing is
+	// created and the clarification prompt is returned as-is.
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Ambiguous: &AmbiguousIntent{
+				Action:              ActionCreateReminder,
+				MissingFields:       []string{"weekdays"},
+				ClarificationPrompt: "¿Qué días de la semana?",
+			},
+		},
+	}
+	tasks := &fakeTaskCreator{}
+	triggers := &fakeTriggerCreator{}
+	manager := &fakeTaskManager{}
+
+	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	reply, err := svc.HandleMessage(context.Background(), "cada semana a las 9")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if reply != "¿Qué días de la semana?" {
+		t.Errorf("reply = %q, want the clarification prompt", reply)
+	}
+	if len(tasks.calls) != 0 || len(triggers.calls) != 0 {
+		t.Error("ambiguous recurrence must not persist a task or trigger")
+	}
+}
+
 func TestServiceUnrecognized(t *testing.T) {
 	interpreter := &fakeInterpreter{
 		result: IntentResult{Unrecognized: true},
@@ -336,8 +574,8 @@ func TestServiceNilReminderSpec(t *testing.T) {
 	interpreter := &fakeInterpreter{
 		result: IntentResult{
 			Recognized: &RecognizedIntent{
-				Action: ActionCreateReminder,
-				Title:  "test",
+				Action:   ActionCreateReminder,
+				Title:    "test",
 				Reminder: nil,
 			},
 		},

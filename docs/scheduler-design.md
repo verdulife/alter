@@ -305,21 +305,23 @@ aceptado igual que en V1.
 ### Formato del spec (JSON canónico en `Trigger.Value`)
 
 ```json
-{"freq":"daily|weekly|monthly","interval":1,"weekdays":5,"day_of_month":1,
+{"freq":"daily|weekly|monthly|yearly","interval":1,"weekdays":5,"day_of_month":1,
  "time":"08:00","timezone":"Europe/Madrid","anchor":"2026-01-05"}
 ```
 
-- `freq`: `daily` | `weekly` | `monthly` (obligatorio).
-- `interval`: ≥ 1, default 1. `every N days/weeks/months`.
+- `freq`: `daily` | `weekly` | `monthly` | `yearly` (obligatorio).
+- `interval`: ≥ 1, default 1. `every N days/weeks/months/years`.
 - `weekdays`: bitmask Lun=1 … Dom=64 (default 0). Obligatorio (no vacío) para `weekly`;
-  ignorado para daily/monthly. "weekday" = máscara Lun–Vie (31). Semana ISO (lunes primero).
+  ignorado para daily/monthly/yearly. "weekday" = máscara Lun–Vie (31). Semana ISO (lunes primero).
 - `day_of_month`: 1–31, default 1; usado por `monthly` con **clamp** al último día del mes
-  (día 31 → 28/29 en febrero).
+  (día 31 → 28/29 en febrero). Ignorado por `yearly` (la fase anual usa mes+día del `anchor`).
 - `time`: `"HH:MM"` local (obligatorio; minuto con dos dígitos).
 - `timezone`: nombre IANA (obligatorio), capturado en creación desde `ALTER_TIMEZONE`/`time.Local`.
 - `anchor`: `"YYYY-MM-DD"` local, fecha de la **primera ocurrencia** (obligatorio). Determina la
-  fase, incluida la de `weekly + interval`; debe ser una fecha de ocurrencia válida para su
-  propio spec (weekly: su día está en la máscara; monthly: cumple la regla de clamp).
+  fase, incluida la de `weekly + interval` y la de `yearly` (mes+día del anchor es la fase anual);
+  debe ser una fecha de ocurrencia válida para su propio spec (weekly: su día está en la máscara;
+  monthly: cumple la regla de clamp; yearly: cualquier fecha real vale, y un 29/02 solo es válido
+  en un año bisiesto).
 
 ### Reglas de pertenencia al calendario (fecha candidata `d`, en el timezone del spec)
 
@@ -328,6 +330,9 @@ aceptado igual que en V1.
   `semanas(x)` = días desde el lunes de la semana de `x`, en unidades de 7 días — aritmética de
   días civiles, sin numeración ISO de semana, sin ambigüedad entre reinicios.
 - `monthly`: `meses(anchor) − meses(d) ≡ 0 (mod interval)` **y** `d.day == clamp(day_of_month)`.
+- `yearly`: `años(d) − años(anchor) ≡ 0 (mod interval)` **y** `d.mes == anchor.mes` **y**
+  `d.día == anchor.día`. La fase es mes+día del anchor (sin clamp): un anchor 29/02 solo ocurre en
+  años bisiestos, respetando el intervalo/fase; 2026-09-10 con interval 1 → 2027-09-10, …
 
 Toda la aritmética de fase es civil (componentes Y/M/D, no duración de reloj de pared): el DST no
 puede sesgar la fase.
@@ -345,10 +350,13 @@ puede sesgar la fase.
 ### Búsqueda acotada y determinista
 
 Para un spec validado (`interval ≥ 1`, máscara weekly no vacía), la primera ocurrencia futura
-está a lo sumo `interval+1` (daily), `7·interval+7` (weekly) o `31·interval+31` (monthly) días
-calendario de la fecha de referencia; el escaneo día a día está limitado por esa cota y termina
-siempre. `NextOccurrence` re-validar el spec antes de escanear, así que una spec construida a
-mano (sin pasar por `ParseRecurrence`) no puede romper la cota.
+está a lo sumo `interval+1` (daily), `7·interval+7` (weekly), `31·interval+31` (monthly) o
+`366·(400·interval)+366` (yearly: la fase 29/02 solo existe en años bisiestos, y los bisiestos
+consecutivos alineados están a lo sumo `lcm(400, interval) ≤ 400·interval` años de distancia,
+porque el patrón gregoriano de bisiestos es periódico de 400 años) días calendario de la fecha de
+referencia; el escaneo día a día está limitado por esa cota y termina siempre. `NextOccurrence`
+re-validar el spec antes de escanear, así que una spec construida a mano (sin pasar por
+`ParseRecurrence`) no puede romper la cota.
 
 ### API de dominio (S0)
 

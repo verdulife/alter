@@ -89,6 +89,24 @@ func TestParseRecurrenceWeeklyExplicit(t *testing.T) {
 	}
 }
 
+func TestParseRecurrenceYearly(t *testing.T) {
+	spec := mustParse(t, `{"freq":"yearly","time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`)
+	if spec.Freq != RecurrenceFreqYearly {
+		t.Errorf("Freq: want yearly, got %q", spec.Freq)
+	}
+	if spec.Interval != 1 {
+		t.Errorf("Interval: want default 1, got %d", spec.Interval)
+	}
+	if spec.DayOfMonth != 1 {
+		t.Errorf("DayOfMonth: want default 1 (unused by yearly), got %d", spec.DayOfMonth)
+	}
+	// An explicit interval is honored, and a leap-day anchor is a valid anchor.
+	spec2 := mustParse(t, `{"freq":"yearly","interval":3,"time":"09:00","timezone":"UTC","anchor":"2028-02-29"}`)
+	if spec2.Interval != 3 {
+		t.Errorf("Interval: want 3, got %d", spec2.Interval)
+	}
+}
+
 // --- ParseRecurrence: validation errors ---
 
 func TestParseRecurrenceErrors(t *testing.T) {
@@ -104,7 +122,7 @@ func TestParseRecurrenceErrors(t *testing.T) {
 		{"unknown field", `{"freq":"daily","time":"08:00","timezone":"UTC","anchor":"2026-01-05","bogus":1}`, ErrRecurrenceUnknownField},
 		{"missing freq", `{"time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrMissingRecurrenceField},
 		{"missing time", `{"freq":"daily","timezone":"UTC","anchor":"2026-01-05"}`, ErrMissingRecurrenceField},
-		{"unknown freq", `{"freq":"yearly","time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrInvalidRecurrenceFreq},
+		{"unknown freq", `{"freq":"annually","time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrInvalidRecurrenceFreq},
 		{"interval zero", `{"freq":"daily","interval":0,"time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrInvalidRecurrenceInterval},
 		{"interval negative", `{"freq":"daily","interval":-2,"time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrInvalidRecurrenceInterval},
 		{"weekly empty mask", `{"freq":"weekly","time":"08:00","timezone":"UTC","anchor":"2026-01-05"}`, ErrInvalidRecurrenceWeekdays},
@@ -121,6 +139,7 @@ func TestParseRecurrenceErrors(t *testing.T) {
 		{"anchor day out of range", `{"freq":"daily","time":"08:00","timezone":"UTC","anchor":"2026-02-30"}`, ErrInvalidRecurrenceAnchor},
 		{"weekly anchor not in mask", `{"freq":"weekly","weekdays":5,"time":"08:00","timezone":"UTC","anchor":"2026-01-08"}`, ErrInvalidRecurrenceAnchor},
 		{"monthly anchor not clamped day", `{"freq":"monthly","day_of_month":31,"time":"08:00","timezone":"UTC","anchor":"2026-02-15"}`, ErrInvalidRecurrenceAnchor},
+		{"yearly anchor impossible date", `{"freq":"yearly","time":"08:00","timezone":"UTC","anchor":"2023-02-29"}`, ErrInvalidRecurrenceAnchor},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -349,6 +368,134 @@ func TestNextOccurrenceMonthlyFixedDay(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	expectEquals(t, "next month", got, time.Date(2026, 2, 10, 10, 0, 0, 0, time.UTC))
+}
+
+// --- NextOccurrence: yearly ---
+
+func TestNextOccurrenceYearlyBase(t *testing.T) {
+	// Every year on Sept 10 at 09:00 UTC, anchored 2026-09-10 (interval 1).
+	spec := mustParse(t, `{"freq":"yearly","time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`)
+	cases := []struct {
+		name  string
+		after time.Time
+		want  time.Time
+	}{
+		{"same year before phase", time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"before time of day", time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC), time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"strictly after exactly on occurrence", time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC), time.Date(2027, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"after time of day", time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC), time.Date(2027, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"mid next year", time.Date(2027, 9, 10, 10, 0, 0, 0, time.UTC), time.Date(2028, 9, 10, 9, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NextOccurrence(spec, c.after)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectEquals(t, "occurrence", got, c.want)
+		})
+	}
+}
+
+func TestNextOccurrenceYearlyInterval(t *testing.T) {
+	// Every 3 years on Sept 10 at 09:00 UTC, anchored 2026-09-10 -> 2026, 2029, 2032, ...
+	spec := mustParse(t, `{"freq":"yearly","interval":3,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`)
+	cases := []struct {
+		name  string
+		after time.Time
+		want  time.Time
+	}{
+		{"skips non-aligned years", time.Date(2027, 9, 11, 0, 0, 0, 0, time.UTC), time.Date(2029, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"skips second non-aligned year", time.Date(2028, 9, 11, 0, 0, 0, 0, time.UTC), time.Date(2029, 9, 10, 9, 0, 0, 0, time.UTC)},
+		{"strictly after on occurrence", time.Date(2029, 9, 10, 9, 0, 0, 0, time.UTC), time.Date(2032, 9, 10, 9, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NextOccurrence(spec, c.after)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectEquals(t, "occurrence", got, c.want)
+		})
+	}
+}
+
+func TestNextOccurrenceYearlyLeapDay(t *testing.T) {
+	// Anchor 2024-02-29 (leap). The phase is month+day = Feb 29, which only
+	// exists in leap years: it is NEVER clamped to Feb 28. Non-leap years simply
+	// have no occurrence.
+	spec := mustParse(t, `{"freq":"yearly","time":"09:00","timezone":"UTC","anchor":"2024-02-29"}`)
+	cases := []struct {
+		name  string
+		after time.Time
+		want  time.Time
+	}{
+		{"anchor year before time of day", time.Date(2024, 2, 29, 8, 0, 0, 0, time.UTC), time.Date(2024, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"after leap day -> next leap year (no clamping)", time.Date(2024, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2028, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"skips three non-leap years", time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2028, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"strictly after leap day", time.Date(2028, 2, 29, 9, 0, 0, 0, time.UTC), time.Date(2032, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"century non-leap year skipped", time.Date(2096, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2104, 2, 29, 9, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NextOccurrence(spec, c.after)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectEquals(t, "occurrence", got, c.want)
+		})
+	}
+}
+
+func TestNextOccurrenceYearlyLeapDayInterval(t *testing.T) {
+	// Feb 29 every 4 years, anchored 2024-02-29: aligned years are all divisible
+	// by 4, so every aligned year is a leap year; the cadence stays 4 years.
+	spec := mustParse(t, `{"freq":"yearly","interval":4,"time":"09:00","timezone":"UTC","anchor":"2024-02-29"}`)
+	cases := []struct {
+		name  string
+		after time.Time
+		want  time.Time
+	}{
+		{"first interval step", time.Date(2024, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2028, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"second interval step", time.Date(2028, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2032, 2, 29, 9, 0, 0, 0, time.UTC)},
+		{"skips non-aligned leap year", time.Date(2036, 2, 29, 10, 0, 0, 0, time.UTC), time.Date(2040, 2, 29, 9, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NextOccurrence(spec, c.after)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectEquals(t, "occurrence", got, c.want)
+		})
+	}
+}
+
+func TestNextOccurrenceYearlyDST(t *testing.T) {
+	// Yearly 09:00 Europe/Madrid: both September phase dates are in CEST (+02),
+	// so the UTC instants are stable across the two occurrences and the wall
+	// clock stays 09:00 (the DST contract: local time, not UTC, defines the day).
+	spec := mustParse(t, `{"freq":"yearly","time":"09:00","timezone":"Europe/Madrid","anchor":"2025-09-10"}`)
+	after := time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC)
+	got, err := NextOccurrence(spec, after)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectEquals(t, "2025 occurrence", got, time.Date(2025, 9, 10, 7, 0, 0, 0, time.UTC))
+	if w := got.In(madrid).Format("15:04"); w != "09:00" {
+		t.Errorf("wall clock: want 09:00, got %s", w)
+	}
+
+	// Strictly after the 2025 occurrence, the phase repeats one year later with
+	// the same CEST offset -> the same UTC wall bucket.
+	got2, err := NextOccurrence(spec, got)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectEquals(t, "2026 occurrence", got2, time.Date(2026, 9, 10, 7, 0, 0, 0, time.UTC))
+	if w := got2.In(madrid).Format("15:04"); w != "09:00" {
+		t.Errorf("wall clock: want 09:00, got %s", w)
+	}
 }
 
 // --- NextOccurrence: timezone and DST ---

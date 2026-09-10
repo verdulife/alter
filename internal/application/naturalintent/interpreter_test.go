@@ -6,12 +6,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/verdu/alter/internal/domain"
 )
 
 // fakePiRunner is a test double that returns pre-configured responses.
 type fakePiRunner struct {
-	response string
-	err      error
+	response   string
+	err        error
 	lastPrompt string
 }
 
@@ -98,6 +100,195 @@ func TestInterpretCreateReminderAbsolute(t *testing.T) {
 	}
 	if result.Recognized.Reminder.AbsoluteDate != "today" {
 		t.Errorf("absolute_date = %q, want %q", result.Recognized.Reminder.AbsoluteDate, "today")
+	}
+}
+
+// --- Recurrence interpretation (B3 S4) --------------------------------------
+
+func TestInterpretCreateReminderRecurringDaily(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"sacar la basura","reminder":{"recurrence":{"freq":"daily","time":"21:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "sacar la basura todos los días a las 21", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Recognized == nil || result.Recognized.Reminder == nil || result.Recognized.Reminder.Recurrence == nil {
+		t.Fatal("expected recognized intent with a recurrence")
+	}
+	rec := result.Recognized.Reminder.Recurrence
+	if rec.Freq != domain.RecurrenceFreqDaily {
+		t.Errorf("freq = %q, want daily", rec.Freq)
+	}
+	if rec.Time != "21:00" {
+		t.Errorf("time = %q, want 21:00", rec.Time)
+	}
+	if rec.Interval != nil {
+		t.Errorf("interval = %v, want nil (defaults to 1)", *rec.Interval)
+	}
+}
+
+func TestInterpretCreateReminderRecurringWeekly(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"llamar a mamá","reminder":{"recurrence":{"freq":"weekly","weekdays":[1,4],"time":"09:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "llamar a mamá cada lunes y jueves a las 9", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	rec := result.Recognized.Reminder.Recurrence
+	if rec.Freq != domain.RecurrenceFreqWeekly {
+		t.Errorf("freq = %q, want weekly", rec.Freq)
+	}
+	if len(rec.Weekdays) != 2 || rec.Weekdays[0] != 1 || rec.Weekdays[1] != 4 {
+		t.Errorf("weekdays = %v, want [1 4]", rec.Weekdays)
+	}
+}
+
+func TestInterpretCreateReminderRecurringMonthly(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"pagar alquiler","reminder":{"recurrence":{"freq":"monthly","day_of_month":1,"time":"08:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "pagar alquiler el día 1 de cada mes a las 8", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	rec := result.Recognized.Reminder.Recurrence
+	if rec.Freq != domain.RecurrenceFreqMonthly {
+		t.Errorf("freq = %q, want monthly", rec.Freq)
+	}
+	if rec.DayOfMonth == nil || *rec.DayOfMonth != 1 {
+		t.Errorf("day_of_month = %v, want 1", rec.DayOfMonth)
+	}
+}
+
+func TestInterpretCreateReminderRecurringYearly(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"aniversario","reminder":{"recurrence":{"freq":"yearly","anchor_month":9,"anchor_day":10,"time":"09:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "aniversario cada año el 10 de septiembre a las 9", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	rec := result.Recognized.Reminder.Recurrence
+	if rec.Freq != domain.RecurrenceFreqYearly {
+		t.Errorf("freq = %q, want yearly", rec.Freq)
+	}
+	if rec.AnchorMonth == nil || *rec.AnchorMonth != 9 || rec.AnchorDay == nil || *rec.AnchorDay != 10 {
+		t.Errorf("anchor = (%v, %v), want (9, 10)", rec.AnchorMonth, rec.AnchorDay)
+	}
+}
+
+func TestInterpretCreateReminderRecurringInterval(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"revisar el coche","reminder":{"recurrence":{"freq":"weekly","interval":2,"weekdays":[2],"time":"10:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "revisar el coche cada 2 semanas los martes a las 10", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	rec := result.Recognized.Reminder.Recurrence
+	if rec.Interval == nil || *rec.Interval != 2 {
+		t.Errorf("interval = %v, want 2", rec.Interval)
+	}
+}
+
+func TestInterpretRecurrenceRequiresTime(t *testing.T) {
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"sacar la basura","reminder":{"recurrence":{"freq":"daily"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "todos los días", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Ambiguous == nil {
+		t.Fatal("expected Ambiguous intent (missing time)")
+	}
+}
+
+func TestInterpretRecurrenceContradiction(t *testing.T) {
+	// Pi must never emit relative/absolute together with recurrence; if it does,
+	// Go treats it as ambiguous rather than guessing.
+	runner := &fakePiRunner{
+		response: `{"action":"create_reminder","title":"sacar la basura","reminder":{"relative":"30m","recurrence":{"freq":"daily","time":"21:00"}}}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "sacar la basura todos los días en 30 minutos", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Ambiguous == nil {
+		t.Fatal("expected Ambiguous intent (contradictory reminder)")
+	}
+}
+
+func TestInterpretRecurringMissingFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		response string
+	}{
+		{"weekly without weekdays", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"weekly","time":"09:00"}}}`},
+		{"monthly without day", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"monthly","time":"09:00"}}}`},
+		{"yearly without month/day", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"yearly","time":"09:00"}}}`},
+		{"unknown freq", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"fortnightly","time":"09:00"}}}`},
+		{"no freq", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"time":"09:00"}}}`},
+		{"interval zero", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"daily","interval":0,"time":"09:00"}}}`},
+		{"weekdays out of range", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"weekly","weekdays":[8],"time":"09:00"}}}`},
+		{"monthly day out of range", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"monthly","day_of_month":32,"time":"09:00"}}}`},
+		{"anchor month without day", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"yearly","anchor_month":9,"time":"09:00"}}}`},
+		{"anchor year only", `{"action":"create_reminder","title":"x","reminder":{"recurrence":{"freq":"yearly","anchor_year":2027,"time":"09:00"}}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			runner := &fakePiRunner{response: c.response}
+			interpreter := NewPiNaturalInterpreter(runner)
+			ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+			result, err := interpreter.Interpret(context.Background(), "prueba", ctx)
+			if err != nil {
+				t.Fatalf("Interpret() error = %v", err)
+			}
+			if result.Ambiguous == nil {
+				t.Errorf("%s: expected Ambiguous intent", c.name)
+			}
+		})
+	}
+}
+
+func TestInterpretCreateTaskStillNoRecurrence(t *testing.T) {
+	// A plain create_task (no reminder) must keep Recognized.Reminder nil.
+	runner := &fakePiRunner{
+		response: `{"action":"create_task","title":"comprar SSD"}`,
+	}
+	interpreter := NewPiNaturalInterpreter(runner)
+	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+	result, err := interpreter.Interpret(context.Background(), "comprar SSD", ctx)
+	if err != nil {
+		t.Fatalf("Interpret() error = %v", err)
+	}
+	if result.Recognized == nil || result.Recognized.Reminder != nil {
+		t.Error("plain create_task must not carry a reminder/recurrence")
 	}
 }
 
@@ -438,15 +629,15 @@ func TestParseIntentResponseVarious(t *testing.T) {
 		wantAction Action
 	}{
 		{
-			name:      "valid create_task",
-			json:      `{"action":"create_task","title":"test"}`,
-			wantState: "recognized",
+			name:       "valid create_task",
+			json:       `{"action":"create_task","title":"test"}`,
+			wantState:  "recognized",
 			wantAction: ActionCreateTask,
 		},
 		{
-			name:      "valid create_reminder with relative",
-			json:      `{"action":"create_reminder","title":"test","reminder":{"relative":"1h"}}`,
-			wantState: "recognized",
+			name:       "valid create_reminder with relative",
+			json:       `{"action":"create_reminder","title":"test","reminder":{"relative":"1h"}}`,
+			wantState:  "recognized",
 			wantAction: ActionCreateReminder,
 		},
 		{
@@ -455,9 +646,9 @@ func TestParseIntentResponseVarious(t *testing.T) {
 			wantState: "unrecognized",
 		},
 		{
-			name:      "missing title",
-			json:      `{"action":"create_task","missing_fields":["title"]}`,
-			wantState: "ambiguous",
+			name:       "missing title",
+			json:       `{"action":"create_task","missing_fields":["title"]}`,
+			wantState:  "ambiguous",
 			wantAction: ActionCreateTask,
 		},
 		{
@@ -471,14 +662,14 @@ func TestParseIntentResponseVarious(t *testing.T) {
 			wantState: "unrecognized",
 		},
 		{
-			name:       "invalid json",
-			json:       `{bad json`,
-			wantState:  "error",
+			name:      "invalid json",
+			json:      `{bad json`,
+			wantState: "error",
 		},
 		{
-			name:       "null action",
-			json:       `{"action":null}`,
-			wantState:  "unrecognized",
+			name:      "null action",
+			json:      `{"action":null}`,
+			wantState: "unrecognized",
 		},
 	}
 

@@ -7,7 +7,11 @@
 // The Pi LLM is the interpreter backend; Go owns all state mutations.
 package naturalintent
 
-import "time"
+import (
+	"time"
+
+	"github.com/verdu/alter/internal/domain"
+)
 
 // Action identifies the operation the user intends.
 type Action string
@@ -58,9 +62,15 @@ type RecognizedIntent struct {
 // The LLM never produces a time.Time; it produces one of two forms:
 //   - Relative: a Go duration string like "30m", "1h30m".
 //   - Absolute: a local time + optional date like "20:00" + "today".
+//   - Recurrence: a recurring cadence (daily/weekly/monthly/yearly).
 //
-// The application resolves the final time.Time using the current time
-// and the user's timezone.
+// Relative/Absolute and Recurrence are mutually exclusive (contradictory specs
+// are rejected as ambiguous). The application resolves the final time using the
+// current time and the user's timezone.
+//
+// Recurrence is a B3 S4 extension: Pi only extracts the cadence from the
+// message; Go builds the canonical RecurrenceSpec JSON and validates it with
+// domain.ParseRecurrence before persisting.
 type ReminderSpec struct {
 	// Relative is a Go duration string (e.g. "30m", "1h30m", "2h").
 	// Resolved as: now.Add(parsed).
@@ -71,14 +81,43 @@ type ReminderSpec struct {
 	// AbsoluteDate is "today", "tomorrow", or "YYYY-MM-DD".
 	// Omitted when Relative is present.
 	AbsoluteDate string `json:"absolute_date,omitempty"`
+	// Recurrence is the recurring cadence (B3 S4). Mutually exclusive with
+	// Relative/AbsoluteTime. nil means a one-shot reminder.
+	Recurrence *RecurrenceParams `json:"recurrence,omitempty"`
+}
+
+// RecurrenceParams is the natural-language layer's view of a recurring cadence
+// (B3 S4). It carries ONLY what Pi extracted from the user message; Go derives
+// timezone, interval default, anchor year and validates the resulting spec.
+// Nil pointers and empty slices mean "not provided" (never a zero value).
+type RecurrenceParams struct {
+	// Freq is daily, weekly, monthly or yearly.
+	Freq domain.RecurrenceFreq `json:"freq"`
+	// Interval is the cadence multiple ("cada 2 semanas"). nil -> 1.
+	Interval *int `json:"interval,omitempty"`
+	// Time is the local wall-clock time in "HH:MM" ("a las 9" -> "09:00").
+	// Required for recurring reminders.
+	Time string `json:"time,omitempty"`
+	// Weekdays are 1=monday..7=sunday, weekly only.
+	Weekdays []int `json:"weekdays,omitempty"`
+	// DayOfMonth is 1..31, monthly only (domain clamps to the month's last day).
+	DayOfMonth *int `json:"day_of_month,omitempty"`
+	// AnchorMonth/AnchorDay of an explicit start date ("el 10 de septiembre").
+	// Required for yearly; optional for the other frequencies. Go completes the
+	// year from the current date (InterpretContext.Now).
+	AnchorMonth *int `json:"anchor_month,omitempty"`
+	AnchorDay   *int `json:"anchor_day,omitempty"`
+	// AnchorYear is an explicit start year ("a partir de 2027"). Go defaults to
+	// the current year; AnchorYear requires AnchorMonth and AnchorDay.
+	AnchorYear *int `json:"anchor_year,omitempty"`
 }
 
 // AmbiguousIntent is produced when the intent is clear but required fields
 // are missing or the message is too vague to act on.
 type AmbiguousIntent struct {
-	Action       Action   `json:"action"`
-	MissingFields []string `json:"missing_fields"`
-	CandidateTitle string `json:"candidate_title,omitempty"`
+	Action         Action   `json:"action"`
+	MissingFields  []string `json:"missing_fields"`
+	CandidateTitle string   `json:"candidate_title,omitempty"`
 	// ClarificationPrompt is the exact question to send to the user.
 	ClarificationPrompt string `json:"clarification_prompt"`
 }

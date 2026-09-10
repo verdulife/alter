@@ -170,6 +170,67 @@ func TestTriggerCreate(t *testing.T) {
 	}
 }
 
+func TestTriggerCreateRecurringValid(t *testing.T) {
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	valid := `{"freq":"daily","interval":1,"weekdays":0,"day_of_month":1,"time":"21:00","timezone":"UTC","anchor":"2026-09-10"}`
+	tr, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID:  "task-1",
+		Type:    domain.TriggerTypeRecurring,
+		Value:   valid,
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create recurring trigger: %v", err)
+	}
+	if tr.Type != domain.TriggerTypeRecurring || tr.Value != valid {
+		t.Errorf("trigger fields mismatch: %+v", tr)
+	}
+	if !repo.has(tr.ID) {
+		t.Error("recurring trigger should be persisted")
+	}
+}
+
+func TestTriggerCreateRecurringInvalidRejected(t *testing.T) {
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	_, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID:  "task-1",
+		Type:    domain.TriggerTypeRecurring,
+		Value:   "not-a-recurrence",
+		Enabled: true,
+	})
+	if !errors.Is(err, ErrInvalidRecurrenceValue) {
+		t.Fatalf("expected ErrInvalidRecurrenceValue, got %v", err)
+	}
+	if len(repo.triggers) != 0 {
+		t.Error("invalid recurring trigger must not be persisted")
+	}
+}
+
+func TestTriggerCreateRecurringSemanticallyInvalidRejected(t *testing.T) {
+	// A JSON-shaped but semantically invalid spec (weekly without weekdays) must
+	// also be rejected by the same barrier.
+	svc, repo, tasks, _ := newTriggerHarness()
+	seedTask(t, tasks, "task-1")
+
+	bad := `{"freq":"weekly","interval":1,"weekdays":0,"day_of_month":1,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`
+	_, err := svc.Create(context.Background(), CreateTriggerParams{
+		TaskID:  "task-1",
+		Type:    domain.TriggerTypeRecurring,
+		Value:   bad,
+		Enabled: true,
+	})
+	if !errors.Is(err, ErrInvalidRecurrenceValue) {
+		t.Fatalf("expected ErrInvalidRecurrenceValue, got %v", err)
+	}
+	if len(repo.triggers) != 0 {
+		t.Error("semantically invalid recurring trigger must not be persisted")
+	}
+}
+
 func TestTriggerCreateDisabledByDefaultWhenRequested(t *testing.T) {
 	svc, _, tasks, _ := newTriggerHarness()
 	seedTask(t, tasks, "task-1")
