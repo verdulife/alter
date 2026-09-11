@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -9,15 +10,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/verdu/alter/internal/application"
+	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/domain"
 )
 
 var fixedNow = time.Date(2024, 5, 1, 10, 0, 0, 0, time.UTC)
 
 // --- Test-only in-memory fakes ----------------------------------------------
-// These exist solely to exercise the Orchestrator composite. They are never part
-// of the runtime wiring (no real Pi transport exists yet). A shared `order` slice
-// records the sequence of Agent -> Channel -> Event calls.
+// These exist solely to exercise the Orchestrator composite through the real
+// AgentFlow pipeline (application.NewAgentFlow + NewCapabilityFlow over a test
+// registry). They are never part of the runtime wiring (no real Pi transport
+// exists yet). A shared `order` slice records the sequence of
+// Agent -> Channel -> Event calls.
 
 type fakeAgent struct {
 	calls  []domain.AgentRequest
@@ -98,17 +103,44 @@ func (f *fakeIndexer) IndexEvent(_ context.Context, e domain.Event) error {
 	return f.err
 }
 
+// echoCapabilityHandler is a test-only capability baked into the harness
+// registry: it counts invocations and returns a fixed JSON-able result so tests
+// can observe a plan being executed end to end.
+type echoCapabilityHandler struct {
+	calls *int
+}
+
+func (h echoCapabilityHandler) Execute(context.Context, json.RawMessage) (capability.CapabilityResult, error) {
+	*h.calls++
+	return capability.CapabilityResult{Data: map[string]any{"ok": true}}, nil
+}
+
 // --- Harness ----------------------------------------------------------------
 
+// newHarness builds the Orchestrator over a real AgentFlow whose registry
+// carries no capabilities (conversation path). See newSeededHarness.
 func newHarness(t *testing.T, a *fakeAgent, ch *fakeChannel, ev *fakeEventStore, opts ...Option) *Orchestrator {
 	t.Helper()
+	return newSeededHarness(t, a, ch, ev, nil, opts...)
+}
+
+// newSeededHarness builds the Orchestrator over a real AgentFlow (Agent →
+// CapabilityFlow → PlanExecutor → Dispatcher) with a registry seeded by the
+// given callback, so tests can register the capabilities the plan path needs.
+func newSeededHarness(t *testing.T, a *fakeAgent, ch *fakeChannel, ev *fakeEventStore, seed func(*capability.Registry), opts ...Option) *Orchestrator {
+	t.Helper()
+	reg := capability.NewRegistry()
+	if seed != nil {
+		seed(reg)
+	}
+	flow := application.NewAgentFlow(a, application.NewCapabilityFlow(capability.NewPlanExecutor(capability.NewDispatcher(reg))))
 	discard := log.New(io.Discard, "", 0)
 	all := append([]Option{
 		WithNow(func() time.Time { return fixedNow }),
 		WithID(func() string { return "evt-1" }),
 		WithLogger(discard),
 	}, opts...)
-	return NewOrchestrator(a, ch, ev, all...)
+	return NewOrchestrator(flow, ch, ev, all...)
 }
 
 func fixedTriggerTask() (domain.Trigger, domain.Task) {
@@ -258,6 +290,114 @@ func TestHappyFlowOrderAndEvent(t *testing.T) {
 	}
 	if !e.CreatedAt.Equal(fixedNow) {
 		t.Errorf("event CreatedAt = %v, want %v", e.CreatedAt, fixedNow)
+	}
+}
+
+// --- AgentFlow integration: conversation, plan, classification errors --------
+
+// TestAgentFlowConversationResponse verifies that a conversational Pi response
+// reaches the Channel unmodified and is audited with exactly the delivered text.
+func TestAgentFlowConversationResponse(t *testing.T) {
+	response := "  tienes 3 tareas pendientes  "
+	a := &fakeAgent{result: domain.AgentResult{Response: response}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newHarness(t, a, ch, ev)
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(ch.sent) != 1 || ch.sent[0] != response {
+		t.Errorf("channel delivery = %q, want the unmodified conversational response %q", ch.sent, response)
+	}
+	if len(ev.events) != 1 {
+		t.Fatalf("events = %d, want 1", len(ev.events))
+	}
+	if got := ev.events[0].Payload["response"]; got != response {
+		t.Errorf("audit response = %q, want %q (audit mirrors delivery)", got, response)
+	}
+}
+
+// TestAgentFlowPlanExecutesCapability verifies that a Plan response is executed
+// through the capability layer and its results are delivered and audited at the
+// same point.
+func TestAgentFlowPlanExecutesCapability(t *testing.T) {
+	var capabilityCalls int
+	a := &fakeAgent{result: domain.AgentResult{Response: `{"calls":[{"capability":"echo","args":{}}],"clarification":null}`}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newSeededHarness(t, a, ch, ev, func(reg *capability.Registry) {
+		reg.Register(
+			capability.Capability{Name: "echo", Parameters: []byte(`{"type":"object","properties":{}}`)},
+			echoCapabilityHandler{calls: &capabilityCalls},
+		)
+	})
+	trg, task := fixedTriggerTask()
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if capabilityCalls != 1 {
+		t.Errorf("capability calls = %d, want 1", capabilityCalls)
+	}
+	want := `[{"data":{"ok":true}}]`
+	if len(ch.sent) != 1 || ch.sent[0] != want {
+		t.Errorf("channel delivery = %q, want the plan results %q", ch.sent, want)
+	}
+	if len(ev.events) != 1 {
+		t.Fatalf("events = %d, want 1", len(ev.events))
+	}
+	if got := ev.events[0].Payload["response"]; got != want {
+		t.Errorf("audit response = %q, want %q (audit mirrors delivery)", got, want)
+	}
+}
+
+// TestAgentFlowInvalidPlanErrorPropagates verifies that a classification error
+// inside the flow (an invalid plan) propagates before any delivery or audit.
+func TestAgentFlowInvalidPlanErrorPropagates(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: `{"calls":[`}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newHarness(t, a, ch, ev)
+	trg, task := fixedTriggerTask()
+
+	err := o.Execute(context.Background(), trg, task)
+	if err == nil {
+		t.Fatal("expected the invalid-plan flow error to propagate")
+	}
+	if !errors.Is(err, capability.ErrInvalidPlan) {
+		t.Errorf("errors.Is(err, ErrInvalidPlan) = false, err = %v", err)
+	}
+	if len(ch.sent) != 0 {
+		t.Errorf("no delivery expected on flow failure, got %d sends", len(ch.sent))
+	}
+	if len(ev.events) != 0 {
+		t.Errorf("no Event expected on flow failure, got %d events", len(ev.events))
+	}
+}
+
+// TestAgentFlowCapabilityErrorPropagates verifies that an execution error inside
+// the flow (an unknown capability) propagates before any delivery or audit.
+func TestAgentFlowCapabilityErrorPropagates(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: `{"calls":[{"capability":"missing","args":{}}],"clarification":null}`}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newHarness(t, a, ch, ev)
+	trg, task := fixedTriggerTask()
+
+	err := o.Execute(context.Background(), trg, task)
+	if err == nil {
+		t.Fatal("expected the capability error to propagate")
+	}
+	if !errors.Is(err, capability.ErrUnknownCapability) {
+		t.Errorf("errors.Is(err, ErrUnknownCapability) = false, err = %v", err)
+	}
+	if len(ch.sent) != 0 {
+		t.Errorf("no delivery expected on capability failure, got %d sends", len(ch.sent))
+	}
+	if len(ev.events) != 0 {
+		t.Errorf("no Event expected on capability failure, got %d events", len(ev.events))
 	}
 }
 

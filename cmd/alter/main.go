@@ -1,8 +1,9 @@
 // Command alter runs the alter runtime: the Telegram inbound adapter
 // (commands), the outbound notification channel, the Scheduler and — when Pi is
 // enabled — the real Pi Agent via the Orchestrator composite
-// (Agent → Channel → Event best-effort). When Pi is not enabled the Scheduler
-// action is the Telegram-only NotifyAction; no fake Agent exists in production.
+// (AgentFlow → Channel → Event best-effort). When Pi is not enabled the
+// Scheduler action is the Telegram-only NotifyAction; no fake Agent exists in
+// production.
 //
 // Optional semantic search (ALTER_SEARCH_ENABLED) wires the derived vector index
 // into that composite: the Orchestrator retrieves related context for the Agent
@@ -23,7 +24,9 @@ import (
 	"github.com/verdu/alter/internal/adapter/agent"
 	"github.com/verdu/alter/internal/adapter/semantic"
 	"github.com/verdu/alter/internal/adapter/telegram"
+	"github.com/verdu/alter/internal/application"
 	"github.com/verdu/alter/internal/application/naturalintent"
+	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/config"
 	"github.com/verdu/alter/internal/domain"
 	"github.com/verdu/alter/internal/scheduler"
@@ -81,24 +84,62 @@ func main() {
 	client := telegram.NewClient(cfg.TelegramToken)
 	channel := telegram.NewChannel(client, cfg.TelegramChatID)
 
+	// Shared TaskService: used by the Telegram commands, the natural language
+	// interpretation and the runtime capability registry (list_tasks). It is
+	// built before the Scheduler because the runtime action (and with it the
+	// capability registry) needs it first; its optional rescan hint is wired
+	// below, once the Scheduler exists.
+	taskOpts := []service.TaskOption{}
+	if indexer != nil {
+		taskOpts = append(taskOpts, service.WithTaskIndexer(indexer))
+	}
+	taskSvc := service.NewTaskService(tasks, triggers, events, taskOpts...)
+
 	// Pi Agent: shared between the Scheduler action (notifications) and
 	// natural language interpretation. Declared here so both can reuse it.
+	//
+	// The runtime capability registry is built alongside: it is the single
+	// source of truth for the shipped capabilities (list_tasks over the shared
+	// TaskService), feeding both execution (the Dispatcher below) and the
+	// catalog the planner sees (Catalog → PlannerContextBuilder embedded in
+	// every Pi request), so Pi only proposes capabilities that can actually
+	// execute.
+	var registry *capability.Registry
 	var piAgent *agent.PiAgent
 	if cfg.PiEnabled {
-		piAgent = agent.NewPiAgent(agent.PiConfig{
-			Bin:          cfg.PiBin,
-			Provider:     cfg.PiProvider,
-			Model:        cfg.PiModel,
-			Timeout:      cfg.PiTimeout,
-			NoTools:      cfg.PiNoTools,
-			SystemPrompt: cfg.PiSystemPrompt,
-		}, agent.WithPiLogger(logger))
+		registry = capability.NewRegistry()
+		capability.RegisterShippedCapabilities(registry, taskSvc)
+		piAgent = agent.NewPiAgent(
+			agent.PiConfig{
+				Bin:          cfg.PiBin,
+				Provider:     cfg.PiProvider,
+				Model:        cfg.PiModel,
+				Timeout:      cfg.PiTimeout,
+				NoTools:      cfg.PiNoTools,
+				SystemPrompt: cfg.PiSystemPrompt,
+			},
+			agent.WithPiLogger(logger),
+			agent.WithPlannerContextBuilder(
+				capability.NewPlannerContextBuilder(capability.NewCatalog(registry)),
+			),
+		)
 	}
 
 	// Scheduler action: the real Pi Agent composite when explicitly enabled, the
 	// Telegram-only NotifyAction otherwise.
 	var action domain.TriggerAction
 	if piAgent != nil {
+		// Capability runtime pipeline: Registry → Dispatcher → PlanExecutor →
+		// CapabilityFlow → AgentFlow. The registry built with the Pi Agent above
+		// (carrying the shipped capabilities) is shared unchanged, so the
+		// execution side of the Orchestrator and the planner context inside
+		// PiAgent see the exact same catalog. registry is non-nil exactly when
+		// piAgent is non-nil (they are built together above).
+		capabilityFlow := application.NewCapabilityFlow(
+			capability.NewPlanExecutor(capability.NewDispatcher(registry)),
+		)
+		agentFlow := application.NewAgentFlow(piAgent, capabilityFlow)
+
 		opts := []agent.Option{agent.WithLogger(logger)}
 		if searcher != nil {
 			opts = append(opts, agent.WithSearcher(searcher))
@@ -106,8 +147,8 @@ func main() {
 		if indexer != nil {
 			opts = append(opts, agent.WithIndexer(indexer))
 		}
-		action = agent.NewOrchestrator(piAgent, channel, events, opts...)
-		logger.Printf("runtime: scheduler action = Pi Agent (orchestrator), bin=%q", cfg.PiBin)
+		action = agent.NewOrchestrator(agentFlow, channel, events, opts...)
+		logger.Printf("runtime: scheduler action = Pi Agent (orchestrator via AgentFlow), bin=%q", cfg.PiBin)
 	} else {
 		action = telegram.NewNotifyAction(channel)
 		logger.Printf("runtime: scheduler action = Telegram notifications only (set ALTER_PI_ENABLED=true for the Pi Agent)")
@@ -115,11 +156,11 @@ func main() {
 
 	sched := scheduler.NewScheduler(triggers, tasks, events, action, scheduler.WithLogger(logger))
 
-	taskOpts := []service.TaskOption{service.WithTaskRescheduler(sched)}
-	if indexer != nil {
-		taskOpts = append(taskOpts, service.WithTaskIndexer(indexer))
-	}
-	taskSvc := service.NewTaskService(tasks, triggers, events, taskOpts...)
+	// The Scheduler rescan hint (Wake) of the shared TaskService, built above
+	// the Scheduler because the runtime capability registry needed it first:
+	// WithTaskRescheduler is by design an option function, applied here once the
+	// Scheduler exists. The final wiring is identical to the previous order.
+	service.WithTaskRescheduler(sched)(taskSvc)
 	triggerSvc := service.NewTriggerService(triggers, tasks, service.WithTriggerRescheduler(sched))
 
 	cmdSvc := commandService{tasks: taskSvc, triggers: triggerSvc}

@@ -2,10 +2,10 @@
 // implemented here by the PiAgent RPC adapter (pi.go), which drives the pi CLI
 // RPC mode as a one-shot subprocess per execution. It also holds the
 // Orchestrator: a concrete domain.TriggerAction that composes
-// Agent -> Channel -> Event(best-effort) on the Scheduler seam.
+// AgentFlow -> Channel -> Event(best-effort) on the Scheduler seam.
 //
 // Dependency direction: this package depends only on internal/domain (plus
-// internal/capability for the optional planner context embedded in requests)
+// internal/capability and internal/application for the capability pipeline)
 // and the standard library. It never imports the scheduler, storage, or
 // telegram packages.
 package agent
@@ -14,21 +14,28 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"time"
 
+	"github.com/verdu/alter/internal/application"
+	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/domain"
 )
 
-// Orchestrator is a concrete domain.TriggerAction that drives the Agent on the
-// Scheduler seam. Execution order (Agent -> Channel -> Event) is deliberate:
+// Orchestrator is a concrete domain.TriggerAction that drives the AgentFlow (the
+// application-layer Agent + capability pipeline) on the Scheduler seam. Execution
+// order (AgentFlow -> Channel -> Event) is deliberate:
 //
-//   - Agent.Execute produces the user-facing response. An error propagates so the
-//     Scheduler decides RetryAt (transitory) vs retire (ErrActionPermanent). On
-//     failure nothing is sent and no Event is persisted.
+//   - AgentFlow.Execute runs the Agent and processes its response through the
+//     CapabilityFlow: a conversation flows through unchanged and its text is
+//     delivered; a plan executes its capability calls and the delivered text is
+//     the serialized results. An error propagates so the Scheduler decides
+//     RetryAt (transitory) vs retire (ErrActionPermanent). On failure nothing is
+//     sent and no Event is persisted.
 //   - Channel.Send delivers the response; it is the real at-least-once consequence.
 //     A send failure propagates so the Scheduler applies RetryAt. No Event is
 //     persisted before a delivery that may not have happened.
@@ -41,7 +48,7 @@ import (
 // enabled). The in-memory fakes of its tests are never part of production
 // wiring, and no fake Agent exists in the runtime path.
 type Orchestrator struct {
-	agent    domain.Agent
+	flow     *application.AgentFlow
 	channel  domain.Channel
 	events   domain.EventStore
 	searcher domain.SemanticSearcher // optional: semantic retrieval for the Agent context
@@ -54,10 +61,10 @@ type Orchestrator struct {
 
 var _ domain.TriggerAction = (*Orchestrator)(nil)
 
-// NewOrchestrator builds the composite action. agent and channel must be non-nil.
-func NewOrchestrator(agent domain.Agent, channel domain.Channel, events domain.EventStore, opts ...Option) *Orchestrator {
+// NewOrchestrator builds the composite action. flow and channel must be non-nil.
+func NewOrchestrator(flow *application.AgentFlow, channel domain.Channel, events domain.EventStore, opts ...Option) *Orchestrator {
 	o := &Orchestrator{
-		agent:   agent,
+		flow:    flow,
 		channel: channel,
 		events:  events,
 		now:     time.Now,
@@ -97,24 +104,25 @@ func WithIndexer(i domain.SemanticIndexer) Option {
 	return func(o *Orchestrator) { o.indexer = i }
 }
 
-// Execute runs the Agent -> Channel -> Event(best-effort) flow for a fired
+// Execute runs the AgentFlow -> Channel -> Event(best-effort) flow for a fired
 // trigger and its task. It returns only an error when the consequence has not
-// happened: an Agent failure or a Channel failure. After a confirmed delivery the
-// audit Event failure never surfaces (best-effort), so the Scheduler must not
-// retry.
+// happened: an Agent (or capability flow) failure or a Channel failure. After a
+// confirmed delivery the audit Event failure never surfaces (best-effort), so
+// the Scheduler must not retry.
 func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task domain.Task) error {
-	result, err := o.agent.Execute(ctx, domain.AgentRequest{
+	result, err := o.flow.Execute(ctx, domain.AgentRequest{
 		Task:        task,
 		Trigger:     trigger,
 		Instruction: o.instruction(ctx, task),
 	})
 	if err != nil {
-		// Agent failed: no consequence happened. Propagate so the Scheduler applies
-		// RetryAt (transitory) or retires (ErrActionPermanent).
+		// Agent or flow failed: no consequence happened. Propagate so the Scheduler
+		// applies RetryAt (transitory) or retires (ErrActionPermanent).
 		return err
 	}
+	text := flowDeliveryText(result)
 
-	if err := o.channel.Send(ctx, result.Response); err != nil {
+	if err := o.channel.Send(ctx, text); err != nil {
 		// Delivery failed: the consequence did not happen. Propagate (Scheduler
 		// RetryAt). No Event is persisted for an unconfirmed delivery. A retry
 		// re-runs the whole composite (at-least-once); a duplicate response/event is
@@ -124,14 +132,16 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 
 	// Delivery confirmed. Persist the audit Event best-effort; failure is logged and
 	// the delivery is NOT retried. The semantic memory write (IndexEvent) happens
-	// only after a confirmed delivery and only when an indexer is wired.
+	// only after a confirmed delivery and only when an indexer is wired. The
+	// payload mirrors exactly what was delivered: audit and delivery stay at the
+	// same point.
 	event := domain.Event{
 		ID:   o.newID(),
 		Type: domain.EventAgentResult,
 		Payload: map[string]any{
 			"task_id":    task.ID,
 			"trigger_id": trigger.ID,
-			"response":   result.Response,
+			"response":   text,
 		},
 		CreatedAt: o.now().UTC(),
 	}
@@ -140,6 +150,30 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 	}
 	o.indexEvent(ctx, event)
 	return nil
+}
+
+// flowDeliveryText derives the user-facing text for Channel delivery (and,
+// identically, for the audit Event and the semantic memory write) from a
+// FlowResult. A conversation carries its text unchanged; a plan carries the
+// executed capability results, serialized as JSON (the V1 rendering of a plan
+// outcome).
+func flowDeliveryText(r application.FlowResult) string {
+	if r.Kind == capability.ResponseConversation {
+		return r.Response
+	}
+	results := r.Results
+	if results == nil {
+		// Defensive: a plan FlowResult always carries a non-nil slice; never
+		// serialize "null" into a delivery.
+		results = []capability.CapabilityResult{}
+	}
+	data, err := json.Marshal(results)
+	if err != nil {
+		// Defensive: capability results are JSON-able by contract; never drop the
+		// outcome on an impossible failure.
+		return fmt.Sprintf("%v", results)
+	}
+	return string(data)
 }
 
 // instruction derives the Agent instruction for a fired task: the neutral V1
