@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/domain"
 )
 
@@ -133,7 +135,13 @@ func runPiRPCHelper(scenario string) error {
 			case "ok", "ui_request":
 				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"Hola desde pi"}}`)
 			case "echo":
-				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"` + promptMessage + `"}}`)
+				// The prompt may contain newlines/quotes (e.g. the capability
+				// context block); marshal it so the RPC line stays single-line JSON.
+				text, err := json.Marshal(promptMessage)
+				if err != nil {
+					return err
+				}
+				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":` + string(text) + `}}`)
 			case "empty_text":
 				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":null}}`)
 			case "provider_failure":
@@ -178,6 +186,97 @@ func TestPiAgentInstructionReachesWire(t *testing.T) {
 	if res.Response != "la instruccion viaja" {
 		t.Errorf("Response = %q, want the sent instruction", res.Response)
 	}
+}
+
+// stubHandler is a minimal CapabilityHandler used to register test capabilities
+// in the agent package without touching real services.
+type stubHandler struct{}
+
+func (stubHandler) Execute(context.Context, json.RawMessage) (capability.CapabilityResult, error) {
+	return capability.CapabilityResult{Data: "ok"}, nil
+}
+
+func TestPiAgentPlannerContextInRequest(t *testing.T) {
+	reg := capability.NewRegistry()
+	reg.Register(capability.Capability{
+		Name:        "list_tasks",
+		Description: "list all tasks",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+	}, stubHandler{})
+
+	var args []string
+	a := newPiHarness(t, "echo", PiConfig{}, &args)
+	a = applyPlanner(a, capability.NewPlannerContextBuilder(capability.NewCatalog(reg)))
+
+	res, err := a.Execute(context.Background(), domain.AgentRequest{Instruction: "que tareas tengo"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, want := range []string{
+		"que tareas tengo",
+		`"name":"list_tasks"`,
+		`"description":"list all tasks"`,
+		`"parameters":{"type":"object","properties":{}}`,
+		"Plan",
+		"Never invent capabilities",
+	} {
+		if !strings.Contains(res.Response, want) {
+			t.Errorf("Response does not contain %q:\n%s", want, res.Response)
+		}
+	}
+}
+
+func TestPiAgentPlannerContextEmpty(t *testing.T) {
+	reg := capability.NewRegistry()
+	var args []string
+	a := newPiHarness(t, "echo", PiConfig{}, &args)
+	a = applyPlanner(a, capability.NewPlannerContextBuilder(capability.NewCatalog(reg)))
+
+	res, err := a.Execute(context.Background(), domain.AgentRequest{Instruction: "hola"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, want := range []string{
+		"hola",
+		`{"capabilities":[]}`,
+		"Rules:",
+	} {
+		if !strings.Contains(res.Response, want) {
+			t.Errorf("Response does not contain %q:\n%s", want, res.Response)
+		}
+	}
+}
+
+func TestPiAgentPlannerContextDynamicFromRegistry(t *testing.T) {
+	reg := capability.NewRegistry()
+	reg.Register(capability.Capability{Name: "alpha", Description: "first"}, stubHandler{})
+	var args []string
+	a := newPiHarness(t, "echo", PiConfig{}, &args)
+	a = applyPlanner(a, capability.NewPlannerContextBuilder(capability.NewCatalog(reg)))
+
+	res, err := a.Execute(context.Background(), domain.AgentRequest{Instruction: "uno"})
+	if err != nil {
+		t.Fatalf("Execute #1: %v", err)
+	}
+	if strings.Contains(res.Response, "gamma") {
+		t.Fatal("Response already contains gamma before registration")
+	}
+
+	reg.Register(capability.Capability{Name: "gamma", Description: "second"}, stubHandler{})
+	res, err = a.Execute(context.Background(), domain.AgentRequest{Instruction: "dos"})
+	if err != nil {
+		t.Fatalf("Execute #2: %v", err)
+	}
+	if !strings.Contains(res.Response, `"name":"gamma"`) {
+		t.Errorf("Response after late registration does not contain gamma:\n%s", res.Response)
+	}
+}
+
+// applyPlanner wires the planner context builder onto an existing agent via the
+// public option (deterministic tests reuse the harness' factory).
+func applyPlanner(a *PiAgent, b *capability.PlannerContextBuilder) *PiAgent {
+	WithPlannerContextBuilder(b)(a)
+	return a
 }
 
 func TestPiAgentProviderAndModelFlags(t *testing.T) {

@@ -4,9 +4,10 @@
 // Orchestrator: a concrete domain.TriggerAction that composes
 // Agent -> Channel -> Event(best-effort) on the Scheduler seam.
 //
-// Dependency direction: this package depends only on internal/domain and the
-// standard library. It never imports the scheduler, storage, or telegram
-// packages.
+// Dependency direction: this package depends only on internal/domain (plus
+// internal/capability for the optional planner context embedded in requests)
+// and the standard library. It never imports the scheduler, storage, or
+// telegram packages.
 package agent
 
 import (

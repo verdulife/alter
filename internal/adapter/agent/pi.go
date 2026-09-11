@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/domain"
 )
 
@@ -37,11 +38,10 @@ import (
 //     Pi exhausted its internal retries, and runs that settle without a
 //     response text. The Scheduler applies its RetryAt backoff.
 type PiAgent struct {
-	cfg    PiConfig
-	logger *log.Logger
-	// newCmd is the process factory seam for deterministic tests; production
-	// uses exec.CommandContext (kills the subprocess when ctx is done).
-	newCmd func(ctx context.Context, name string, args ...string) *exec.Cmd
+	cfg     PiConfig
+	logger  *log.Logger
+	newCmd  func(ctx context.Context, name string, args ...string) *exec.Cmd
+	planner *capability.PlannerContextBuilder // optional: capability context for planner-facing requests
 }
 
 var _ domain.Agent = (*PiAgent)(nil)
@@ -75,6 +75,17 @@ type PiOption func(*PiAgent)
 // the "binary" is the test binary itself re-executed as an RPC fake).
 func WithCommandFactory(f func(ctx context.Context, name string, args ...string) *exec.Cmd) PiOption {
 	return func(a *PiAgent) { a.newCmd = f }
+}
+
+// WithPlannerContextBuilder wires the optional capability context for
+// planner-facing requests. When set, every request sent to Pi embeds the
+// current PlannerContext (capability names, descriptions and schemas, derived
+// fresh from the Catalog on each execution) plus the Plan protocol rules.
+// When absent, requests are exactly the V1 message and existing behavior is
+// unchanged. PiAgent only prepares the request: it never parses nor executes
+// plans itself.
+func WithPlannerContextBuilder(b *capability.PlannerContextBuilder) PiOption {
+	return func(a *PiAgent) { a.planner = b }
 }
 
 // WithPiLogger sets the logger used for non-fatal diagnostics. It is named
@@ -192,7 +203,7 @@ func (a *PiAgent) run(ctx context.Context, stdin io.Writer, stdout io.Reader, in
 	// U+2028/U+2029). Allow large lines (e.g. a long assistant response).
 	scanner.Buffer(make([]byte, 0, 64*1024), piMaxLine)
 
-	if err := writeJSON(stdin, piPrompt(instruction)); err != nil {
+	if err := writeJSON(stdin, piPrompt(a.promptMessage(instruction))); err != nil {
 		return "", classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: write prompt: %w", err))
 	}
 
@@ -347,6 +358,17 @@ type rpcEvent struct {
 	Data       json.RawMessage `json:"data"`
 	ID         string          `json:"id"`
 	Method     string          `json:"method"`
+}
+
+// promptMessage composes the RPC message: the plain instruction, plus a
+// capability-context block when a planner context builder is wired. The block
+// is derived fresh from the Catalog on every execution. Interpretation and
+// execution of plans is a later layer; this method only prepares the request.
+func (a *PiAgent) promptMessage(instruction string) string {
+	if a.planner == nil {
+		return instruction
+	}
+	return instruction + "\n\n" + plannerPrompt(a.planner.Build())
 }
 
 // promptCommand/response/data shapes (documented in the pi RPC protocol).
