@@ -222,6 +222,7 @@ func TestPiAgentPromptRejectedIsPermanent(t *testing.T) {
 	if !errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v, want domain.ErrActionPermanent", err)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindProvider)
 }
 
 func TestPiAgentBinaryMissingIsPermanent(t *testing.T) {
@@ -236,6 +237,7 @@ func TestPiAgentBinaryMissingIsPermanent(t *testing.T) {
 	if !errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v, want domain.ErrActionPermanent", err)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindProvider)
 }
 
 func TestPiAgentEmptyResponseIsRetryable(t *testing.T) {
@@ -249,6 +251,7 @@ func TestPiAgentEmptyResponseIsRetryable(t *testing.T) {
 	if errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v must be retryable, not permanent", err)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindEmptyResponse)
 }
 
 func TestPiAgentCrashIsRetryable(t *testing.T) {
@@ -262,6 +265,7 @@ func TestPiAgentCrashIsRetryable(t *testing.T) {
 	if errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v must be retryable, not permanent", err)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindInternal)
 }
 
 func TestPiAgentProviderFailureIsRetryable(t *testing.T) {
@@ -275,6 +279,7 @@ func TestPiAgentProviderFailureIsRetryable(t *testing.T) {
 	if errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v must be retryable, not permanent", err)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindProvider)
 }
 
 func TestPiAgentTimeoutIsRetryable(t *testing.T) {
@@ -292,6 +297,7 @@ func TestPiAgentTimeoutIsRetryable(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Errorf("timeout took %v, want a prompt failure", elapsed)
 	}
+	assertAgentErrorKind(t, err, domain.AgentErrorKindTimeout)
 }
 
 func TestPiAgentUIDialogIsDismissed(t *testing.T) {
@@ -321,6 +327,8 @@ func TestPiAgentContextCancelledIsRetryable(t *testing.T) {
 	if errors.Is(err, domain.ErrActionPermanent) {
 		t.Errorf("err = %v must be retryable, not permanent", err)
 	}
+	// The spawn is aborted before the RPC starts: an internal/transport failure.
+	assertAgentErrorKind(t, err, domain.AgentErrorKindInternal)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -339,5 +347,13 @@ func assertArgsAbsent(t *testing.T, args []string, flag string) {
 	t.Helper()
 	if slices.Contains(args, flag) {
 		t.Errorf("args = %v, want no %q", args, flag)
+	}
+}
+
+// assertAgentErrorKind checks that err carries the given classification.
+func assertAgentErrorKind(t *testing.T, err error, want domain.AgentErrorKind) {
+	t.Helper()
+	if got := domain.AgentErrorKindOf(err); got != want {
+		t.Errorf("err = %v: kind = %v, want %v", err, got, want)
 	}
 }

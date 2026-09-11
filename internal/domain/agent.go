@@ -49,3 +49,65 @@ type AgentResult struct {
 // boundary and wraps permanent ones with this sentinel; everything else is
 // treated as retryable by default.
 var ErrActionPermanent = errors.New("action failed permanently")
+
+// AgentErrorKind classifies an Agent execution failure so application layers
+// can tell an infrastructure/provider problem apart from a non-recognized
+// input and choose the right user-facing reply. Classification happens at the
+// adapter boundary (where the failure originates); consumers read it with
+// AgentErrorKindOf, never by parsing error text.
+type AgentErrorKind int
+
+const (
+	// AgentErrorKindInternal is the default kind: an unexpected failure inside
+	// the agent transport (spawn, IO, protocol, decode).
+	AgentErrorKindInternal AgentErrorKind = iota
+	// AgentErrorKindTimeout means the agent execution exceeded its time bound.
+	AgentErrorKindTimeout
+	// AgentErrorKindEmptyResponse means the agent produced no response text.
+	AgentErrorKindEmptyResponse
+	// AgentErrorKindProvider means the underlying model/provider failed (after
+	// the agent's own internal retries) or the run was rejected for an
+	// environment/configuration reason. Some of these are also marked permanent
+	// via ErrActionPermanent (the two classifications are independent:
+	// ErrActionPermanent drives scheduler retire/retry, the kind drives the
+	// user-facing reply).
+	AgentErrorKindProvider
+)
+
+// AgentError is a classified Agent failure. It implements error and preserves
+// its cause through Unwrap, so errors.Is/errors.As keep working on the whole
+// wrapped chain (e.g. a Provider failure that is also ErrActionPermanent).
+type AgentError struct {
+	// Kind is the classification of the failure.
+	Kind AgentErrorKind
+	// Err is the original failure; non-nil in practice.
+	Err error
+}
+
+// Error implements error. The text is the underlying failure's text, so
+// existing log/journal output keeps its current shape.
+func (e *AgentError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "agent execution failed"
+}
+
+// Unwrap exposes the cause so classification and sentinel checks survive the
+// wrapping layers between adapter and application.
+func (e *AgentError) Unwrap() error { return e.Err }
+
+// AgentErrorKindOf returns the classified kind of err. Errors without an
+// attached classification default to AgentErrorKindInternal, except a bare (or
+// wrapped) context deadline, which is a timeout: callers that do not attach
+// AgentError still get the right visible outcome.
+func AgentErrorKindOf(err error) AgentErrorKind {
+	var ae *AgentError
+	if errors.As(err, &ae) {
+		return ae.Kind
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return AgentErrorKindTimeout
+	}
+	return AgentErrorKindInternal
+}

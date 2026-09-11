@@ -2,6 +2,7 @@ package naturalintent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -498,7 +499,7 @@ func TestServiceAmbiguous(t *testing.T) {
 	}
 }
 
-func TestServiceInterpreterError(t *testing.T) {
+func TestServiceInterpreterTimeoutReply(t *testing.T) {
 	interpreter := &fakeInterpreter{
 		err: context.DeadlineExceeded,
 	}
@@ -511,8 +512,48 @@ func TestServiceInterpreterError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(reply, "No pude entender") {
-		t.Errorf("reply = %q, want error message", reply)
+	// A bare context deadline is classified as a timeout and must not be
+	// presented as an unrecognized input.
+	if !strings.Contains(reply, "tardó demasiado") {
+		t.Errorf("reply = %q, want timeout message", reply)
+	}
+}
+
+// TestServiceInterpreterErrorClassification checks that each classified agent
+// failure produces its own distinct reply, and that unclassified errors fall
+// back to internal (never to the "unrecognized input" welcome).
+func TestServiceInterpreterErrorClassification(t *testing.T) {
+	classified := func(kind domain.AgentErrorKind) error {
+		return &domain.AgentError{Kind: kind, Err: errors.New("boom")}
+	}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"timeout", classified(domain.AgentErrorKindTimeout), "tardó demasiado"},
+		{"empty response", classified(domain.AgentErrorKindEmptyResponse), "no devolvió una respuesta"},
+		{"provider", classified(domain.AgentErrorKindProvider), "no está disponible"},
+		{"internal", classified(domain.AgentErrorKindInternal), "error interno"},
+		{"bare deadline is a timeout", context.DeadlineExceeded, "tardó demasiado"},
+		// An unclassified error is still an internal failure, never an
+		// unrecognized input: the generic "No pude entender" message would hide
+		// the infrastructure problem this change exists to surface.
+		{"unclassified is internal", errors.New("something else"), "error interno"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			interpreter := &fakeInterpreter{err: tt.err}
+			svc := NewService(interpreter, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+
+			reply, err := svc.HandleMessage(context.Background(), "test")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(reply, tt.want) {
+				t.Errorf("reply = %q, want substring %q", reply, tt.want)
+			}
+		})
 	}
 }
 

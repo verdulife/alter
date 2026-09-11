@@ -96,7 +96,7 @@ func (s *Service) HandleMessage(ctx context.Context, text string) (string, error
 	result, err := s.interpreter.Interpret(ctx, text, ictx)
 	if err != nil {
 		s.logger.Printf("natural: interpret failed: %v", err)
-		return "No pude entender tu mensaje. Intenta con más detalle.", err
+		return interpretErrorReply(err), err
 	}
 
 	switch {
@@ -113,6 +113,26 @@ func (s *Service) HandleMessage(ctx context.Context, text string) (string, error
 	default:
 		return "No pude procesar tu mensaje.", nil
 	}
+}
+
+// interpretErrorReply maps a classified Agent failure to a distinct user-facing
+// reply. The point is to never present an infrastructure/provider problem as an
+// unrecognized input: each case tells the user what actually failed. The switch
+// is exhaustive because domain.AgentErrorKindOf always returns one of the four
+// kinds; an error without an attached classification is an internal failure, NOT
+// an unrecognized input (that would recreate the confusion this fixes).
+func interpretErrorReply(err error) string {
+	switch domain.AgentErrorKindOf(err) {
+	case domain.AgentErrorKindTimeout:
+		return "El agente tardó demasiado en responder. Intenta de nuevo en unos segundos."
+	case domain.AgentErrorKindEmptyResponse:
+		return "El agente no devolvió una respuesta. Intenta de nuevo en unos segundos."
+	case domain.AgentErrorKindProvider:
+		return "El servicio del agente no está disponible ahora mismo. Intenta de nuevo en unos segundos."
+	case domain.AgentErrorKindInternal:
+		return "Ocurrió un error interno al procesar tu mensaje. Intenta de nuevo en unos segundos."
+	}
+	return "Ocurrió un error interno al procesar tu mensaje. Intenta de nuevo en unos segundos."
 }
 
 // executeRecognized executes a fully parsed intent.

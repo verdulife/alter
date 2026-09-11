@@ -113,11 +113,11 @@ func (a *PiAgent) Execute(ctx context.Context, request domain.AgentRequest) (dom
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return domain.AgentResult{}, fmt.Errorf("pi: stdin pipe: %w", err)
+		return domain.AgentResult{}, classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: stdin pipe: %w", err))
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return domain.AgentResult{}, fmt.Errorf("pi: stdout pipe: %w", err)
+		return domain.AgentResult{}, classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: stdout pipe: %w", err))
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -128,9 +128,9 @@ func (a *PiAgent) Execute(ctx context.Context, request domain.AgentRequest) (dom
 		// exist: an environment misconfiguration an operator must fix (e.g. set
 		// ALTER_PI_BIN). Retrying is useless, so the trigger is retired.
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
-			return domain.AgentResult{}, fmt.Errorf("%w: pi: %v", domain.ErrActionPermanent, err)
+			return domain.AgentResult{}, classify(domain.AgentErrorKindProvider, fmt.Errorf("%w: pi: %v", domain.ErrActionPermanent, err))
 		}
-		return domain.AgentResult{}, fmt.Errorf("pi: start: %w", err)
+		return domain.AgentResult{}, classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: start: %w", err))
 	}
 
 	text, runErr := a.run(ctx, stdin, stdout, request.Instruction)
@@ -159,7 +159,7 @@ func (a *PiAgent) Execute(ctx context.Context, request domain.AgentRequest) (dom
 	}
 	if text == "" {
 		// Defensive: a settled run must carry a response; never deliver empty.
-		return domain.AgentResult{}, errors.New("pi: agent returned an empty response")
+		return domain.AgentResult{}, classify(domain.AgentErrorKindEmptyResponse, errors.New("pi: agent returned an empty response"))
 	}
 	return domain.AgentResult{Response: text}, nil
 }
@@ -193,7 +193,7 @@ func (a *PiAgent) run(ctx context.Context, stdin io.Writer, stdout io.Reader, in
 	scanner.Buffer(make([]byte, 0, 64*1024), piMaxLine)
 
 	if err := writeJSON(stdin, piPrompt(instruction)); err != nil {
-		return "", fmt.Errorf("pi: write prompt: %w", err)
+		return "", classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: write prompt: %w", err))
 	}
 
 	var st piRunState
@@ -207,29 +207,29 @@ func (a *PiAgent) run(ctx context.Context, stdin io.Writer, stdout io.Reader, in
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("pi: timed out after %s", a.cfg.Timeout)
+			return "", classify(domain.AgentErrorKindTimeout, fmt.Errorf("pi: timed out after %s", a.cfg.Timeout))
 		}
-		return "", fmt.Errorf("pi: read: %w", err)
+		return "", classify(domain.AgentErrorKindInternal, fmt.Errorf("pi: read: %w", err))
 	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("pi: timed out after %s", a.cfg.Timeout)
+		return "", classify(domain.AgentErrorKindTimeout, fmt.Errorf("pi: timed out after %s", a.cfg.Timeout))
 	}
 
 	switch {
 	case st.promptRejected != nil:
-		return "", fmt.Errorf("%w: pi: %v", domain.ErrActionPermanent, st.promptRejected)
+		return "", classify(domain.AgentErrorKindProvider, fmt.Errorf("%w: pi: %v", domain.ErrActionPermanent, st.promptRejected))
 	case st.runnerErr != nil:
-		return "", fmt.Errorf("pi: agent failed after retries: %w", st.runnerErr)
+		return "", classify(domain.AgentErrorKindProvider, fmt.Errorf("pi: agent failed after retries: %w", st.runnerErr))
 	case st.gotTextResponse:
 		return st.text, nil
 	case st.settled:
 		// The run settled but produced no response text (e.g. a transient
 		// failure without a retry marker): retry; never deliver an empty
 		// notification.
-		return "", errors.New("pi: agent settled without a response text")
+		return "", classify(domain.AgentErrorKindEmptyResponse, errors.New("pi: agent settled without a response text"))
 	default:
 		// EOF before agent_settled: the process crashed or was interrupted.
-		return "", errors.New("pi: process exited before agent_settled")
+		return "", classify(domain.AgentErrorKindInternal, errors.New("pi: process exited before agent_settled"))
 	}
 }
 
@@ -389,6 +389,13 @@ func boundedText(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// classify attaches a domain.AgentError classification to err, keeping the
+// original error text (logs keep their current shape) and its wrapping chain
+// (errors.Is/errors.As keep working on ErrActionPermanent and other sentinels).
+func classify(kind domain.AgentErrorKind, err error) error {
+	return &domain.AgentError{Kind: kind, Err: err}
 }
 
 // Timeouts and bounds for the one-shot RPC execution.

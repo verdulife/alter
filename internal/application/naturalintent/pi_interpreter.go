@@ -3,6 +3,7 @@ package naturalintent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -82,7 +83,14 @@ func parseIntentResponse(raw string) (IntentResult, error) {
 	raw = strings.TrimSpace(raw)
 
 	if raw == "" {
-		return IntentResult{Unrecognized: true}, nil
+		// An empty agent response is an agent failure, NOT an unrecognized input:
+		// the user's message was never classified, so it must never surface as the
+		// harmless "unrecognized" welcome. Classify it so the reply layer can tell
+		// the two apart.
+		return IntentResult{}, &domain.AgentError{
+			Kind: domain.AgentErrorKindEmptyResponse,
+			Err:  errors.New("natural interpreter: pi returned no response text"),
+		}
 	}
 
 	var parsed piIntentJSON

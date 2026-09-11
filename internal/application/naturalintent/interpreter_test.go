@@ -3,6 +3,7 @@ package naturalintent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -375,8 +376,17 @@ func TestInterpretInvalidJSON(t *testing.T) {
 	if !strings.Contains(err.Error(), "invalid JSON") {
 		t.Errorf("error = %q, want 'invalid JSON'", err.Error())
 	}
+	// An unclassifiable protocol defect is an internal failure, never an
+	// unrecognized input.
+	if got := domain.AgentErrorKindOf(err); got != domain.AgentErrorKindInternal {
+		t.Errorf("invalid JSON kind = %v, want internal", got)
+	}
 }
 
+// TestInterpretEmptyResponse checks that an empty agent response is classified
+// as an agent failure (EmptyResponse), NOT as an unrecognized input: the user's
+// message was never classified, so it must not trigger the "unrecognized"
+// welcome path.
 func TestInterpretEmptyResponse(t *testing.T) {
 	runner := &fakePiRunner{
 		response: "",
@@ -384,12 +394,44 @@ func TestInterpretEmptyResponse(t *testing.T) {
 	interpreter := NewPiNaturalInterpreter(runner)
 	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
 
-	result, err := interpreter.Interpret(context.Background(), "test", ctx)
-	if err != nil {
-		t.Fatalf("Interpret() error = %v", err)
+	_, err := interpreter.Interpret(context.Background(), "test", ctx)
+	if err == nil {
+		t.Fatal("expected an error for an empty agent response")
 	}
-	if !result.Unrecognized {
-		t.Error("empty response should be Unrecognized")
+	if got := domain.AgentErrorKindOf(err); got != domain.AgentErrorKindEmptyResponse {
+		t.Errorf("kind = %v, want %v", got, domain.AgentErrorKindEmptyResponse)
+	}
+}
+
+// TestInterpretPreservesRunnerErrorKind checks that a classified runner error
+// keeps its classification through the interpreter's wrapping: the wrapper adds
+// context but never reclassifies, so the reply layer can distinguish timeout,
+// empty response, provider failure and internal failure.
+func TestInterpretPreservesRunnerErrorKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind domain.AgentErrorKind
+	}{
+		{"timeout", domain.AgentErrorKindTimeout},
+		{"empty response", domain.AgentErrorKindEmptyResponse},
+		{"provider", domain.AgentErrorKindProvider},
+		{"internal", domain.AgentErrorKindInternal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakePiRunner{
+				err: &domain.AgentError{Kind: tc.kind, Err: errors.New("boom")},
+			}
+			interpreter := NewPiNaturalInterpreter(runner)
+			ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
+
+			_, err := interpreter.Interpret(context.Background(), "test", ctx)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if got := domain.AgentErrorKindOf(err); got != tc.kind {
+				t.Errorf("kind = %v, want %v", got, tc.kind)
+			}
+		})
 	}
 }
 
@@ -441,6 +483,11 @@ func TestInterpretUnknownAction(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown action") {
 		t.Errorf("error = %q, want 'unknown action'", err.Error())
+	}
+	// An unknown action is a contract defect of the agent's output: internal,
+	// never presented as an unrecognized input.
+	if got := domain.AgentErrorKindOf(err); got != domain.AgentErrorKindInternal {
+		t.Errorf("unknown action kind = %v, want internal", got)
 	}
 }
 
