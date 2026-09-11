@@ -434,11 +434,11 @@ func TestSearchEnrichesInstruction(t *testing.T) {
 		t.Errorf("Exclude = %+v, want the fired task itself", opts.Exclude)
 	}
 
-	// The instruction carries the reminder prompt, the default, and labeled,
-	// bounded context.
+	// The instruction carries the neutral user message, the default, and
+	// labeled, bounded context.
 	instr := a.calls[0].Instruction
-	if !strings.HasPrefix(instr, reminderPrompt+"\n\nUser message: ") {
-		t.Errorf("instruction lacks the reminder prompt prefix: %q", instr)
+	if !strings.HasPrefix(instr, "User message: ") {
+		t.Errorf("instruction lacks the neutral user message prefix: %q", instr)
 	}
 	if !strings.Contains(instr, "Related context:") {
 		t.Errorf("instruction lacks context: %q", instr)
@@ -462,7 +462,7 @@ func TestSearchErrorFallsBackToDefault(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	want := "User message: " + defaultInstruction(task)
 	if got := a.calls[0].Instruction; got != want {
 		t.Errorf("instruction = %q, want %q", got, want)
 	}
@@ -482,7 +482,7 @@ func TestSearchUnavailableFallsBackSilently(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute again: %v", err)
 	}
-	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	want := "User message: " + defaultInstruction(task)
 	if got := a.calls[0].Instruction; got != want {
 		t.Errorf("instruction = %q, want %q", got, want)
 	}
@@ -498,7 +498,7 @@ func TestNoSearcherNoContext(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	want := "User message: " + defaultInstruction(task)
 	if got := a.calls[0].Instruction; got != want {
 		t.Errorf("instruction = %q, want %q", got, want)
 	}
@@ -515,9 +515,47 @@ func TestEmptySearchResultsNoContext(t *testing.T) {
 	if err := o.Execute(context.Background(), trg, task); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	want := reminderPrompt + "\n\nUser message: " + defaultInstruction(task)
+	want := "User message: " + defaultInstruction(task)
 	if got := a.calls[0].Instruction; got != want {
 		t.Errorf("instruction = %q, want %q", got, want)
+	}
+}
+
+// TestInstructionIsNeutralForPlanner verifies that the Orchestrator instruction
+// no longer prepends the old reminderPrompt (whose notification-only mandates
+// blocked Plan JSON) and still carries the task/trigger context: the neutral
+// "User message: " framing plus exactly the default instruction derived from
+// the task. The plannerPrompt appended later by PiAgent remains the single
+// authority deciding between a conversational reply and a Plan.
+func TestInstructionIsNeutralForPlanner(t *testing.T) {
+	a := &fakeAgent{result: domain.AgentResult{Response: "ok"}}
+	ch := &fakeChannel{}
+	ev := &fakeEventStore{}
+	o := newHarness(t, a, ch, ev)
+	trg, task := fixedTriggerTask()
+	task.Title = "comprar leche"
+
+	if err := o.Execute(context.Background(), trg, task); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	instr := a.calls[0].Instruction
+	want := "User message: " + defaultInstruction(task)
+	if instr != want {
+		t.Errorf("instruction = %q, want %q", instr, want)
+	}
+
+	// The task context survives: the default instruction embeds the task title.
+	if !strings.Contains(instr, task.Title) {
+		t.Errorf("instruction lacks the task context (title %q): %q", task.Title, instr)
+	}
+
+	// The reminderPrompt mandates that blocked planning must never appear.
+	if strings.Contains(instr, "Reply ONLY with the notification text") {
+		t.Error("instruction still carries the reminderPrompt 'Reply ONLY' mandate")
+	}
+	if strings.Contains(instr, "Do not execute actions") {
+		t.Error("instruction still carries the reminderPrompt 'Do not execute actions' mandate")
 	}
 }
 

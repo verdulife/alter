@@ -86,8 +86,22 @@ func NewService(
 }
 
 // HandleMessage processes a natural language message and returns a reply.
-// This is the main entry point from the Telegram adapter.
+// This is the main entry point from the Telegram adapter. It is a thin wrapper
+// over HandleMessageStructured that discards the recognition signal, preserving
+// the exact historical behavior for existing callers and tests.
 func (s *Service) HandleMessage(ctx context.Context, text string) (string, error) {
+	reply, _, err := s.HandleMessageStructured(ctx, text)
+	return reply, err
+}
+
+// HandleMessageStructured processes a natural language message and returns the
+// reply plus whether the message was recognized as an actionable operation that
+// was executed (recognized=true). Ambiguous and unrecognized messages report
+// false: nothing was executed, so a caller with its own conversational reply (the
+// AgentFlow inbound route) keeps it instead of replacing it with a clarification
+// or help text. The interpretation and execution logic is unchanged; this method
+// only exposes the signal the AgentFlowHandler needs for its fallback decision.
+func (s *Service) HandleMessageStructured(ctx context.Context, text string) (reply string, recognized bool, err error) {
 	ictx := InterpretContext{
 		Now:      s.now(),
 		Timezone: s.timezone,
@@ -96,22 +110,23 @@ func (s *Service) HandleMessage(ctx context.Context, text string) (string, error
 	result, err := s.interpreter.Interpret(ctx, text, ictx)
 	if err != nil {
 		s.logger.Printf("natural: interpret failed: %v", err)
-		return interpretErrorReply(err), err
+		return interpretErrorReply(err), false, err
 	}
 
 	switch {
 	case result.Unrecognized:
 		return "Hola, soy ALTER. Puedo crear tareas y recordatorios. " +
-			"Por ejemplo: \"comprar SSD\" o \"recordar comprar SSD en 30 minutos\".", nil
+			"Por ejemplo: \"comprar SSD\" o \"recordar comprar SSD en 30 minutos\".", false, nil
 
 	case result.Ambiguous != nil:
-		return result.Ambiguous.ClarificationPrompt, nil
+		return result.Ambiguous.ClarificationPrompt, false, nil
 
 	case result.Recognized != nil:
-		return s.executeRecognized(ctx, result.Recognized)
+		reply, err := s.executeRecognized(ctx, result.Recognized)
+		return reply, true, err
 
 	default:
-		return "No pude procesar tu mensaje.", nil
+		return "No pude procesar tu mensaje.", false, nil
 	}
 }
 

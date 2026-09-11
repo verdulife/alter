@@ -1074,3 +1074,65 @@ func (f *errorTaskManager) Complete(_ context.Context, id string) (domain.Task, 
 func (f *errorTaskManager) Cancel(_ context.Context, id string) (domain.Task, error) {
 	return domain.Task{}, f.cancelErr
 }
+
+// TestHandleMessageStructured checks the recognition signal the AgentFlow inbound
+// route relies on: recognized=true only when an actionable operation was
+// executed; unrecognized and ambiguous messages report false. It also verifies
+// the HandleMessage wrapper keeps the exact historical behavior (same reply).
+func TestHandleMessageStructured(t *testing.T) {
+	// Recognized: create task executed.
+	interpreter := &fakeInterpreter{
+		result: IntentResult{
+			Recognized: &RecognizedIntent{Action: ActionCreateTask, Title: "comprar pan"},
+		},
+	}
+	svc := NewService(interpreter, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	reply, recognized, err := svc.HandleMessageStructured(context.Background(), "comprar pan")
+	if err != nil {
+		t.Fatalf("HandleMessageStructured() error = %v", err)
+	}
+	if !recognized {
+		t.Error("recognized = false, want true for an executed create_task")
+	}
+	if !strings.Contains(reply, "comprar pan") {
+		t.Errorf("reply = %q, want the created task title", reply)
+	}
+
+	// Ambiguous: nothing executed.
+	amb := &fakeInterpreter{
+		result: IntentResult{
+			Ambiguous: &AmbiguousIntent{Action: ActionCreateTask, ClarificationPrompt: "¿Qué tarea?"},
+		},
+	}
+	ambSvc := NewService(amb, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	_, ambRecognized, ambErr := ambSvc.HandleMessageStructured(context.Background(), "crea")
+	if ambErr != nil {
+		t.Fatalf("ambiguous HandleMessageStructured() error = %v", ambErr)
+	}
+	if ambRecognized {
+		t.Error("recognized = true, want false for an ambiguous message (nothing executed)")
+	}
+
+	// Unrecognized: nothing executed, help text.
+	unrec := &fakeInterpreter{result: IntentResult{Unrecognized: true}}
+	unrecSvc := NewService(unrec, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	unrecReply, unrecRecognized, unrecErr := unrecSvc.HandleMessageStructured(context.Background(), "hola")
+	if unrecErr != nil {
+		t.Fatalf("unrecognized HandleMessageStructured() error = %v", unrecErr)
+	}
+	if unrecRecognized {
+		t.Error("recognized = true, want false for an unrecognized message")
+	}
+	if !strings.Contains(unrecReply, "ALTER") {
+		t.Errorf("reply = %q, want the ALTER welcome", unrecReply)
+	}
+
+	// Wrapper preserves the historical shape for the recognized case.
+	wrapper, wrapperErr := svc.HandleMessage(context.Background(), "comprar pan")
+	if wrapperErr != nil {
+		t.Fatalf("HandleMessage() error = %v", wrapperErr)
+	}
+	if wrapper != reply {
+		t.Errorf("HandleMessage() = %q, want %q (wrapper must preserve behavior)", wrapper, reply)
+	}
+}

@@ -126,8 +126,12 @@ func main() {
 	}
 
 	// Scheduler action: the real Pi Agent composite when explicitly enabled, the
-	// Telegram-only NotifyAction otherwise.
+	// Telegram-only NotifyAction otherwise. agentFlow is the shared capability
+	// pipeline (Pi Agent + CapabilityFlow) reused by the Scheduler Orchestrator
+	// AND the inbound free-text route below, so both entry points see the exact
+	// same Agent, catalog and executor.
 	var action domain.TriggerAction
+	var agentFlow *application.AgentFlow
 	if piAgent != nil {
 		// Capability runtime pipeline: Registry → Dispatcher → PlanExecutor →
 		// CapabilityFlow → AgentFlow. The registry built with the Pi Agent above
@@ -138,7 +142,7 @@ func main() {
 		capabilityFlow := application.NewCapabilityFlow(
 			capability.NewPlanExecutor(capability.NewDispatcher(registry)),
 		)
-		agentFlow := application.NewAgentFlow(piAgent, capabilityFlow)
+		agentFlow = application.NewAgentFlow(piAgent, capabilityFlow)
 
 		opts := []agent.Option{agent.WithLogger(logger)}
 		if searcher != nil {
@@ -165,31 +169,49 @@ func main() {
 
 	cmdSvc := commandService{tasks: taskSvc, triggers: triggerSvc}
 
-	// Natural language interpretation: requires Pi to be enabled (for the LLM)
-	// and NaturalEnabled to be explicitly opted-in.
+	// Inbound free text: with the Pi Agent enabled the AgentFlow capability
+	// pipeline is the primary route (Pi decides conversational reply vs Plan
+	// JSON; a Plan executes registered capabilities such as list_tasks).
+	// NaturalIntent is kept as the temporary fallback for operations not yet
+	// migrated to capabilities (create/reminder/complete/cancel), and only when
+	// explicitly opted-in via ALTER_NATURAL_ENABLED. With ALTER_PI_ENABLED=false
+	// there is no AgentFlow and no natural handler: the behavior is exactly the
+	// pre-slice one (slash commands + help fallback).
 	var naturalHandler telegram.NaturalHandler
-	if piAgent != nil && cfg.NaturalEnabled {
-		// Parse timezone.
-		tz := time.Local
-		if cfg.Timezone != "" {
-			loc, err := time.LoadLocation(cfg.Timezone)
-			if err != nil {
-				logger.Printf("runtime: invalid ALTER_TIMEZONE %q, using system timezone: %v", cfg.Timezone, err)
-			} else {
-				tz = loc
+	if agentFlow != nil {
+		// Fallback seam: the natural-language service (only when opted-in). It
+		// shares the same PiAgent for interpretation and reports whether it
+		// recognized-and-executed an actionable operation, so Pi's conversational
+		// reply is only replaced when the fallback actually acted.
+		var fallback telegram.NaturalRecognizer
+		if cfg.NaturalEnabled {
+			// Parse timezone.
+			tz := time.Local
+			if cfg.Timezone != "" {
+				loc, err := time.LoadLocation(cfg.Timezone)
+				if err != nil {
+					logger.Printf("runtime: invalid ALTER_TIMEZONE %q, using system timezone: %v", cfg.Timezone, err)
+				} else {
+					tz = loc
+				}
 			}
+
+			// Reuse the same PiAgent instance for interpretation.
+			// The interpreter wraps it via PiRunnerAdapter.
+			natInterpreter := naturalintent.NewPiNaturalInterpreter(
+				naturalintent.NewPiRunnerAdapter(piAgent),
+			)
+			natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, taskSvc, tz,
+				naturalintent.WithLogger(logger),
+			)
+			fallback = natSvc
+			logger.Printf("runtime: natural language interpretation fallback enabled (timezone=%s)", tz)
+		} else {
+			logger.Printf("runtime: natural language interpretation fallback disabled (set ALTER_NATURAL_ENABLED=true)")
 		}
 
-		// Reuse the same PiAgent instance for interpretation.
-		// The interpreter wraps it via PiRunnerAdapter.
-		natInterpreter := naturalintent.NewPiNaturalInterpreter(
-			naturalintent.NewPiRunnerAdapter(piAgent),
-		)
-		natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, taskSvc, tz,
-			naturalintent.WithLogger(logger),
-		)
-		naturalHandler = natSvc.HandleMessage
-		logger.Printf("runtime: natural language interpretation enabled (timezone=%s)", tz)
+		naturalHandler = telegram.NewAgentFlowHandler(agentFlow, fallback).Handle
+		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities), fallback=NaturalIntent(%t)", cfg.NaturalEnabled)
 	} else {
 		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true and ALTER_NATURAL_ENABLED=true)")
 	}

@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/verdu/alter/internal/application"
-	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/domain"
 )
 
@@ -120,7 +118,7 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 		// applies RetryAt (transitory) or retires (ErrActionPermanent).
 		return err
 	}
-	text := flowDeliveryText(result)
+	text := application.FlowDeliveryText(result)
 
 	if err := o.channel.Send(ctx, text); err != nil {
 		// Delivery failed: the consequence did not happen. Propagate (Scheduler
@@ -152,30 +150,6 @@ func (o *Orchestrator) Execute(ctx context.Context, trigger domain.Trigger, task
 	return nil
 }
 
-// flowDeliveryText derives the user-facing text for Channel delivery (and,
-// identically, for the audit Event and the semantic memory write) from a
-// FlowResult. A conversation carries its text unchanged; a plan carries the
-// executed capability results, serialized as JSON (the V1 rendering of a plan
-// outcome).
-func flowDeliveryText(r application.FlowResult) string {
-	if r.Kind == capability.ResponseConversation {
-		return r.Response
-	}
-	results := r.Results
-	if results == nil {
-		// Defensive: a plan FlowResult always carries a non-nil slice; never
-		// serialize "null" into a delivery.
-		results = []capability.CapabilityResult{}
-	}
-	data, err := json.Marshal(results)
-	if err != nil {
-		// Defensive: capability results are JSON-able by contract; never drop the
-		// outcome on an impossible failure.
-		return fmt.Sprintf("%v", results)
-	}
-	return string(data)
-}
-
 // instruction derives the Agent instruction for a fired task: the neutral V1
 // default plus, when a searcher is wired and returns related context, a bounded
 // digest of the best results with the task itself excluded. Retrieval is
@@ -183,6 +157,11 @@ func flowDeliveryText(r application.FlowResult) string {
 // result set falls back to the default instruction, and the fire is never
 // blocked by search. The Orchestrator only ever sees the domain port: it never
 // touches SQLite, the vector tables or the embedding provider.
+//
+// The instruction is deliberately neutral: it carries no response-format or
+// action mandates, so the planner context appended by PiAgent is the single
+// authority deciding between a conversational reply and a Plan JSON that
+// executes registered capabilities.
 func (o *Orchestrator) instruction(ctx context.Context, task domain.Task) string {
 	var base string
 	if o.searcher == nil {
@@ -203,7 +182,10 @@ func (o *Orchestrator) instruction(ctx context.Context, task domain.Task) string
 			base = assembleInstruction(task, results)
 		}
 	}
-	return reminderPrompt + "\n\nUser message: " + base
+	// Neutral user message: the old reminderPrompt (notification-only mandates
+	// that forbade actions) is gone; plannerPrompt, appended by PiAgent, decides
+	// between a conversational reply and a Plan JSON.
+	return "User message: " + base
 }
 
 // indexEvent feeds a confirmed agent.result Event to the derived semantic index
