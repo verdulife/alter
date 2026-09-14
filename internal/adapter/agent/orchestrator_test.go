@@ -341,7 +341,7 @@ func TestAgentFlowPlanExecutesCapability(t *testing.T) {
 	if capabilityCalls != 1 {
 		t.Errorf("capability calls = %d, want 1", capabilityCalls)
 	}
-	want := `[{"data":{"ok":true}}]`
+	want := "✅ Operación completada."
 	if len(ch.sent) != 1 || ch.sent[0] != want {
 		t.Errorf("channel delivery = %q, want the plan results %q", ch.sent, want)
 	}

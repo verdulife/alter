@@ -45,9 +45,10 @@ func seedListTasks(reg *capability.Registry) {
 		Name:        "list_tasks",
 		Description: "List all tasks",
 		Parameters:  []byte(`{"type":"object","properties":{}}`),
-	}, &stubCapability{data: map[string]any{
-		"tasks": []map[string]any{{"title": "comprar leche"}, {"title": "pasear al perro"}},
-	}})
+	}, &stubCapability{data: capability.ListTasksResult{Tasks: []capability.TaskView{
+		{ID: "t1", Title: "comprar leche", Status: "pending"},
+		{ID: "t2", Title: "pasear al perro", Status: "pending"},
+	}}})
 }
 
 // newTestFlow builds a real AgentFlow over a stub Agent and a real capability
@@ -87,9 +88,10 @@ func TestAgentFlowHandlerPlanExecutesCapability(t *testing.T) {
 		t.Fatalf("Handle() error = %v", err)
 	}
 
-	// The plan was executed: the reply is the JSON of the capability results.
-	if !strings.Contains(reply, "comprar leche") || !strings.Contains(reply, "pasear al perro") {
-		t.Errorf("reply = %q, want executed list_tasks results", reply)
+	// The plan was executed: the reply is the human-readable task list.
+	want := "Tus tareas (2):\n1) comprar leche\n2) pasear al perro"
+	if reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
 	}
 	if len(agent.calls) != 1 {
 		t.Fatalf("agent calls = %d, want 1", len(agent.calls))
