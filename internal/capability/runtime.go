@@ -19,4 +19,22 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService) {
 		},
 		NewListTasksHandler(taskSvc),
 	)
+
+	reg.Register(
+		Capability{
+			Name:        "create_task",
+			Description: "Create a new task",
+			Parameters: []byte(`{
+				"type": "object",
+				"properties": {
+					"title":       {"type": "string"},
+					"description": {"type": "string"},
+					"priority":    {"type": "string"},
+					"due_at":      {"type": "string"}
+				},
+				"required": ["title"]
+			}`),
+		},
+		NewCreateTaskHandler(taskSvc),
+	)
 }

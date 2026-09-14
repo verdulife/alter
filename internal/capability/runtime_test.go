@@ -50,28 +50,32 @@ func TestPlannerContextDerivesFromSameRegistry(t *testing.T) {
 	planner := NewPlannerContextBuilder(catalog)
 	ctxDoc := planner.Build()
 
-	if len(ctxDoc.Capabilities) != 1 {
-		t.Fatalf("planner context capabilities = %d, want 1", len(ctxDoc.Capabilities))
-	}
-	entry := ctxDoc.Capabilities[0]
-	if entry.Name != "list_tasks" {
-		t.Fatalf("planner context capability name = %q, want list_tasks", entry.Name)
+	if len(ctxDoc.Capabilities) != 2 {
+		t.Fatalf("planner context capabilities = %d, want 2", len(ctxDoc.Capabilities))
 	}
 	// Same source: the entry parameters and description must match the
-	// registry definition.
-	capDef, _, _ := reg.Get("list_tasks")
-	if string(entry.Parameters) != string(capDef.Parameters) {
-		t.Errorf("planner parameters %s != registry parameters %s", entry.Parameters, capDef.Parameters)
-	}
-	if entry.Description != capDef.Description {
-		t.Errorf("planner description %q != registry description %q", entry.Description, capDef.Description)
+	// registry definition, for every shipped capability.
+	for _, entry := range ctxDoc.Capabilities {
+		capDef, _, err := reg.Get(entry.Name)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", entry.Name, err)
+		}
+		if string(entry.Parameters) != string(capDef.Parameters) {
+			t.Errorf("planner parameters %s != registry parameters %s", entry.Parameters, capDef.Parameters)
+		}
+		if entry.Description != capDef.Description {
+			t.Errorf("planner description %q != registry description %q", entry.Description, capDef.Description)
+		}
 	}
 
-	// Execution side: the same registry feeds the Dispatcher, so list_tasks
-	// is dispatchable right now through the same source.
+	// Execution side: the same registry feeds the Dispatcher, so every shipped
+	// capability is dispatchable right now through the same source.
 	d := NewDispatcher(reg)
 	if _, err := d.Dispatch(context.Background(), "list_tasks", []byte(`{}`)); err != nil {
-		t.Errorf("Dispatch through the same registry must succeed: %v", err)
+		t.Errorf("Dispatch list_tasks through the same registry must succeed: %v", err)
+	}
+	if _, err := d.Dispatch(context.Background(), "create_task", []byte(`{"title":"x"}`)); err != nil {
+		t.Errorf("Dispatch create_task through the same registry must succeed: %v", err)
 	}
 }
 
