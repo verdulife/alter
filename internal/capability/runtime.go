@@ -37,4 +37,19 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService) {
 		},
 		NewCreateTaskHandler(taskSvc),
 	)
+
+	reg.Register(
+		Capability{
+			Name:        "complete_task",
+			Description: "Complete an existing task by textual reference",
+			Parameters: []byte(`{
+				"type": "object",
+				"properties": {
+					"task_ref": {"type": "string"}
+				},
+				"required": ["task_ref"]
+			}`),
+		},
+		NewCompleteTaskHandler(taskSvc),
+	)
 }

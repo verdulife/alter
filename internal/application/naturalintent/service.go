@@ -311,34 +311,30 @@ func (s *Service) cancelTask(ctx context.Context, taskRef string) (string, error
 }
 
 // resolveTask finds a single pending task matching the given reference.
-// Returns an error reply if 0 or 2+ tasks match.
+// Resolution rules live in service.MatchTaskRef (the shared task_ref
+// resolution); this method only maps its classification to the user-facing
+// error reply: 0 matches or 2+ matches both return an error reply.
 func (s *Service) resolveTask(ctx context.Context, ref string) (domain.Task, error) {
 	tasks, err := s.manager.List(ctx)
 	if err != nil {
 		return domain.Task{}, fmt.Errorf("No pude obtener las tareas: %w", err)
 	}
 
-	refLower := strings.ToLower(ref)
-	var matches []domain.Task
-	for _, t := range tasks {
-		if t.Status == domain.TaskStatusPending && strings.Contains(strings.ToLower(t.Title), refLower) {
-			matches = append(matches, t)
-		}
-	}
-
-	switch len(matches) {
-	case 0:
+	match := appservice.MatchTaskRef(tasks, ref)
+	switch {
+	case match.IsNotFound():
 		return domain.Task{}, fmt.Errorf("No encontré ninguna tarea pendiente que coincida con «%s».", ref)
-	case 1:
-		return matches[0], nil
-	default:
+	case match.IsAmbiguous():
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Encontré varias tareas que coinciden con «%s»:\n", ref))
-		for i, t := range matches {
+		for i, t := range match.Matches {
 			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, t.Title))
 		}
 		sb.WriteString("¿Cuál?")
 		return domain.Task{}, errors.New(sb.String())
+	default:
+		task, _ := match.ResolvedTask()
+		return task, nil
 	}
 }
 
