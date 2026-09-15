@@ -13,7 +13,8 @@ import (
 
 // fakeTriggerRepo is an in-memory domain.TriggerRepository.
 type fakeTriggerRepo struct {
-	triggers map[string]domain.Trigger
+	triggers  map[string]domain.Trigger
+	createErr error
 }
 
 func newFakeTriggerRepo() *fakeTriggerRepo {
@@ -21,6 +22,9 @@ func newFakeTriggerRepo() *fakeTriggerRepo {
 }
 
 func (f *fakeTriggerRepo) Create(_ context.Context, tr domain.Trigger) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
 	f.triggers[tr.ID] = tr
 	return nil
 }

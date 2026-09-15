@@ -31,26 +31,57 @@ func (f *fakeTaskCreator) Create(_ context.Context, params appservice.CreateTask
 	return task, nil
 }
 
-// fakeTriggerCreator is a test double for TriggerCreator.
-type fakeTriggerCreator struct {
-	triggers  []domain.Trigger
-	calls     []appservice.CreateTriggerParams
-	createErr error
+// fakeReminderCreator is a test double for ReminderCreator. It records the
+// composition requests and, on success, returns a persisted-ish task with a
+// deterministic ID. Error behavior mirrors service.ReminderService: on error it
+// returns the (possibly non-empty) task it would have persisted before failing,
+// so callers can detect the partial outcome (task orphaned).
+type fakeReminderCreator struct {
+	oneShotCalls   []oneShotCall
+	recurringCalls []recurringCall
+	oneShotErr     error
+	recurringErr   error
+	// oneShotTask/recurringTask is the task returned on success (or alongside
+	// the error, mirroring the partial-failure contract). Zero value -> the fake
+	// derives one from the title.
+	oneShotTask   domain.Task
+	recurringTask domain.Task
 }
 
-func (f *fakeTriggerCreator) Create(_ context.Context, params appservice.CreateTriggerParams) (domain.Trigger, error) {
-	f.calls = append(f.calls, params)
-	if f.createErr != nil {
-		return domain.Trigger{}, f.createErr
+// oneShotCall records the inputs of a CreateOneShot invocation.
+type oneShotCall struct {
+	title  string
+	source string
+	at     time.Time
+}
+
+// recurringCall records the inputs of a CreateRecurring invocation.
+type recurringCall struct {
+	title  string
+	source string
+	value  string
+}
+
+func (f *fakeReminderCreator) CreateOneShot(_ context.Context, title, source string, at time.Time) (domain.Task, error) {
+	f.oneShotCalls = append(f.oneShotCalls, oneShotCall{title: title, source: source, at: at})
+	if f.oneShotErr != nil {
+		return f.oneShotTask, f.oneShotErr
 	}
-	trigger := domain.Trigger{
-		ID:     "trigger-" + params.TaskID,
-		TaskID: params.TaskID,
-		Type:   params.Type,
-		Value:  params.Value,
+	if f.oneShotTask.ID != "" {
+		return f.oneShotTask, nil
 	}
-	f.triggers = append(f.triggers, trigger)
-	return trigger, nil
+	return domain.Task{ID: "task-" + title, Title: title}, nil
+}
+
+func (f *fakeReminderCreator) CreateRecurring(_ context.Context, title, source, value string) (domain.Task, error) {
+	f.recurringCalls = append(f.recurringCalls, recurringCall{title: title, source: source, value: value})
+	if f.recurringErr != nil {
+		return f.recurringTask, f.recurringErr
+	}
+	if f.recurringTask.ID != "" {
+		return f.recurringTask, nil
+	}
+	return domain.Task{ID: "task-" + title, Title: title}, nil
 }
 
 // fakeInterpreter is a test double for IntentInterpreter.
@@ -110,11 +141,11 @@ func TestServiceCreateTask(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, manager, tz)
+	svc := NewService(interpreter, tasks, reminders, manager, tz)
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -128,8 +159,8 @@ func TestServiceCreateTask(t *testing.T) {
 	if tasks.calls[0].Source != "telegram:natural" {
 		t.Errorf("task source = %q, want %q", tasks.calls[0].Source, "telegram:natural")
 	}
-	if len(triggers.calls) != 0 {
-		t.Error("expected no trigger creation for plain task")
+	if len(reminders.oneShotCalls) != 0 || len(reminders.recurringCalls) != 0 {
+		t.Error("expected no reminder composition for plain task")
 	}
 	if !strings.Contains(reply, "Tarea creada") {
 		t.Errorf("reply = %q, want confirmation", reply)
@@ -150,27 +181,31 @@ func TestServiceCreateReminderRelative(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, manager, tz, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, tz, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD en 30 minutos")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(tasks.calls) != 1 {
-		t.Fatalf("expected 1 task creation, got %d", len(tasks.calls))
+	if len(tasks.calls) != 0 {
+		t.Errorf("task creation is delegated to ReminderService, got %d direct calls", len(tasks.calls))
 	}
-	if len(triggers.calls) != 1 {
-		t.Fatalf("expected 1 trigger creation, got %d", len(triggers.calls))
+	if len(reminders.oneShotCalls) != 1 {
+		t.Fatalf("expected 1 one-shot reminder composition, got %d", len(reminders.oneShotCalls))
 	}
-	if triggers.calls[0].Type != domain.TriggerTypeAt {
-		t.Errorf("trigger type = %q, want %q", triggers.calls[0].Type, domain.TriggerTypeAt)
+	call := reminders.oneShotCalls[0]
+	if call.title != "comprar SSD" || call.source != "telegram:natural" {
+		t.Errorf("composition inputs = (%q, %q), want (comprar SSD, telegram:natural)", call.title, call.source)
 	}
-	wantTime := now.Add(30 * time.Minute).UTC().Format(time.RFC3339)
-	if triggers.calls[0].Value != wantTime {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantTime)
+	wantAt := now.Add(30 * time.Minute)
+	if !call.at.Equal(wantAt) {
+		t.Errorf("resolved at = %v, want %v", call.at, wantAt)
+	}
+	if len(reminders.recurringCalls) != 0 {
+		t.Error("expected no recurring composition for a relative reminder")
 	}
 	if !strings.Contains(reply, "Recordatorio creado") {
 		t.Errorf("reply = %q, want confirmation", reply)
@@ -192,21 +227,21 @@ func TestServiceCreateReminderAbsolute(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 	tz := time.UTC
 
-	svc := NewService(interpreter, tasks, triggers, manager, tz, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, tz, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "comprar SSD hoy a las 20h")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(triggers.calls) != 1 {
-		t.Fatalf("expected 1 trigger creation, got %d", len(triggers.calls))
+	if len(reminders.oneShotCalls) != 1 {
+		t.Fatalf("expected 1 one-shot reminder composition, got %d", len(reminders.oneShotCalls))
 	}
-	wantTime := time.Date(2026, 9, 10, 20, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339)
-	if triggers.calls[0].Value != wantTime {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantTime)
+	wantAt := time.Date(2026, 9, 10, 20, 0, 0, 0, time.UTC)
+	if !reminders.oneShotCalls[0].at.Equal(wantAt) {
+		t.Errorf("resolved at = %v, want %v", reminders.oneShotCalls[0].at, wantAt)
 	}
 	if !strings.Contains(reply, "Recordatorio creado") {
 		t.Errorf("reply = %q, want confirmation", reply)
@@ -227,29 +262,30 @@ func TestServiceCreateRecurringReminderDaily(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "sacar la basura todos los días a las 21")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(tasks.calls) != 1 {
-		t.Fatalf("expected 1 task creation, got %d", len(tasks.calls))
+	if len(tasks.calls) != 0 {
+		t.Errorf("task creation is delegated to ReminderService, got %d direct calls", len(tasks.calls))
 	}
-	if len(triggers.calls) != 1 {
-		t.Fatalf("expected 1 trigger creation, got %d", len(triggers.calls))
+	if len(reminders.recurringCalls) != 1 {
+		t.Fatalf("expected 1 recurring reminder composition, got %d", len(reminders.recurringCalls))
 	}
-	if triggers.calls[0].Type != domain.TriggerTypeRecurring {
-		t.Errorf("trigger type = %q, want %q", triggers.calls[0].Type, domain.TriggerTypeRecurring)
+	call := reminders.recurringCalls[0]
+	if call.title != "sacar la basura" || call.source != "telegram:natural" {
+		t.Errorf("composition inputs = (%q, %q), want (sacar la basura, telegram:natural)", call.title, call.source)
 	}
 	wantJSON := `{"freq":"daily","interval":1,"weekdays":0,"day_of_month":1,"time":"21:00","timezone":"UTC","anchor":"2026-09-10"}`
-	if triggers.calls[0].Value != wantJSON {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	if call.value != wantJSON {
+		t.Errorf("recurrence value = %q, want %q", call.value, wantJSON)
 	}
-	if !triggers.calls[0].Enabled {
-		t.Error("recurring trigger must be created enabled")
+	if len(reminders.oneShotCalls) != 0 {
+		t.Error("expected no one-shot composition for a recurring reminder")
 	}
 	if !strings.Contains(reply, "Recordatorio creado") || !strings.Contains(reply, "todos los días a las 21:00") {
 		t.Errorf("reply = %q, want confirmation with cadence", reply)
@@ -274,17 +310,17 @@ func TestServiceCreateRecurringReminderWeekly(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "llamar a mamá cada lunes y jueves a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
 	wantJSON := `{"freq":"weekly","interval":1,"weekdays":9,"day_of_month":1,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`
-	if triggers.calls[0].Value != wantJSON {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	if len(reminders.recurringCalls) != 1 || reminders.recurringCalls[0].value != wantJSON {
+		t.Errorf("recurrence value = %q, want %q", reminders.recurringCalls[0].value, wantJSON)
 	}
 	if !strings.Contains(reply, "cada lunes y jueves a las 09:00") {
 		t.Errorf("reply = %q, want weekly cadence", reply)
@@ -306,10 +342,10 @@ func TestServiceCreateRecurringReminderMonthly(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "pagar alquiler el día 1 de cada mes a las 8")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -334,17 +370,17 @@ func TestServiceCreateRecurringReminderYearly(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "aniversario cada año el 10 de septiembre a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
 	wantJSON := `{"freq":"yearly","interval":1,"weekdays":0,"day_of_month":1,"time":"09:00","timezone":"UTC","anchor":"2026-09-10"}`
-	if triggers.calls[0].Value != wantJSON {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantJSON)
+	if len(reminders.recurringCalls) != 1 || reminders.recurringCalls[0].value != wantJSON {
+		t.Errorf("recurrence value = %q, want %q", reminders.recurringCalls[0].value, wantJSON)
 	}
 	if !strings.Contains(reply, "cada año, el 10 de septiembre a las 09:00") {
 		t.Errorf("reply = %q, want yearly cadence", reply)
@@ -370,20 +406,23 @@ func TestServiceCreateRecurringReminderUserTimezone(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, ba, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, ba, WithNow(func() time.Time { return now }))
 	_, err = svc.HandleMessage(context.Background(), "sacar la basura todos los días a las 21")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if !strings.Contains(triggers.calls[0].Value, `"timezone":"America/Argentina/Buenos_Aires"`) {
-		t.Errorf("trigger value = %q, want user timezone", triggers.calls[0].Value)
+	if len(reminders.recurringCalls) != 1 {
+		t.Fatalf("expected 1 recurring reminder composition, got %d", len(reminders.recurringCalls))
+	}
+	if !strings.Contains(reminders.recurringCalls[0].value, `"timezone":"America/Argentina/Buenos_Aires"`) {
+		t.Errorf("recurrence value = %q, want user timezone", reminders.recurringCalls[0].value)
 	}
 	// 2026-09-10 14:00 UTC = 11:00 ART: the anchor is the local date (Sep 10).
-	if !strings.Contains(triggers.calls[0].Value, `"anchor":"2026-09-10"`) {
-		t.Errorf("trigger value = %q, want local-date anchor", triggers.calls[0].Value)
+	if !strings.Contains(reminders.recurringCalls[0].value, `"anchor":"2026-09-10"`) {
+		t.Errorf("recurrence value = %q, want local-date anchor", reminders.recurringCalls[0].value)
 	}
 }
 
@@ -403,10 +442,10 @@ func TestServiceRecurringReminderInvalidNoPersist(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "cada año a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -414,8 +453,8 @@ func TestServiceRecurringReminderInvalidNoPersist(t *testing.T) {
 	if len(tasks.calls) != 0 {
 		t.Errorf("no task must be created, got %d", len(tasks.calls))
 	}
-	if len(triggers.calls) != 0 {
-		t.Errorf("no trigger must be created, got %d", len(triggers.calls))
+	if len(reminders.recurringCalls) != 0 || len(reminders.oneShotCalls) != 0 {
+		t.Errorf("no reminder composition must happen, got recurring=%d one-shot=%d", len(reminders.recurringCalls), len(reminders.oneShotCalls))
 	}
 	if !strings.Contains(reply, "recurrencia") {
 		t.Errorf("reply = %q, want a clarification about the recurrence", reply)
@@ -435,10 +474,10 @@ func TestServiceAmbiguousRecurringNoPersist(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "cada semana a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -446,7 +485,7 @@ func TestServiceAmbiguousRecurringNoPersist(t *testing.T) {
 	if reply != "¿Qué días de la semana?" {
 		t.Errorf("reply = %q, want the clarification prompt", reply)
 	}
-	if len(tasks.calls) != 0 || len(triggers.calls) != 0 {
+	if len(tasks.calls) != 0 || len(reminders.recurringCalls) != 0 || len(reminders.oneShotCalls) != 0 {
 		t.Error("ambiguous recurrence must not persist a task or trigger")
 	}
 }
@@ -456,15 +495,15 @@ func TestServiceUnrecognized(t *testing.T) {
 		result: IntentResult{Unrecognized: true},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "hola")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(tasks.calls) != 0 || len(triggers.calls) != 0 {
+	if len(tasks.calls) != 0 || len(reminders.recurringCalls) != 0 || len(reminders.oneShotCalls) != 0 {
 		t.Error("expected no operations for unrecognized message")
 	}
 	if !strings.Contains(reply, "ALTER") {
@@ -483,15 +522,15 @@ func TestServiceAmbiguous(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "poné una tarea")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(tasks.calls) != 0 || len(triggers.calls) != 0 {
+	if len(tasks.calls) != 0 || len(reminders.recurringCalls) != 0 || len(reminders.oneShotCalls) != 0 {
 		t.Error("expected no operations for ambiguous message")
 	}
 	if reply != "¿Qué tarea quieres crear?" {
@@ -504,10 +543,10 @@ func TestServiceInterpreterTimeoutReply(t *testing.T) {
 		err: context.DeadlineExceeded,
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
@@ -544,7 +583,7 @@ func TestServiceInterpreterErrorClassification(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			interpreter := &fakeInterpreter{err: tt.err}
-			svc := NewService(interpreter, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+			svc := NewService(interpreter, &fakeTaskCreator{}, &fakeReminderCreator{}, &fakeTaskManager{}, time.UTC)
 
 			reply, err := svc.HandleMessage(context.Background(), "test")
 			if err == nil {
@@ -567,10 +606,10 @@ func TestServiceTaskCreationError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{createErr: context.DeadlineExceeded}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
@@ -594,17 +633,27 @@ func TestServiceTriggerCreationError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{createErr: context.DeadlineExceeded}
+	// Partial outcome: the task was persisted but the trigger failed. The fake
+	// returns the created task together with the error, exactly like
+	// service.ReminderService (no rollback).
+	reminders := &fakeReminderCreator{
+		oneShotErr:  context.DeadlineExceeded,
+		oneShotTask: domain.Task{ID: "task-test", Title: "test"},
+	}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC, WithNow(func() time.Time { return now }))
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	// Task was created, but trigger failed
-	if len(tasks.calls) != 1 {
-		t.Error("expected task to be created before trigger failure")
+	// The NL service must not create the task directly: the composition is
+	// delegated to ReminderService.
+	if len(tasks.calls) != 0 {
+		t.Error("task creation should be delegated to ReminderService")
+	}
+	if len(reminders.oneShotCalls) != 1 {
+		t.Fatalf("expected 1 one-shot composition, got %d", len(reminders.oneShotCalls))
 	}
 	if !strings.Contains(reply, "no pude programar el recordatorio") {
 		t.Errorf("reply = %q, want trigger error", reply)
@@ -622,15 +671,15 @@ func TestServiceNilReminderSpec(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(tasks.calls) != 0 || len(triggers.calls) != 0 {
+	if len(tasks.calls) != 0 || len(reminders.oneShotCalls) != 0 || len(reminders.recurringCalls) != 0 {
 		t.Error("expected no operations when reminder spec is nil")
 	}
 	if !strings.Contains(reply, "No pude entender cuándo") {
@@ -648,10 +697,10 @@ func TestServiceUnknownAction(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -678,21 +727,21 @@ func TestServiceWithTimezone(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, buenosAires, WithNow(func() time.Time { return now }))
+	svc := NewService(interpreter, tasks, reminders, manager, buenosAires, WithNow(func() time.Time { return now }))
 	_, err := svc.HandleMessage(context.Background(), "reunión mañana a las 9")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if len(triggers.calls) != 1 {
-		t.Fatalf("expected 1 trigger creation, got %d", len(triggers.calls))
+	if len(reminders.oneShotCalls) != 1 {
+		t.Fatalf("expected 1 one-shot composition, got %d", len(reminders.oneShotCalls))
 	}
 	// 09:00 ART tomorrow = 12:00 UTC on Sep 11
-	wantTime := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
-	if triggers.calls[0].Value != wantTime {
-		t.Errorf("trigger value = %q, want %q", triggers.calls[0].Value, wantTime)
+	wantAt := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	if !reminders.oneShotCalls[0].at.Equal(wantAt) {
+		t.Errorf("resolved at = %v, want %v", reminders.oneShotCalls[0].at, wantAt)
 	}
 }
 
@@ -707,10 +756,10 @@ func TestServiceListTasksEmpty(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -729,13 +778,13 @@ func TestServiceListTasksWithPending(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -760,13 +809,13 @@ func TestServiceListTasksFiltersCompleted(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "tarea completada", Status: domain.TaskStatusCompleted},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -788,11 +837,11 @@ func TestServiceListTasksError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	// manager with nil tasks will cause an error on List
 	manager := &fakeTaskManager{}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	_, err := svc.HandleMessage(context.Background(), "qué tareas tengo")
 	// The fakeTaskManager.List returns nil, which is an empty slice, not an error
 	// So this test verifies the empty case works
@@ -813,13 +862,13 @@ func TestServiceCompleteTaskOneMatch(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "compra SSD lista")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -846,12 +895,12 @@ func TestServiceCompleteTaskNoMatch(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "completá lo inexistente")
 	if err == nil {
 		t.Fatal("expected error for no match")
@@ -871,13 +920,13 @@ func TestServiceCompleteTaskMultipleMatches(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
 	if err == nil {
 		t.Fatal("expected error for multiple matches")
@@ -903,11 +952,11 @@ func TestServiceCompleteTaskListError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	// Create a manager that returns an error on List
 	errManager := &errorTaskManager{listErr: context.DeadlineExceeded}
 
-	svc := NewService(interpreter, tasks, triggers, errManager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, errManager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
 	if err == nil {
 		t.Fatal("expected error")
@@ -927,13 +976,13 @@ func TestServiceCompleteTaskCompleteError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{
 		tasks:       []domain.Task{{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending}},
 		completeErr: context.DeadlineExceeded,
 	}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "completá SSD")
 	if err == nil {
 		t.Fatal("expected error")
@@ -955,13 +1004,13 @@ func TestServiceCancelTaskOneMatch(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "cancelá la del fontanero")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
@@ -988,12 +1037,12 @@ func TestServiceCancelTaskNoMatch(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "cancelá lo inexistente")
 	if err == nil {
 		t.Fatal("expected error for no match")
@@ -1013,13 +1062,13 @@ func TestServiceCancelTaskMultipleMatches(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{tasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
 	}}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "cancelá SSD")
 	if err == nil {
 		t.Fatal("expected error for multiple matches")
@@ -1039,13 +1088,13 @@ func TestServiceCancelTaskCancelError(t *testing.T) {
 		},
 	}
 	tasks := &fakeTaskCreator{}
-	triggers := &fakeTriggerCreator{}
+	reminders := &fakeReminderCreator{}
 	manager := &fakeTaskManager{
 		tasks:     []domain.Task{{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending}},
 		cancelErr: context.DeadlineExceeded,
 	}
 
-	svc := NewService(interpreter, tasks, triggers, manager, time.UTC)
+	svc := NewService(interpreter, tasks, reminders, manager, time.UTC)
 	reply, err := svc.HandleMessage(context.Background(), "cancelá SSD")
 	if err == nil {
 		t.Fatal("expected error")
@@ -1086,7 +1135,7 @@ func TestHandleMessageStructured(t *testing.T) {
 			Recognized: &RecognizedIntent{Action: ActionCreateTask, Title: "comprar pan"},
 		},
 	}
-	svc := NewService(interpreter, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	svc := NewService(interpreter, &fakeTaskCreator{}, &fakeReminderCreator{}, &fakeTaskManager{}, time.UTC)
 	reply, recognized, err := svc.HandleMessageStructured(context.Background(), "comprar pan")
 	if err != nil {
 		t.Fatalf("HandleMessageStructured() error = %v", err)
@@ -1104,7 +1153,7 @@ func TestHandleMessageStructured(t *testing.T) {
 			Ambiguous: &AmbiguousIntent{Action: ActionCreateTask, ClarificationPrompt: "¿Qué tarea?"},
 		},
 	}
-	ambSvc := NewService(amb, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	ambSvc := NewService(amb, &fakeTaskCreator{}, &fakeReminderCreator{}, &fakeTaskManager{}, time.UTC)
 	_, ambRecognized, ambErr := ambSvc.HandleMessageStructured(context.Background(), "crea")
 	if ambErr != nil {
 		t.Fatalf("ambiguous HandleMessageStructured() error = %v", ambErr)
@@ -1115,7 +1164,7 @@ func TestHandleMessageStructured(t *testing.T) {
 
 	// Unrecognized: nothing executed, help text.
 	unrec := &fakeInterpreter{result: IntentResult{Unrecognized: true}}
-	unrecSvc := NewService(unrec, &fakeTaskCreator{}, &fakeTriggerCreator{}, &fakeTaskManager{}, time.UTC)
+	unrecSvc := NewService(unrec, &fakeTaskCreator{}, &fakeReminderCreator{}, &fakeTaskManager{}, time.UTC)
 	unrecReply, unrecRecognized, unrecErr := unrecSvc.HandleMessageStructured(context.Background(), "hola")
 	if unrecErr != nil {
 		t.Fatalf("unrecognized HandleMessageStructured() error = %v", unrecErr)

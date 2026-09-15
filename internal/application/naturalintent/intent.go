@@ -8,9 +8,7 @@
 package naturalintent
 
 import (
-	"time"
-
-	"github.com/verdu/alter/internal/domain"
+	appservice "github.com/verdu/alter/internal/service"
 )
 
 // Action identifies the operation the user intends.
@@ -87,30 +85,12 @@ type ReminderSpec struct {
 }
 
 // RecurrenceParams is the natural-language layer's view of a recurring cadence
-// (B3 S4). It carries ONLY what Pi extracted from the user message; Go derives
-// timezone, interval default, anchor year and validates the resulting spec.
-// Nil pointers and empty slices mean "not provided" (never a zero value).
-type RecurrenceParams struct {
-	// Freq is daily, weekly, monthly or yearly.
-	Freq domain.RecurrenceFreq `json:"freq"`
-	// Interval is the cadence multiple ("cada 2 semanas"). nil -> 1.
-	Interval *int `json:"interval,omitempty"`
-	// Time is the local wall-clock time in "HH:MM" ("a las 9" -> "09:00").
-	// Required for recurring reminders.
-	Time string `json:"time,omitempty"`
-	// Weekdays are 1=monday..7=sunday, weekly only.
-	Weekdays []int `json:"weekdays,omitempty"`
-	// DayOfMonth is 1..31, monthly only (domain clamps to the month's last day).
-	DayOfMonth *int `json:"day_of_month,omitempty"`
-	// AnchorMonth/AnchorDay of an explicit start date ("el 10 de septiembre").
-	// Required for yearly; optional for the other frequencies. Go completes the
-	// year from the current date (InterpretContext.Now).
-	AnchorMonth *int `json:"anchor_month,omitempty"`
-	AnchorDay   *int `json:"anchor_day,omitempty"`
-	// AnchorYear is an explicit start year ("a partir de 2027"). Go defaults to
-	// the current year; AnchorYear requires AnchorMonth and AnchorDay.
-	AnchorYear *int `json:"anchor_year,omitempty"`
-}
+// (B3 S4). It is an alias of the pure application type owned by the service
+// layer (service.RecurrenceParams), so the JSON contract the interpreter uses
+// is exactly the type the reminder resolution/builders consume — there is no
+// duplicated struct that can drift. All fields, semantics and JSON tags are
+// defined on the service type.
+type RecurrenceParams = appservice.RecurrenceParams
 
 // AmbiguousIntent is produced when the intent is clear but required fields
 // are missing or the message is too vague to act on.
@@ -122,12 +102,9 @@ type AmbiguousIntent struct {
 	ClarificationPrompt string `json:"clarification_prompt"`
 }
 
-// InterpretContext carries the runtime context the interpreter needs
-// to resolve time expressions. The LLM never sees this; Go provides it.
-type InterpretContext struct {
-	// Now is the current time. Used for relative resolution and for
-	// deciding "today" vs "tomorrow" when an absolute time has passed.
-	Now time.Time
-	// Timezone is the user's timezone. Resolved from ALTER_TIMEZONE or time.Local.
-	Timezone *time.Location
-}
+// InterpretContext carries the runtime context the interpreter needs to
+// resolve time expressions. The interpreter never sees the LLM's output in
+// this struct: it is provided by the application. It is an alias of
+// service.TimeContext so interpretation and reminder resolution share one
+// typed clock/timezone context.
+type InterpretContext = appservice.TimeContext

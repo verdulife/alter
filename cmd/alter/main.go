@@ -166,8 +166,13 @@ func main() {
 	// Scheduler exists. The final wiring is identical to the previous order.
 	service.WithTaskRescheduler(sched)(taskSvc)
 	triggerSvc := service.NewTriggerService(triggers, tasks, service.WithTriggerRescheduler(sched))
+	// ReminderService owns the Task + Trigger composition shared by every
+	// reminder route (natural language one-shot/recurring and /recordar). It is
+	// prepared here so the existing routes reuse it; the create_reminder
+	// capability wiring comes later.
+	reminderSvc := service.NewReminderService(taskSvc, triggerSvc)
 
-	cmdSvc := commandService{tasks: taskSvc, triggers: triggerSvc}
+	cmdSvc := commandService{tasks: taskSvc, reminders: reminderSvc}
 
 	// Inbound free text: with the Pi Agent enabled the AgentFlow capability
 	// pipeline is the primary route (Pi decides conversational reply vs Plan
@@ -201,7 +206,7 @@ func main() {
 			natInterpreter := naturalintent.NewPiNaturalInterpreter(
 				naturalintent.NewPiRunnerAdapter(piAgent),
 			)
-			natSvc := naturalintent.NewService(natInterpreter, taskSvc, triggerSvc, taskSvc, tz,
+			natSvc := naturalintent.NewService(natInterpreter, taskSvc, reminderSvc, taskSvc, tz,
 				naturalintent.WithLogger(logger),
 			)
 			fallback = natSvc

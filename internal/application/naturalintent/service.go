@@ -23,7 +23,7 @@ import (
 type Service struct {
 	interpreter IntentInterpreter
 	tasks       TaskCreator
-	triggers    TriggerCreator
+	reminders   ReminderCreator
 	manager     TaskManager
 	now         func() time.Time
 	timezone    *time.Location
@@ -35,9 +35,16 @@ type TaskCreator interface {
 	Create(ctx context.Context, params appservice.CreateTaskParams) (domain.Task, error)
 }
 
-// TriggerCreator abstracts trigger creation for testability.
-type TriggerCreator interface {
-	Create(ctx context.Context, params appservice.CreateTriggerParams) (domain.Trigger, error)
+// ReminderCreator abstracts the Task + Trigger composition for reminders
+// (one-shot and recurring), so tests can inject a fake. It is satisfied by
+// service.ReminderService, the single owner of that composition.
+type ReminderCreator interface {
+	// CreateOneShot creates the task and its one-shot "at" trigger. On error,
+	// a non-empty task means the task was persisted but the trigger failed.
+	CreateOneShot(ctx context.Context, title, source string, at time.Time) (domain.Task, error)
+	// CreateRecurring creates the task and its recurring trigger with the
+	// given canonical recurrence JSON value. Error semantics mirror CreateOneShot.
+	CreateRecurring(ctx context.Context, title, source string, recurrenceJSON string) (domain.Task, error)
 }
 
 // TaskManager abstracts task listing, completion and cancellation for testability.
@@ -65,7 +72,7 @@ func WithNow(f func() time.Time) Option {
 func NewService(
 	interpreter IntentInterpreter,
 	tasks TaskCreator,
-	triggers TriggerCreator,
+	reminders ReminderCreator,
 	manager TaskManager,
 	timezone *time.Location,
 	opts ...Option,
@@ -73,7 +80,7 @@ func NewService(
 	s := &Service{
 		interpreter: interpreter,
 		tasks:       tasks,
-		triggers:    triggers,
+		reminders:   reminders,
 		manager:     manager,
 		now:         time.Now,
 		timezone:    timezone,
@@ -168,11 +175,15 @@ func (s *Service) executeRecognized(ctx context.Context, intent *RecognizedInten
 	}
 }
 
+// sourceNatural is the task Source stamped on every task created through the
+// natural language route.
+const sourceNatural = "telegram:natural"
+
 // createTask creates a plain task (no reminder trigger).
 func (s *Service) createTask(ctx context.Context, title string) (string, error) {
 	_, err := s.tasks.Create(ctx, appservice.CreateTaskParams{
 		Title:  title,
-		Source: "telegram:natural",
+		Source: sourceNatural,
 	})
 	if err != nil {
 		return "No pude crear la tarea: " + err.Error(), err
@@ -181,7 +192,9 @@ func (s *Service) createTask(ctx context.Context, title string) (string, error) 
 }
 
 // createReminder creates a task plus a trigger: one-shot "at" for relative/
-// absolute reminders, recurring for RecurrenceParams (B3 S4).
+// absolute reminders, recurring for RecurrenceParams (B3 S4). The composition
+// is delegated to service.ReminderService (via ReminderCreator); this method
+// only resolves the time/spec and formats the user-facing reply.
 func (s *Service) createReminder(ctx context.Context, title string, spec *ReminderSpec) (string, error) {
 	if spec == nil {
 		return "No pude entender cuándo quieres el recordatorio.", nil
@@ -199,22 +212,13 @@ func (s *Service) createReminder(ctx context.Context, title string, spec *Remind
 		return fmt.Sprintf("No pude resolver el horario: %v", err), err
 	}
 
-	task, err := s.tasks.Create(ctx, appservice.CreateTaskParams{
-		Title:  title,
-		Source: "telegram:natural",
-	})
+	task, err := s.reminders.CreateOneShot(ctx, title, sourceNatural, at)
 	if err != nil {
+		if task.ID != "" {
+			// Task persisted, trigger failed: partial outcome, no rollback.
+			return "Tarea creada pero no pude programar el recordatorio: " + err.Error(), err
+		}
 		return "No pude crear la tarea: " + err.Error(), err
-	}
-
-	_, err = s.triggers.Create(ctx, appservice.CreateTriggerParams{
-		TaskID:  task.ID,
-		Type:    domain.TriggerTypeAt,
-		Value:   at.UTC().Format(time.RFC3339),
-		Enabled: true,
-	})
-	if err != nil {
-		return "Tarea creada pero no pude programar el recordatorio: " + err.Error(), err
 	}
 
 	return fmt.Sprintf("Recordatorio creado ✓ \"%s\" para %s",
@@ -223,9 +227,10 @@ func (s *Service) createReminder(ctx context.Context, title string, spec *Remind
 
 // createRecurringReminder creates a task + a TriggerTypeRecurring trigger whose
 // Value is the canonical RecurrenceSpec JSON. Go derives and validates the whole
-// spec; if the recurrence cannot be represented, nothing is persisted and the
-// reply asks for clarification (same visible behavior as an AmbiguousIntent, so
-// Pi never decides execution).
+// spec (service.BuildRecurrenceJSON + TriggerService.Create); if the recurrence
+// cannot be represented, nothing is persisted and the reply asks for
+// clarification (same visible behavior as an AmbiguousIntent, so Pi never
+// decides execution).
 func (s *Service) createRecurringReminder(ctx context.Context, title string, rec *RecurrenceParams) (string, error) {
 	value, err := BuildRecurrenceJSON(*rec, InterpretContext{
 		Now:      s.now(),
@@ -235,22 +240,13 @@ func (s *Service) createRecurringReminder(ctx context.Context, title string, rec
 		return fmt.Sprintf("No pude entender la recurrencia: %v. ¿Me la describes de nuevo?", err), nil
 	}
 
-	task, err := s.tasks.Create(ctx, appservice.CreateTaskParams{
-		Title:  title,
-		Source: "telegram:natural",
-	})
+	task, err := s.reminders.CreateRecurring(ctx, title, sourceNatural, value)
 	if err != nil {
+		if task.ID != "" {
+			// Task persisted, trigger failed: partial outcome, no rollback.
+			return "Tarea creada pero no pude programar el recordatorio recurrente: " + err.Error(), err
+		}
 		return "No pude crear la tarea: " + err.Error(), err
-	}
-
-	_, err = s.triggers.Create(ctx, appservice.CreateTriggerParams{
-		TaskID:  task.ID,
-		Type:    domain.TriggerTypeRecurring,
-		Value:   value,
-		Enabled: true,
-	})
-	if err != nil {
-		return "Tarea creada pero no pude programar el recordatorio recurrente: " + err.Error(), err
 	}
 
 	return fmt.Sprintf("Recordatorio creado: %s — %s.",
@@ -353,7 +349,7 @@ func describeCadence(rec RecurrenceParams) string {
 		interval = *rec.Interval
 	}
 
-	hh, mm, err := parseHHMM(rec.Time)
+	hh, mm, err := appservice.ParseHHMM(rec.Time)
 	if err != nil {
 		// Unreachable in practice: BuildRecurrenceJSON validated the time first.
 		hh, mm = 0, 0

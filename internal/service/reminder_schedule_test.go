@@ -1,4 +1,9 @@
-package naturalintent
+// This file is the comprehensive test suite of the pure reminder resolution
+// and recurrence building logic (ResolveTime, BuildRecurrenceJSON, ParseHHMM).
+// The naturalintent package keeps a slimmer adapter-level suite over these
+// functions; this suite is the direct, type-level coverage that future
+// capability callers (which import this package, not naturalintent) rely on.
+package service
 
 import (
 	"strings"
@@ -10,42 +15,42 @@ import (
 
 func TestResolveRelative(t *testing.T) {
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
 	tests := []struct {
 		name    string
-		spec    ReminderSpec
+		spec    OneShotSpec
 		want    time.Time
 		wantErr bool
 	}{
 		{
 			name: "30 minutes",
-			spec: ReminderSpec{Relative: "30m"},
+			spec: OneShotSpec{Relative: "30m"},
 			want: now.Add(30 * time.Minute),
 		},
 		{
 			name: "1 hour",
-			spec: ReminderSpec{Relative: "1h"},
+			spec: OneShotSpec{Relative: "1h"},
 			want: now.Add(1 * time.Hour),
 		},
 		{
 			name: "2 hours 30 minutes",
-			spec: ReminderSpec{Relative: "2h30m"},
+			spec: OneShotSpec{Relative: "2h30m"},
 			want: now.Add(2*time.Hour + 30*time.Minute),
 		},
 		{
 			name:    "invalid duration",
-			spec:    ReminderSpec{Relative: "not_a_duration"},
+			spec:    OneShotSpec{Relative: "not_a_duration"},
 			wantErr: true,
 		},
 		{
 			name:    "negative duration",
-			spec:    ReminderSpec{Relative: "-30m"},
+			spec:    OneShotSpec{Relative: "-30m"},
 			wantErr: true,
 		},
 		{
 			name:    "zero duration",
-			spec:    ReminderSpec{Relative: "0s"},
+			spec:    OneShotSpec{Relative: "0s"},
 			wantErr: true,
 		},
 	}
@@ -67,9 +72,9 @@ func TestResolveRelative(t *testing.T) {
 func TestResolveAbsoluteToday(t *testing.T) {
 	// 14:00 UTC, requesting 20:00 → same day
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
+	spec := OneShotSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -84,9 +89,9 @@ func TestResolveAbsoluteToday(t *testing.T) {
 func TestResolveAbsoluteTodayPastShiftsToTomorrow(t *testing.T) {
 	// 21:00 UTC, requesting 20:00 → already passed → tomorrow
 	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
+	spec := OneShotSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -100,9 +105,9 @@ func TestResolveAbsoluteTodayPastShiftsToTomorrow(t *testing.T) {
 
 func TestResolveAbsoluteTomorrow(t *testing.T) {
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{AbsoluteTime: "09:00", AbsoluteDate: "tomorrow"}
+	spec := OneShotSpec{AbsoluteTime: "09:00", AbsoluteDate: "tomorrow"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -116,9 +121,9 @@ func TestResolveAbsoluteTomorrow(t *testing.T) {
 
 func TestResolveAbsoluteSpecificDate(t *testing.T) {
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{AbsoluteTime: "15:30", AbsoluteDate: "2026-09-15"}
+	spec := OneShotSpec{AbsoluteTime: "15:30", AbsoluteDate: "2026-09-15"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -133,9 +138,9 @@ func TestResolveAbsoluteSpecificDate(t *testing.T) {
 func TestResolveAbsoluteNoDateDefaultsToToday(t *testing.T) {
 	// No date specified → defaults to today (with tomorrow fallback if past)
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{AbsoluteTime: "18:00"}
+	spec := OneShotSpec{AbsoluteTime: "18:00"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -153,9 +158,9 @@ func TestResolveAbsoluteWithTimezone(t *testing.T) {
 	// Requesting 20:00 ART today
 	buenosAires, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: buenosAires}
+	ctx := TimeContext{Now: now, Timezone: buenosAires}
 
-	spec := ReminderSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
+	spec := OneShotSpec{AbsoluteTime: "20:00", AbsoluteDate: "today"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -174,9 +179,9 @@ func TestResolveAbsoluteWithTimezoneShiftsToTomorrow(t *testing.T) {
 	// Requesting 09:00 ART today → already passed (11:00 > 09:00) → tomorrow
 	buenosAires, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
 	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: buenosAires}
+	ctx := TimeContext{Now: now, Timezone: buenosAires}
 
-	spec := ReminderSpec{AbsoluteTime: "09:00", AbsoluteDate: "today"}
+	spec := OneShotSpec{AbsoluteTime: "09:00", AbsoluteDate: "today"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -189,9 +194,43 @@ func TestResolveAbsoluteWithTimezoneShiftsToTomorrow(t *testing.T) {
 	}
 }
 
+func TestParseHHMMFormats(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantH   int
+		wantM   int
+		wantErr bool
+	}{
+		{"20:00", 20, 0, false},
+		{"09:30", 9, 30, false},
+		{"20h00", 20, 0, false},
+		{"20h", 20, 0, false},
+		{"20.00", 20, 0, false},
+		{"20,30", 20, 30, false},
+		{" 20:00 ", 20, 0, false},
+		{"25:00", 0, 0, true}, // invalid hour
+		{"20:60", 0, 0, true}, // invalid minute
+		{"abc", 0, 0, true},   // not a time
+		{"20", 0, 0, true},    // missing minutes
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			h, m, err := ParseHHMM(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseHHMM(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && (h != tt.wantH || m != tt.wantM) {
+				t.Errorf("ParseHHMM(%q) = (%d, %d), want (%d, %d)", tt.input, h, m, tt.wantH, tt.wantM)
+			}
+		})
+	}
+}
+
 func TestResolveTimeNoSpec(t *testing.T) {
-	ctx := InterpretContext{Now: time.Now(), Timezone: time.UTC}
-	spec := ReminderSpec{} // empty
+	ctx := TimeContext{Now: time.Now(), Timezone: time.UTC}
+	spec := OneShotSpec{} // empty
 	_, err := ResolveTime(spec, ctx)
 	if err == nil {
 		t.Error("ResolveTime() should error on empty spec")
@@ -201,9 +240,9 @@ func TestResolveTimeNoSpec(t *testing.T) {
 func TestResolveRelativeExactMinute(t *testing.T) {
 	// Verify exact minute arithmetic (no seconds drift)
 	now := time.Date(2026, 9, 10, 14, 30, 45, 123456789, time.UTC)
-	ctx := InterpretContext{Now: now, Timezone: time.UTC}
+	ctx := TimeContext{Now: now, Timezone: time.UTC}
 
-	spec := ReminderSpec{Relative: "15m"}
+	spec := OneShotSpec{Relative: "15m"}
 	got, err := ResolveTime(spec, ctx)
 	if err != nil {
 		t.Fatalf("ResolveTime() error = %v", err)
@@ -224,7 +263,7 @@ func recurParams(freq domain.RecurrenceFreq, timeStr string) RecurrenceParams {
 }
 
 func TestBuildRecurrenceJSONDaily(t *testing.T) {
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 
 	got, err := BuildRecurrenceJSON(recurParams(domain.RecurrenceFreqDaily, "21:00"), ctx)
 	if err != nil {
@@ -242,7 +281,7 @@ func TestBuildRecurrenceJSONDaily(t *testing.T) {
 
 func TestBuildRecurrenceJSONWeeklyTodayInMask(t *testing.T) {
 	// 2026-09-10 is a Thursday (4). Weekdays [4] -> today is compatible.
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqWeekly, "09:00")
 	p.Weekdays = []int{4}
 
@@ -258,7 +297,7 @@ func TestBuildRecurrenceJSONWeeklyTodayInMask(t *testing.T) {
 
 func TestBuildRecurrenceJSONWeeklyNextCompatibleDay(t *testing.T) {
 	// 2026-09-10 is a Thursday; weekdays [6] (Saturday) -> next Saturday is the 12th.
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqWeekly, "09:00")
 	p.Weekdays = []int{6}
 
@@ -275,7 +314,7 @@ func TestBuildRecurrenceJSONWeeklyNextCompatibleDay(t *testing.T) {
 func TestBuildRecurrenceJSONWeeklyMultiDayMask(t *testing.T) {
 	// Monday (1) + Wednesday (3) = mask bits 1|4 = 5. Thursday 2026-09-10 is
 	// not in the mask, so the next compatible day is the following Monday (14th).
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqWeekly, "09:30")
 	p.Weekdays = []int{1, 3}
 
@@ -292,7 +331,7 @@ func TestBuildRecurrenceJSONWeeklyMultiDayMask(t *testing.T) {
 func TestBuildRecurrenceJSONMonthlyClamp(t *testing.T) {
 	// Day 31 in February 2026 (not a leap year) clamps to the 28th: the anchor
 	// month is the current month, so the anchor day follows the domain clamp.
-	ctx := InterpretContext{Now: time.Date(2026, 2, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 2, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqMonthly, "08:00")
 	day := 31
 	p.DayOfMonth = &day
@@ -309,7 +348,7 @@ func TestBuildRecurrenceJSONMonthlyClamp(t *testing.T) {
 
 func TestBuildRecurrenceJSONMonthlyLeapClamp(t *testing.T) {
 	// February 2024 is a leap year: day 31 clamps to the 29th.
-	ctx := InterpretContext{Now: time.Date(2024, 2, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2024, 2, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqMonthly, "08:00")
 	day := 31
 	p.DayOfMonth = &day
@@ -326,7 +365,7 @@ func TestBuildRecurrenceJSONMonthlyLeapClamp(t *testing.T) {
 
 func TestBuildRecurrenceJSONYearlyCurrentYear(t *testing.T) {
 	// "cada año el 10 de septiembre": Go completes the year from Now (2026).
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "09:00")
 	m, d := 9, 10
 	p.AnchorMonth, p.AnchorDay = &m, &d
@@ -343,7 +382,7 @@ func TestBuildRecurrenceJSONYearlyCurrentYear(t *testing.T) {
 
 func TestBuildRecurrenceJSONYearlyLeapDay(t *testing.T) {
 	// Feb 29 in a non-leap year: Go walks forward to the next leap year (2028).
-	ctx := InterpretContext{Now: time.Date(2025, 7, 1, 12, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2025, 7, 1, 12, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "09:00")
 	m, d := 2, 29
 	p.AnchorMonth, p.AnchorDay = &m, &d
@@ -360,7 +399,7 @@ func TestBuildRecurrenceJSONYearlyLeapDay(t *testing.T) {
 
 func TestBuildRecurrenceJSONYearlyLeapDayCurrentLeapYear(t *testing.T) {
 	// 2024 is a leap year: the anchor stays in the current year.
-	ctx := InterpretContext{Now: time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "09:00")
 	m, d := 2, 29
 	p.AnchorMonth, p.AnchorDay = &m, &d
@@ -377,7 +416,7 @@ func TestBuildRecurrenceJSONYearlyLeapDayCurrentLeapYear(t *testing.T) {
 
 func TestBuildRecurrenceJSONIntervalAndExplicitYear(t *testing.T) {
 	// interval 2 + explicit anchor year 2027 ("a partir de 2027").
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "10:30")
 	iv, y, m, d := 2, 2027, 3, 15
 	p.Interval, p.AnchorYear, p.AnchorMonth, p.AnchorDay = &iv, &y, &m, &d
@@ -394,9 +433,9 @@ func TestBuildRecurrenceJSONIntervalAndExplicitYear(t *testing.T) {
 
 func TestBuildRecurrenceJSONYearlyExplicitAnchorYearRespected(t *testing.T) {
 	// «cada 2 años a partir de 2028 el 10 de septiembre»: the explicit anchor
-	// year wins over InterpretContext.Now (2026), even when the current year is
+	// year wins over TimeContext.Now (2026), even when the current year is
 	// different.
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "09:00")
 	iv, y, m, d := 2, 2028, 9, 10
 	p.Interval, p.AnchorYear, p.AnchorMonth, p.AnchorDay = &iv, &y, &m, &d
@@ -415,7 +454,7 @@ func TestBuildRecurrenceJSONYearlyLeapDayExplicitNonLeapYear(t *testing.T) {
 	// «cada año el 29 de febrero a partir de 2025»: 2025 is not a leap year, so
 	// the anchor walks to the next valid leap year (2028), exactly like the
 	// derived-year case — the explicit year does not change the Feb-29 rule.
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	p := recurParams(domain.RecurrenceFreqYearly, "09:00")
 	y, m, d := 2025, 2, 29
 	p.AnchorYear, p.AnchorMonth, p.AnchorDay = &y, &m, &d
@@ -431,12 +470,12 @@ func TestBuildRecurrenceJSONYearlyLeapDayExplicitNonLeapYear(t *testing.T) {
 }
 
 func TestBuildRecurrenceJSONUserTimezone(t *testing.T) {
-	// The timezone always comes from Go (InterpretContext), never from Pi.
+	// The timezone always comes from the application (TimeContext), never from the LLM.
 	ba, err := time.LoadLocation("America/Argentina/Buenos_Aires")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: ba}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: ba}
 
 	got, err := BuildRecurrenceJSON(recurParams(domain.RecurrenceFreqDaily, "21:00"), ctx)
 	if err != nil {
@@ -448,8 +487,8 @@ func TestBuildRecurrenceJSONUserTimezone(t *testing.T) {
 }
 
 func TestBuildRecurrenceJSONTimeNormalized(t *testing.T) {
-	// "20h" is accepted by parseHHMM and normalized to the canonical "20:00".
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	// "20h" is accepted by ParseHHMM and normalized to the canonical "20:00".
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	got, err := BuildRecurrenceJSON(recurParams(domain.RecurrenceFreqDaily, "20h"), ctx)
 	if err != nil {
 		t.Fatalf("BuildRecurrenceJSON() error = %v", err)
@@ -460,7 +499,7 @@ func TestBuildRecurrenceJSONTimeNormalized(t *testing.T) {
 }
 
 func TestBuildRecurrenceJSONErrors(t *testing.T) {
-	ctx := InterpretContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
+	ctx := TimeContext{Now: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC), Timezone: time.UTC}
 	cases := []struct {
 		name string
 		p    RecurrenceParams

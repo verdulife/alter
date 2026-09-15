@@ -17,8 +17,8 @@ import (
 // the only place that turns /nueva, /recordar, /listar, /completar and /cancelar
 // messages into service calls.
 type commandService struct {
-	tasks    *service.TaskService
-	triggers *service.TriggerService
+	tasks     *service.TaskService
+	reminders *service.ReminderService
 }
 
 var _ telegram.CommandService = commandService{}
@@ -30,21 +30,17 @@ func (c commandService) CreateTask(ctx context.Context, title string) (domain.Ta
 
 // CreateReminder implements the /recordar semantics documented on
 // telegram.CommandService: it creates a Task plus its one-shot "at" Trigger
-// scheduled `in` from now. Composition happens here (no service change), and
-// both services persist before returning: the Scheduler receives the Wake hint
-// from TriggerService.Create only after the write is committed.
+// scheduled `in` from now. The composition is delegated to ReminderService (the
+// single owner of the Task + Trigger composition); here only the duration is
+// turned into an absolute fire time. Errors propagate unchanged, so a trigger
+// failure leaves the already-persisted task (no rollback) and the Scheduler
+// receives its rescan hint from TriggerService.Create after the commit, exactly
+// as before.
 func (c commandService) CreateReminder(ctx context.Context, title string, in time.Duration) (domain.Task, error) {
-	task, err := c.tasks.Create(ctx, service.CreateTaskParams{Title: title})
+	task, err := c.reminders.CreateOneShot(ctx, title, "", time.Now().Add(in))
 	if err != nil {
-		return domain.Task{}, err
-	}
-	_, err = c.triggers.Create(ctx, service.CreateTriggerParams{
-		TaskID:  task.ID,
-		Type:    domain.TriggerTypeAt,
-		Value:   time.Now().Add(in).UTC().Format(time.RFC3339),
-		Enabled: true,
-	})
-	if err != nil {
+		// Preserve the historical response shape: the caller sees no partial
+		// task on error, only the propagated error text.
 		return domain.Task{}, err
 	}
 	return task, nil
