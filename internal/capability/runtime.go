@@ -52,4 +52,19 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService) {
 		},
 		NewCompleteTaskHandler(taskSvc),
 	)
+
+	reg.Register(
+		Capability{
+			Name:        "cancel_task",
+			Description: "Cancel an existing task by textual reference",
+			Parameters: []byte(`{
+				"type": "object",
+				"properties": {
+					"task_ref": {"type": "string"}
+				},
+				"required": ["task_ref"]
+			}`),
+		},
+		NewCancelTaskHandler(taskSvc),
+	)
 }

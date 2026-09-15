@@ -50,8 +50,8 @@ func TestPlannerContextDerivesFromSameRegistry(t *testing.T) {
 	planner := NewPlannerContextBuilder(catalog)
 	ctxDoc := planner.Build()
 
-	if len(ctxDoc.Capabilities) != 3 {
-		t.Fatalf("planner context capabilities = %d, want 3", len(ctxDoc.Capabilities))
+	if len(ctxDoc.Capabilities) != 4 {
+		t.Fatalf("planner context capabilities = %d, want 4", len(ctxDoc.Capabilities))
 	}
 	// Same source: the entry parameters and description must match the
 	// registry definition, for every shipped capability.
@@ -110,5 +110,65 @@ func TestListTasksHandlerSharesProvidedTaskService(t *testing.T) {
 	}
 	if result.Tasks[0].ID != created.ID {
 		t.Errorf("task ID = %q, want %q", result.Tasks[0].ID, created.ID)
+	}
+}
+
+// TestRegisterShippedCapabilitiesWiresCancelTask verifies that the shipped
+// registration function wires cancel_task into the registry: it appears in the
+// catalog, carries a Description and a parseable Parameters schema, and the
+// handler is non-nil.
+func TestRegisterShippedCapabilitiesWiresCancelTask(t *testing.T) {
+	ts, _ := buildTaskService()
+	reg := NewRegistry()
+
+	RegisterShippedCapabilities(reg, ts)
+
+	if !reg.Has("cancel_task") {
+		t.Fatal("registry must contain cancel_task after RegisterShippedCapabilities")
+	}
+	capDef, handler, err := reg.Get("cancel_task")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("cancel_task handler must be wired")
+	}
+	if capDef.Description == "" {
+		t.Error("cancel_task must carry a Description for the planner context")
+	}
+	if err := validateArgs(capDef.Parameters, []byte(`{"task_ref":"x"}`)); err != nil {
+		t.Errorf("Parameters must be parseable, got: %v", err)
+	}
+}
+
+// TestCancelTaskHandlerSharesProvidedTaskService proves that the handler
+// registered via RegisterShippedCapabilities operates on exactly the
+// TaskService instance supplied by the caller. A task created through the
+// service must be cancellable through the dispatch result; no second service is
+// involved.
+func TestCancelTaskHandlerSharesProvidedTaskService(t *testing.T) {
+	ts, _ := buildTaskService()
+	created, err := ts.Create(context.Background(), service.CreateTaskParams{Title: "comprar leche"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	reg := NewRegistry()
+	RegisterShippedCapabilities(reg, ts)
+
+	d := NewDispatcher(reg)
+	raw, err := d.Dispatch(context.Background(), "cancel_task", []byte(`{"task_ref":"leche"}`))
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	result, ok := raw.Data.(CancelTaskResult)
+	if !ok {
+		t.Fatalf("unexpected result type %T", raw.Data)
+	}
+	if result.Task.ID != created.ID {
+		t.Errorf("task ID = %q, want %q", result.Task.ID, created.ID)
+	}
+	if result.Task.Status != "cancelled" {
+		t.Errorf("task status = %q, want %q", result.Task.Status, "cancelled")
 	}
 }
