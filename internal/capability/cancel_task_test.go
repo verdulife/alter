@@ -363,7 +363,7 @@ func TestCancelTaskAmbiguousJSONShape(t *testing.T) {
 func TestRegisterShippedCapabilitiesRegistersCancelTask(t *testing.T) {
 	ts, _ := buildTaskService()
 	reg := NewRegistry()
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	if !reg.Has("cancel_task") {
 		t.Error("cancel_task must be registered after RegisterShippedCapabilities")

@@ -95,6 +95,16 @@ func main() {
 	}
 	taskSvc := service.NewTaskService(tasks, triggers, events, taskOpts...)
 
+	// TriggerService and ReminderService are shared like the TaskService: they
+	// back every reminder route (natural language one-shot/recurring and
+	// /recordar) and, since the reminder refactor, the capability registry seam
+	// for the future create_reminder. They are built here, before the Scheduler
+	// and the registry, because the registry needs ReminderService; their
+	// optional rescan hints are wired below once the Scheduler exists (the same
+	// option-function pattern the TaskService hint uses).
+	triggerSvc := service.NewTriggerService(triggers, tasks)
+	reminderSvc := service.NewReminderService(taskSvc, triggerSvc)
+
 	// Pi Agent: shared between the Scheduler action (notifications) and
 	// natural language interpretation. Declared here so both can reuse it.
 	//
@@ -108,7 +118,7 @@ func main() {
 	var piAgent *agent.PiAgent
 	if cfg.PiEnabled {
 		registry = capability.NewRegistry()
-		capability.RegisterShippedCapabilities(registry, taskSvc)
+		capability.RegisterShippedCapabilities(registry, taskSvc, reminderSvc)
 		piAgent = agent.NewPiAgent(
 			agent.PiConfig{
 				Bin:          cfg.PiBin,
@@ -160,17 +170,15 @@ func main() {
 
 	sched := scheduler.NewScheduler(triggers, tasks, events, action, scheduler.WithLogger(logger))
 
-	// The Scheduler rescan hint (Wake) of the shared TaskService, built above
-	// the Scheduler because the runtime capability registry needed it first:
-	// WithTaskRescheduler is by design an option function, applied here once the
-	// Scheduler exists. The final wiring is identical to the previous order.
+	// The Scheduler rescan hints (Wake) of the shared services, built above the
+	// Scheduler because the runtime capability registry needed them first:
+	// WithTaskRescheduler / WithTriggerRescheduler are by design option
+	// functions, applied here once the Scheduler exists. The runtime wiring is
+	// identical to the previous order — only the construction point of the
+	// trigger/reminder services moved above, without their hints, so the
+	// registry can receive the shared ReminderService.
 	service.WithTaskRescheduler(sched)(taskSvc)
-	triggerSvc := service.NewTriggerService(triggers, tasks, service.WithTriggerRescheduler(sched))
-	// ReminderService owns the Task + Trigger composition shared by every
-	// reminder route (natural language one-shot/recurring and /recordar). It is
-	// prepared here so the existing routes reuse it; the create_reminder
-	// capability wiring comes later.
-	reminderSvc := service.NewReminderService(taskSvc, triggerSvc)
+	service.WithTriggerRescheduler(sched)(triggerSvc)
 
 	cmdSvc := commandService{tasks: taskSvc, reminders: reminderSvc}
 

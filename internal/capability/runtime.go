@@ -3,14 +3,19 @@ package capability
 import "github.com/verdu/alter/internal/service"
 
 // RegisterShippedCapabilities registers the V1 shipped capabilities into reg,
-// backed by the concrete dependencies ALTER already uses (the shared
-// TaskService instance). It is the single registration point the runtime calls
-// (cmd/alter/main.go): the registry stays the single source of truth for both
-// execution (Dispatcher) and the catalog the planner sees (Catalog →
-// PlannerContextBuilder), so Pi can only propose capabilities that can actually
-// execute. Registration follows Registry.Register semantics (panic on empty
-// name, duplicate name or nil handler).
-func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService) {
+// backed by the concrete dependencies ALTER already uses (the shared TaskService
+// and ReminderService instances). It is the single registration point the
+// runtime calls (cmd/alter/main.go): the registry stays the single source of
+// truth for both execution (Dispatcher) and the catalog the planner sees
+// (Catalog → PlannerContextBuilder), so Pi can only propose capabilities that
+// can actually execute. Registration follows Registry.Register semantics (panic
+// on empty name, duplicate name or nil handler).
+//
+// reminderSvc is the dependency seam for the future create_reminder capability:
+// passing the shared ReminderService here means a handler can be registered
+// against it without duplicating services or reaching into naturalintent. It is
+// intentionally not consumed by the shipped capabilities yet.
+func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, reminderSvc *service.ReminderService) {
 	reg.Register(
 		Capability{
 			Name:        "list_tasks",

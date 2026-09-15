@@ -363,7 +363,7 @@ func TestCompleteTaskAmbiguousJSONShape(t *testing.T) {
 func TestRegisterShippedCapabilitiesRegistersCompleteTask(t *testing.T) {
 	ts, _ := buildTaskService()
 	reg := NewRegistry()
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	if !reg.Has("complete_task") {
 		t.Error("complete_task must be registered after RegisterShippedCapabilities")

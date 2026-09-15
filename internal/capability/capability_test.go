@@ -118,6 +118,16 @@ func buildTaskService(tasks ...domain.Task) (*service.TaskService, *mockTaskRepo
 	return ts, repo
 }
 
+// buildReminderService builds a ReminderService over the same in-memory stubs
+// used by buildTaskService, sharing the given TaskService instance — mirroring
+// the production wiring (reminderSvc := service.NewReminderService(taskSvc,
+// triggerSvc)) so the reminder seam reuses the exact same TaskService rather
+// than duplicating it.
+func buildReminderService(ts *service.TaskService) *service.ReminderService {
+	triggerSvc := service.NewTriggerService(&stubTriggerRepo{}, &mockTaskRepo{})
+	return service.NewReminderService(ts, triggerSvc)
+}
+
 // registerListTasks is a shorthand used by dispatcher tests: it registers the
 // list_tasks capability with its strict empty-properties schema.
 func registerListTasks(t *testing.T, ts *service.TaskService) *Registry {

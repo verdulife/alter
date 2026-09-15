@@ -18,7 +18,7 @@ func TestRegisterShippedCapabilitiesRegistersListTasks(t *testing.T) {
 	ts, _ := buildTaskService()
 	reg := NewRegistry()
 
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	if !reg.Has("list_tasks") {
 		t.Fatal("registry must contain list_tasks after RegisterShippedCapabilities")
@@ -44,7 +44,7 @@ func TestRegisterShippedCapabilitiesRegistersListTasks(t *testing.T) {
 func TestPlannerContextDerivesFromSameRegistry(t *testing.T) {
 	ts, _ := buildTaskService()
 	reg := NewRegistry()
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	catalog := NewCatalog(reg)
 	planner := NewPlannerContextBuilder(catalog)
@@ -91,7 +91,7 @@ func TestListTasksHandlerSharesProvidedTaskService(t *testing.T) {
 	}
 
 	reg := NewRegistry()
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	d := NewDispatcher(reg)
 	raw, err := d.Dispatch(context.Background(), "list_tasks", []byte(`{}`))
@@ -121,7 +121,7 @@ func TestRegisterShippedCapabilitiesWiresCancelTask(t *testing.T) {
 	ts, _ := buildTaskService()
 	reg := NewRegistry()
 
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	if !reg.Has("cancel_task") {
 		t.Fatal("registry must contain cancel_task after RegisterShippedCapabilities")
@@ -154,7 +154,7 @@ func TestCancelTaskHandlerSharesProvidedTaskService(t *testing.T) {
 	}
 
 	reg := NewRegistry()
-	RegisterShippedCapabilities(reg, ts)
+	RegisterShippedCapabilities(reg, ts, buildReminderService(ts))
 
 	d := NewDispatcher(reg)
 	raw, err := d.Dispatch(context.Background(), "cancel_task", []byte(`{"task_ref":"leche"}`))
