@@ -94,9 +94,9 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, re
 				"required": ["title"]
 			}`),
 		},
-		// One-shot relative and absolute cases are implemented; recurrence is
-		// declared by the schema but rejected by the handler with ErrInvalidArgs
-		// until its case is implemented.
+		// All three scheduling cases (relative, absolute, recurring) are
+		// implemented; the handler delegates time and calendar derivation to
+		// the shared reminder service logic.
 		NewCreateReminderHandler(reminderSvc, handlerOpts...),
 	)
 }

@@ -13,9 +13,9 @@ import (
 // createReminderArgs is the JSON-validated input for the create_reminder
 // capability. It mirrors the NL V2 contract (ReminderSpec): title is required
 // and the three scheduling cases (relative, absolute, recurring) are mutually
-// exclusive. The one-shot relative and absolute cases are implemented in this
-// step; recurrence is declared by the contract and rejected by the handler
-// until implemented.
+// exclusive. The `recurrence` object carries the cadence extracted by Pi and is
+// strictly decoded into service.RecurrenceParams; Go derives and validates the
+// whole RecurrenceSpec.
 type createReminderArgs struct {
 	Title        string                     `json:"title"`
 	Relative     string                     `json:"relative"`
@@ -35,12 +35,13 @@ type CreateReminderResult struct {
 // through the create_reminder capability (mirrors "capability:create_task").
 const sourceCapabilityReminder = "capability:create_reminder"
 
-// CreateReminderHandler executes the one-shot cases of the create_reminder
-// capability: it resolves the fire time with the shared service.ResolveTime
-// logic (Go owns the resolution for both the relative duration and the
-// absolute wall-clock time; Pi never computes a time.Time) and delegates the
-// Task + Trigger composition to ReminderService.CreateOneShot. It reuses the
-// existing reminder logic with zero duplication.
+// CreateReminderHandler executes the three scheduling cases of the
+// create_reminder capability. One-shot reminders (relative and absolute)
+// resolve their fire time with the shared service.ResolveTime logic; recurring
+// reminders are built with service.BuildRecurrenceJSON. Go owns all time and
+// calendar derivation (Pi never computes a time.Time), and the Task + Trigger
+// composition is delegated to ReminderService.CreateOneShot / CreateRecurring,
+// reusing the existing reminder logic with zero duplication.
 //
 // The clock (WithNow) and the user's timezone (WithTimezone) are injected so
 // resolution is deterministic and independent of NaturalIntent: the default
@@ -54,8 +55,9 @@ type CreateReminderHandler struct {
 // Option configures a CreateReminderHandler.
 type Option func(*CreateReminderHandler)
 
-// WithNow overrides the clock used to resolve relative durations (defaults to
-// time.Now). Tests inject a fixed clock for deterministic resolution.
+// WithNow overrides the clock used to resolve relative durations and to derive
+// recurrence anchors (defaults to time.Now). Tests inject a fixed clock for
+// deterministic resolution.
 func WithNow(f func() time.Time) Option {
 	return func(h *CreateReminderHandler) { h.now = f }
 }
@@ -85,17 +87,20 @@ func NewCreateReminderHandler(rs *service.ReminderService, opts ...Option) *Crea
 	return h
 }
 
-// Execute creates a one-shot reminder whose fire time is either `relative`
-// from the injected clock or an absolute local wall-clock time (`absolute_time`
-// plus the optional `absolute_date`). Args have already been validated against
-// the capability schema by the dispatcher before this method is called.
+// Execute creates a reminder whose scheduling case is either `relative` from
+// the injected clock, an absolute local wall-clock time (`absolute_time` plus
+// the optional `absolute_date`), or a `recurrence` cadence. Args have already
+// been validated against the capability schema by the dispatcher before this
+// method is called.
 //
 // Semantic validation stays in Go (the resolution logic is not duplicated here):
 //   - the three scheduling cases are mutually exclusive per the contract:
 //     recurrence combined with relative/absolute, or relative combined with
 //     absolute_time/absolute_date → ErrInvalidArgs;
-//   - the recurring case is declared by the contract but not implemented in
-//     this step → ErrInvalidArgs;
+//   - the recurring case is strictly decoded into service.RecurrenceParams
+//     (unknown fields and type mismatches → ErrInvalidArgs) and the canonical
+//     RecurrenceSpec is built exclusively by service.BuildRecurrenceJSON
+//     (invalid cadences → ErrInvalidArgs);
 //   - relative with an invalid or non-positive duration → ErrInvalidArgs
 //     (service.ResolveTime is the single authority for duration parsing);
 //   - absolute_date without absolute_time → ErrInvalidArgs;
@@ -118,8 +123,30 @@ func (h *CreateReminderHandler) Execute(ctx context.Context, args json.RawMessag
 			return CapabilityResult{}, fmt.Errorf(
 				"%w: recurrence is mutually exclusive with relative, absolute_time and absolute_date", ErrInvalidArgs)
 		}
-		return CapabilityResult{}, fmt.Errorf(
-			"%w: the recurring case is declared by the contract but not implemented yet", ErrInvalidArgs)
+
+		params, err := decodeRecurrenceParams(in.Recurrence)
+		if err != nil {
+			return CapabilityResult{}, fmt.Errorf("%w: %v", ErrInvalidArgs, err)
+		}
+
+		// Go owns the whole canonical RecurrenceSpec: timezone from the
+		// injected TimeContext, interval default, anchor derivation and final
+		// validation via domain.ParseRecurrence (service.BuildRecurrenceJSON
+		// is the single authority).
+		recurrenceJSON, err := service.BuildRecurrenceJSON(params, service.TimeContext{
+			Now:      h.now(),
+			Timezone: h.timezone,
+		})
+		if err != nil {
+			return CapabilityResult{}, fmt.Errorf("%w: %v", ErrInvalidArgs, err)
+		}
+
+		task, err := h.reminders.CreateRecurring(ctx, in.Title, sourceCapabilityReminder, recurrenceJSON)
+		if err != nil {
+			return CapabilityResult{}, err
+		}
+
+		return CapabilityResult{Data: CreateReminderResult{Task: toTaskView(task)}}, nil
 	}
 
 	if rel != "" && (timeStr != "" || dateStr != "") {
@@ -156,4 +183,23 @@ func (h *CreateReminderHandler) Execute(ctx context.Context, args json.RawMessag
 	}
 
 	return CapabilityResult{Data: CreateReminderResult{Task: toTaskView(task)}}, nil
+}
+
+// decodeRecurrenceParams strictly decodes the `recurrence` object into the
+// shared service.RecurrenceParams wire contract (the exact type the NL layer
+// uses, so there is no duplicated contract that can drift). Rejecting unknown
+// fields and type mismatches fails closed, mirroring the strict constructor of
+// the domain (domain.ParseRecurrence).
+func decodeRecurrenceParams(raw map[string]json.RawMessage) (service.RecurrenceParams, error) {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return service.RecurrenceParams{}, err
+	}
+	var p service.RecurrenceParams
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return service.RecurrenceParams{}, err
+	}
+	return p, nil
 }

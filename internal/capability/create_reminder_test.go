@@ -287,6 +287,171 @@ func TestCreateReminderAbsoluteAcceptedTimeFormats(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Recurring success
+// ---------------------------------------------------------------------------
+
+// recurringSpecValue executes a recurring reminder against a captureTriggerRepo
+// with the standard deterministic clock (fixedNow, UTC) and returns the
+// canonical recurrence JSON persisted by the shared ReminderService, parsed
+// back through the domain constructor — so tests assert the round-tripped
+// RecurrenceSpec, never the raw string. Extra options are applied after the
+// defaults, so a test can override the clock and/or the timezone.
+func recurringSpecValue(t *testing.T, args string, opts ...Option) domain.RecurrenceSpec {
+	t.Helper()
+	ts, taskRepo := buildTaskService()
+	triggerRepo := &captureTriggerRepo{}
+	rs := buildReminderServiceSharingTasks(ts, taskRepo, triggerRepo)
+	allOpts := append([]Option{
+		WithNow(func() time.Time { return fixedNow }),
+		WithTimezone(time.UTC),
+	}, opts...)
+	h := NewCreateReminderHandler(rs, allOpts...)
+
+	if _, err := h.Execute(context.Background(), json.RawMessage(args)); err != nil {
+		t.Fatalf("Execute(%s): %v", args, err)
+	}
+	if len(triggerRepo.created) != 1 {
+		t.Fatalf("triggers created = %d, want 1", len(triggerRepo.created))
+	}
+	spec, err := domain.ParseRecurrence(triggerRepo.created[0].Value)
+	if err != nil {
+		t.Fatalf("trigger Value is not a valid canonical RecurrenceSpec: %v", err)
+	}
+	return spec
+}
+
+// TestCreateReminderRecurringDailyPersistsTaskAndTrigger verifies the full
+// delegation for the recurring daily case: the task is persisted through the
+// TaskService, the trigger as TriggerTypeRecurring through the TriggerService,
+// and the trigger Value round-trips domain.ParseRecurrence with the derived
+// defaults (interval 1, anchor = today per the fixed clock, UTC).
+func TestCreateReminderRecurringDailyPersistsTaskAndTrigger(t *testing.T) {
+	ts, taskRepo := buildTaskService()
+	triggerRepo := &captureTriggerRepo{}
+	rs := buildReminderServiceSharingTasks(ts, taskRepo, triggerRepo)
+	h := NewCreateReminderHandler(rs, WithNow(func() time.Time { return fixedNow }), WithTimezone(time.UTC))
+
+	result, err := h.Execute(context.Background(), json.RawMessage(`{"title":"regar plantas","recurrence":{"freq":"daily","time":"09:00"}}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	ctr, ok := result.Data.(CreateReminderResult)
+	if !ok {
+		t.Fatalf("Data is %T, want CreateReminderResult", result.Data)
+	}
+	task := ctr.Task
+	if task.ID == "" || task.Title != "regar plantas" || task.Status != "pending" {
+		t.Errorf("unexpected task: %+v", task)
+	}
+
+	// The task is persisted through the shared TaskService.
+	if len(taskRepo.tasks) != 1 || taskRepo.tasks[0].ID != task.ID {
+		t.Errorf("task must be persisted in the shared repository, got %d tasks", len(taskRepo.tasks))
+	}
+
+	// The trigger is persisted through the TriggerService as recurring and
+	// enabled, with the canonical RecurrenceSpec as its Value.
+	if len(triggerRepo.created) != 1 {
+		t.Fatalf("triggers created = %d, want 1", len(triggerRepo.created))
+	}
+	tr := triggerRepo.created[0]
+	if tr.TaskID != task.ID {
+		t.Errorf("trigger TaskID = %q, want %q", tr.TaskID, task.ID)
+	}
+	if tr.Type != domain.TriggerTypeRecurring {
+		t.Errorf("trigger Type = %q, want %q", tr.Type, domain.TriggerTypeRecurring)
+	}
+	if !tr.Enabled {
+		t.Error("trigger must be enabled")
+	}
+
+	// Value round-trips the domain constructor with the derived defaults:
+	// interval 1, anchor = today (fixedNow 2026-01-15), UTC timezone.
+	spec, err := domain.ParseRecurrence(tr.Value)
+	if err != nil {
+		t.Fatalf("trigger Value must be a valid canonical RecurrenceSpec: %v", err)
+	}
+	if spec.Freq != domain.RecurrenceFreqDaily || spec.Interval != 1 || spec.Time != "09:00" || spec.Timezone != "UTC" || spec.Anchor != "2026-01-15" {
+		t.Errorf("unexpected daily spec: %+v", spec)
+	}
+}
+
+// TestCreateReminderRecurringWeeklyExplicitAnchorAndInterval verifies that an
+// explicit start date (anchor_month/anchor_day, year completed by Go from the
+// fixed clock), the weekly weekdays mask and interval all pass through to the
+// canonical spec built by the shared service.
+func TestCreateReminderRecurringWeeklyExplicitAnchorAndInterval(t *testing.T) {
+	spec := recurringSpecValue(t, `{"title":"reunion","recurrence":{"freq":"weekly","time":"18:30","weekdays":[1,3],"interval":2,"anchor_month":1,"anchor_day":14}}`)
+
+	if spec.Freq != domain.RecurrenceFreqWeekly {
+		t.Errorf("Freq = %q, want weekly", spec.Freq)
+	}
+	if spec.Interval != 2 {
+		t.Errorf("Interval = %d, want 2", spec.Interval)
+	}
+	if spec.Weekdays != domain.WeekdayMonday|domain.WeekdayWednesday {
+		t.Errorf("Weekdays = %d, want %d (monday+wednesday)", spec.Weekdays, domain.WeekdayMonday|domain.WeekdayWednesday)
+	}
+	if spec.Time != "18:30" {
+		t.Errorf("Time = %q, want 18:30", spec.Time)
+	}
+	if spec.Timezone != "UTC" {
+		t.Errorf("Timezone = %q, want UTC", spec.Timezone)
+	}
+	// The year is completed by Go from the fixed clock (2026), never by Pi.
+	if spec.Anchor != "2026-01-14" {
+		t.Errorf("Anchor = %q, want 2026-01-14 (year completed by Go)", spec.Anchor)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Recurring validation (ErrInvalidArgs)
+// ---------------------------------------------------------------------------
+
+// TestCreateReminderRecurringRejectsInvalidArgs covers the strict decode and
+// semantic validation of the recurring case: unknown fields and type mismatches
+// inside `recurrence`, incomplete cadences per frequency, and the domain gate
+// (an anchor that is not an occurrence date is rejected).
+func TestCreateReminderRecurringRejectsInvalidArgs(t *testing.T) {
+	ts, _ := buildTaskService()
+	h := NewCreateReminderHandler(buildReminderService(ts), WithNow(func() time.Time { return fixedNow }), WithTimezone(time.UTC))
+
+	cases := []struct {
+		name string
+		args string
+	}{
+		{"empty_recurrence", `{"title":"x","recurrence":{}}`},
+		{"unknown_freq", `{"title":"x","recurrence":{"freq":"hourly","time":"09:00"}}`},
+		{"missing_time", `{"title":"x","recurrence":{"freq":"daily"}}`},
+		{"malformed_time", `{"title":"x","recurrence":{"freq":"daily","time":"25:00"}}`},
+		{"weekly_without_weekdays", `{"title":"x","recurrence":{"freq":"weekly","time":"09:00"}}`},
+		{"weekday_out_of_range", `{"title":"x","recurrence":{"freq":"weekly","time":"09:00","weekdays":[8]}}`},
+		{"monthly_without_day_of_month", `{"title":"x","recurrence":{"freq":"monthly","time":"09:00"}}`},
+		{"yearly_without_anchor", `{"title":"x","recurrence":{"freq":"yearly","time":"09:00"}}`},
+		{"yearly_incomplete_anchor", `{"title":"x","recurrence":{"freq":"yearly","time":"09:00","anchor_month":2}}`},
+		{"anchor_year_alone", `{"title":"x","recurrence":{"freq":"daily","time":"09:00","anchor_year":2027}}`},
+		{"zero_interval", `{"title":"x","recurrence":{"freq":"daily","time":"09:00","interval":0}}`},
+		{"non_number_interval", `{"title":"x","recurrence":{"freq":"daily","time":"09:00","interval":"2"}}`},
+		{"non_string_freq", `{"title":"x","recurrence":{"freq":5,"time":"09:00"}}`},
+		{"unknown_recurrence_field", `{"title":"x","recurrence":{"freq":"daily","time":"09:00","frecuencia":"daily"}}`},
+		{"anchor_not_occurrence_date", `{"title":"x","recurrence":{"freq":"weekly","time":"09:00","weekdays":[1],"anchor_month":1,"anchor_day":20}}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.Execute(context.Background(), json.RawMessage(tc.args))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrInvalidArgs) {
+				t.Errorf("errors.Is(err, ErrInvalidArgs) = false, err = %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // One-shot absolute validation (ErrInvalidArgs)
 // ---------------------------------------------------------------------------
 
@@ -358,14 +523,12 @@ func TestCreateReminderRelativeRejectsMissingOrInvalidRelative(t *testing.T) {
 	}
 }
 
-// TestCreateReminderRejectsInvalidCombinationsAndRecurrence verifies that the
-// cross-case combinations of the contract are rejected with ErrInvalidArgs:
-// relative combined with any absolute field, recurrence combined with any other
-// field, and recurrence on its own (the recurring case is declared by the
-// contract but not implemented in this step). The absolute-only inputs that
-// used to be rejected as unimplemented are now valid and covered by the
-// one-shot absolute tests below.
-func TestCreateReminderRejectsInvalidCombinationsAndRecurrence(t *testing.T) {
+// TestCreateReminderRejectsInvalidCombinations verifies that the cross-case
+// combinations of the contract are rejected with ErrInvalidArgs: relative
+// combined with any absolute field, and recurrence combined with any other
+// scheduling field. Recurrence on its own is now a valid case (covered by the
+// recurring success tests).
+func TestCreateReminderRejectsInvalidCombinations(t *testing.T) {
 	ts, _ := buildTaskService()
 	h := NewCreateReminderHandler(buildReminderService(ts), WithNow(func() time.Time { return fixedNow }))
 
@@ -377,7 +540,6 @@ func TestCreateReminderRejectsInvalidCombinationsAndRecurrence(t *testing.T) {
 		{"relative_plus_absolute_date", `{"title":"x","relative":"30m","absolute_date":"tomorrow"}`},
 		{"relative_plus_recurrence", `{"title":"x","relative":"30m","recurrence":{"freq":"daily","time":"09:00"}}`},
 		{"absolute_plus_recurrence", `{"title":"x","absolute_time":"20:00","recurrence":{"freq":"daily","time":"09:00"}}`},
-		{"recurrence_only", `{"title":"x","recurrence":{"freq":"weekly","time":"09:00","weekdays":[1]}}`},
 	}
 
 	for _, tc := range cases {
@@ -469,6 +631,46 @@ func TestCreateReminderTriggerFailurePropagates(t *testing.T) {
 	h := NewCreateReminderHandler(rs, WithNow(func() time.Time { return fixedNow }))
 
 	_, err := h.Execute(context.Background(), json.RawMessage(`{"title":"x","relative":"30m"}`))
+	if err == nil {
+		t.Fatal("expected error from failing trigger repository")
+	}
+	if !errors.Is(err, errInner) {
+		t.Errorf("errors.Is(err, errInner) = false: the inner error chain is lost, err = %v", err)
+	}
+	if len(taskRepo.tasks) != 1 {
+		t.Errorf("task must remain persisted on trigger failure (partial outcome), got %d tasks", len(taskRepo.tasks))
+	}
+}
+
+// TestCreateReminderRecurringTaskFailurePropagates proves that a TaskService
+// failure surfaces through the recurring branch (wrapped by the dispatcher as
+// ErrExecutionFailed) instead of being swallowed: nothing is persisted.
+func TestCreateReminderRecurringTaskFailurePropagates(t *testing.T) {
+	repo := &failingCreateRepo{mockTaskRepo: &mockTaskRepo{}, err: errInner}
+	ts := service.NewTaskService(repo, &stubTriggerRepo{}, &stubEventStore{})
+	h := NewCreateReminderHandler(buildReminderService(ts), WithNow(func() time.Time { return fixedNow }))
+
+	_, err := h.Execute(context.Background(), json.RawMessage(`{"title":"x","recurrence":{"freq":"daily","time":"09:00"}}`))
+	if err == nil {
+		t.Fatal("expected error from failing task repository")
+	}
+	if !errors.Is(err, errInner) {
+		t.Errorf("errors.Is(err, errInner) = false: the inner error chain is lost, err = %v", err)
+	}
+}
+
+// TestCreateReminderRecurringTriggerFailurePropagates pins the documented
+// partial-outcome semantics of ReminderService.CreateRecurring through the
+// capability: when the trigger creation fails the error propagates (the
+// reminder is not reported as created) even though the task was already
+// persisted.
+func TestCreateReminderRecurringTriggerFailurePropagates(t *testing.T) {
+	ts, taskRepo := buildTaskService()
+	triggerRepo := &failingTriggerRepo{err: errInner}
+	rs := buildReminderServiceSharingTasks(ts, taskRepo, triggerRepo)
+	h := NewCreateReminderHandler(rs, WithNow(func() time.Time { return fixedNow }))
+
+	_, err := h.Execute(context.Background(), json.RawMessage(`{"title":"x","recurrence":{"freq":"daily","time":"09:00"}}`))
 	if err == nil {
 		t.Fatal("expected error from failing trigger repository")
 	}
@@ -584,6 +786,25 @@ func TestRegisterShippedCapabilitiesRegistersCreateReminder(t *testing.T) {
 	raw, err = d.Dispatch(context.Background(), "create_reminder", json.RawMessage(`{"title":"x","absolute_time":"10:30","absolute_date":"tomorrow"}`))
 	if err != nil {
 		t.Fatalf("Dispatch absolute reminder through the shipped registry must succeed: %v", err)
+	}
+	if _, ok := raw.Data.(CreateReminderResult); !ok {
+		t.Fatalf("unexpected result type %T", raw.Data)
+	}
+}
+
+// TestRegisterShippedCapabilitiesDispatchRecurring proves the shipped handler
+// accepts a recurring cadence through the real registry with the default
+// clock: a daily recurrence always derives a valid canonical spec (anchor =
+// today), so the dispatch is deterministic on any day.
+func TestRegisterShippedCapabilitiesDispatchRecurring(t *testing.T) {
+	ts, taskRepo := buildTaskService()
+	reg := NewRegistry()
+	RegisterShippedCapabilities(reg, ts, buildReminderServiceSharingTasks(ts, taskRepo, &stubTriggerRepo{}))
+
+	d := NewDispatcher(reg)
+	raw, err := d.Dispatch(context.Background(), "create_reminder", json.RawMessage(`{"title":"x","recurrence":{"freq":"daily","time":"09:00"}}`))
+	if err != nil {
+		t.Fatalf("Dispatch recurring reminder through the shipped registry must succeed: %v", err)
 	}
 	if _, ok := raw.Data.(CreateReminderResult); !ok {
 		t.Fatalf("unexpected result type %T", raw.Data)
