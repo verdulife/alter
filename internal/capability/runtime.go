@@ -13,10 +13,14 @@ import "github.com/verdu/alter/internal/service"
 //
 // reminderSvc is the dependency seam for the create_reminder capability: passing
 // the shared ReminderService here means a handler can be registered against it
-// without duplicating services or reaching into naturalintent. The handler owns
-// its own clock/timezone injection (NewCreateReminderHandler defaults to
-// time.Now/time.Local) so the registration point stays dependency-free.
-func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, reminderSvc *service.ReminderService) {
+// without duplicating services or reaching into naturalintent.
+//
+// handlerOpts are forwarded to the create_reminder handler constructor — the
+// existing Option pattern (e.g. WithTimezone(tz)) — so the runtime can inject
+// the real user timezone from ALTER_TIMEZONE without growing a positional
+// parameter per future scheduling case. NewCreateReminderHandler still defaults
+// to time.Now/time.Local when no options are passed.
+func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, reminderSvc *service.ReminderService, handlerOpts ...Option) {
 	reg.Register(
 		Capability{
 			Name:        "list_tasks",
@@ -90,9 +94,9 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, re
 				"required": ["title"]
 			}`),
 		},
-		// Only the one-shot relative case is implemented in this step: the handler
-		// rejects absolute_time/absolute_date/recurrence with ErrInvalidArgs until
-		// those cases are implemented (the schema keeps the full contract).
-		NewCreateReminderHandler(reminderSvc),
+		// One-shot relative and absolute cases are implemented; recurrence is
+		// declared by the schema but rejected by the handler with ErrInvalidArgs
+		// until its case is implemented.
+		NewCreateReminderHandler(reminderSvc, handlerOpts...),
 	)
 }

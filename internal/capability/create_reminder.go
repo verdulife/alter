@@ -13,9 +13,9 @@ import (
 // createReminderArgs is the JSON-validated input for the create_reminder
 // capability. It mirrors the NL V2 contract (ReminderSpec): title is required
 // and the three scheduling cases (relative, absolute, recurring) are mutually
-// exclusive. Only the one-shot relative case is implemented in this step; the
-// other fields are declared by the contract and rejected by the handler until
-// implemented.
+// exclusive. The one-shot relative and absolute cases are implemented in this
+// step; recurrence is declared by the contract and rejected by the handler
+// until implemented.
 type createReminderArgs struct {
 	Title        string                     `json:"title"`
 	Relative     string                     `json:"relative"`
@@ -35,12 +35,12 @@ type CreateReminderResult struct {
 // through the create_reminder capability (mirrors "capability:create_task").
 const sourceCapabilityReminder = "capability:create_reminder"
 
-// CreateReminderHandler executes the create_reminder capability for the
-// one-shot relative case: it resolves the relative duration with the shared
-// service.ResolveTime logic (Go owns the resolution; Pi never computes a
-// time.Time) and delegates the Task + Trigger composition to
-// ReminderService.CreateOneShot. It reuses the existing reminder logic with
-// zero duplication.
+// CreateReminderHandler executes the one-shot cases of the create_reminder
+// capability: it resolves the fire time with the shared service.ResolveTime
+// logic (Go owns the resolution for both the relative duration and the
+// absolute wall-clock time; Pi never computes a time.Time) and delegates the
+// Task + Trigger composition to ReminderService.CreateOneShot. It reuses the
+// existing reminder logic with zero duplication.
 //
 // The clock (WithNow) and the user's timezone (WithTimezone) are injected so
 // resolution is deterministic and independent of NaturalIntent: the default
@@ -85,34 +85,64 @@ func NewCreateReminderHandler(rs *service.ReminderService, opts ...Option) *Crea
 	return h
 }
 
-// Execute creates a one-shot reminder whose fire time is `relative` from the
-// injected clock. Args have already been validated against the capability
-// schema by the dispatcher before this method is called.
+// Execute creates a one-shot reminder whose fire time is either `relative`
+// from the injected clock or an absolute local wall-clock time (`absolute_time`
+// plus the optional `absolute_date`). Args have already been validated against
+// the capability schema by the dispatcher before this method is called.
 //
 // Semantic validation stays in Go (the resolution logic is not duplicated here):
-//   - relative missing or empty → ErrInvalidArgs;
+//   - the three scheduling cases are mutually exclusive per the contract:
+//     recurrence combined with relative/absolute, or relative combined with
+//     absolute_time/absolute_date → ErrInvalidArgs;
+//   - the recurring case is declared by the contract but not implemented in
+//     this step → ErrInvalidArgs;
 //   - relative with an invalid or non-positive duration → ErrInvalidArgs
 //     (service.ResolveTime is the single authority for duration parsing);
-//   - any absolute_time / absolute_date / recurrence field (implemented by
-//     later steps, and mutually exclusive with relative per the contract) →
-//     ErrInvalidArgs.
+//   - absolute_date without absolute_time → ErrInvalidArgs;
+//   - malformed absolute_time or absolute_date → ErrInvalidArgs (parsing is
+//     delegated to service.ParseHHMM / service.ResolveTime, the single
+//     authority for the supported formats and the today→tomorrow fallback);
+//   - no scheduling case at all → ErrInvalidArgs.
 func (h *CreateReminderHandler) Execute(ctx context.Context, args json.RawMessage) (CapabilityResult, error) {
 	var in createReminderArgs
 	if err := json.Unmarshal(args, &in); err != nil {
 		return CapabilityResult{}, fmt.Errorf("%w: unparseable args", ErrInvalidArgs)
 	}
 
-	if in.AbsoluteTime != "" || in.AbsoluteDate != "" || in.Recurrence != nil {
-		return CapabilityResult{}, fmt.Errorf(
-			"%w: only the one-shot relative case is implemented; absolute_time, absolute_date and recurrence are rejected", ErrInvalidArgs)
-	}
-
 	rel := strings.TrimSpace(in.Relative)
-	if rel == "" {
-		return CapabilityResult{}, fmt.Errorf("%w: relative is required", ErrInvalidArgs)
+	timeStr := strings.TrimSpace(in.AbsoluteTime)
+	dateStr := strings.TrimSpace(in.AbsoluteDate)
+
+	if in.Recurrence != nil {
+		if rel != "" || timeStr != "" || dateStr != "" {
+			return CapabilityResult{}, fmt.Errorf(
+				"%w: recurrence is mutually exclusive with relative, absolute_time and absolute_date", ErrInvalidArgs)
+		}
+		return CapabilityResult{}, fmt.Errorf(
+			"%w: the recurring case is declared by the contract but not implemented yet", ErrInvalidArgs)
 	}
 
-	at, err := service.ResolveTime(service.OneShotSpec{Relative: rel}, service.TimeContext{
+	if rel != "" && (timeStr != "" || dateStr != "") {
+		return CapabilityResult{}, fmt.Errorf(
+			"%w: relative is mutually exclusive with absolute_time and absolute_date", ErrInvalidArgs)
+	}
+
+	var spec service.OneShotSpec
+	switch {
+	case rel != "":
+		spec = service.OneShotSpec{Relative: rel}
+	case timeStr != "":
+		// AbsoluteTime without AbsoluteDate defaults to today, with the
+		// "tomorrow when already past" fallback; AbsoluteDate is "today",
+		// "tomorrow" or "YYYY-MM-DD". service.ResolveTime owns that semantics.
+		spec = service.OneShotSpec{AbsoluteTime: timeStr, AbsoluteDate: dateStr}
+	case dateStr != "":
+		return CapabilityResult{}, fmt.Errorf("%w: absolute_time is required when absolute_date is provided", ErrInvalidArgs)
+	default:
+		return CapabilityResult{}, fmt.Errorf("%w: one of relative or absolute_time is required", ErrInvalidArgs)
+	}
+
+	at, err := service.ResolveTime(spec, service.TimeContext{
 		Now:      h.now(),
 		Timezone: h.timezone,
 	})

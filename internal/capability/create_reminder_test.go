@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -152,6 +153,179 @@ func TestCreateReminderRelativePersistsTaskAndTrigger(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// One-shot absolute success
+// ---------------------------------------------------------------------------
+
+// absoluteTriggerValue executes a one-shot reminder against a
+// captureTriggerRepo with the standard deterministic clock (fixedNow, UTC) and
+// returns the canonical RFC3339 "at" value persisted by the shared
+// ReminderService. Extra options are applied after the defaults, so a test can
+// override the clock and/or the timezone (e.g. WithTimezone(loc)).
+func absoluteTriggerValue(t *testing.T, args string, opts ...Option) string {
+	t.Helper()
+	ts, taskRepo := buildTaskService()
+	triggerRepo := &captureTriggerRepo{}
+	rs := buildReminderServiceSharingTasks(ts, taskRepo, triggerRepo)
+	allOpts := append([]Option{
+		WithNow(func() time.Time { return fixedNow }),
+		WithTimezone(time.UTC),
+	}, opts...)
+	h := NewCreateReminderHandler(rs, allOpts...)
+
+	if _, err := h.Execute(context.Background(), json.RawMessage(args)); err != nil {
+		t.Fatalf("Execute(%s): %v", args, err)
+	}
+	if len(triggerRepo.created) != 1 {
+		t.Fatalf("triggers created = %d, want 1", len(triggerRepo.created))
+	}
+	return triggerRepo.created[0].Value
+}
+
+// TestCreateReminderAbsoluteNoDateDefaultsToToday verifies the no-date default:
+// an absolute_time without absolute_date resolves to today (fixedNow is 10:00;
+// the requested 10:30 has not passed).
+func TestCreateReminderAbsoluteNoDateDefaultsToToday(t *testing.T) {
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"10:30"}`), "2026-01-15T10:30:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+func TestCreateReminderAbsoluteToday(t *testing.T) {
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"10:30","absolute_date":"today"}`), "2026-01-15T10:30:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+func TestCreateReminderAbsoluteTomorrow(t *testing.T) {
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"10:30","absolute_date":"tomorrow"}`), "2026-01-16T10:30:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+func TestCreateReminderAbsoluteExplicitDate(t *testing.T) {
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"09:00","absolute_date":"2026-03-01"}`), "2026-03-01T09:00:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+// TestCreateReminderAbsolutePastTimeShiftsToTomorrow pins the existing
+// ResolveTime semantics for a time that has already passed today without a
+// date (defaults to today, then shifts to tomorrow).
+func TestCreateReminderAbsolutePastTimeShiftsToTomorrow(t *testing.T) {
+	// fixedNow is 10:00; 09:00 has already passed.
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"09:00"}`), "2026-01-16T09:00:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+// TestCreateReminderAbsoluteExplicitPastDateIsHonored pins the existing
+// ResolveTime semantics for explicit dates: a YYYY-MM-DD date is honored
+// verbatim (no today→tomorrow shift), even when it lies in the past.
+func TestCreateReminderAbsoluteExplicitPastDateIsHonored(t *testing.T) {
+	if got, want := absoluteTriggerValue(t, `{"title":"comprar SSD","absolute_time":"10:30","absolute_date":"2026-01-01"}`), "2026-01-01T10:30:00Z"; got != want {
+		t.Errorf("trigger Value = %q, want %q", got, want)
+	}
+}
+
+// TestCreateReminderAbsoluteWithInjectedTimezone proves the handler resolves in
+// the injected timezone, not in UTC: at 21:00Z (18:00 in Buenos Aires, UTC-3)
+// the requested 20:00 has already passed today in UTC (shifted to tomorrow)
+// but is still ahead locally in ART (resolved today) — the timezone drives the
+// today/tomorrow decision. The explicit-date case pins the offset end to end
+// (09:00 ART = 12:00Z).
+func TestCreateReminderAbsoluteWithInjectedTimezone(t *testing.T) {
+	ba, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Fatalf("LoadLocation: %v", err)
+	}
+
+	// Same clock, injected timezone: 20:00 ART has not passed locally.
+	if got, want := absoluteTriggerValue(t,
+		`{"title":"comprar SSD","absolute_time":"20:00"}`,
+		WithNow(func() time.Time { return time.Date(2026, 1, 15, 21, 0, 0, 0, time.UTC) }),
+		WithTimezone(ba)), "2026-01-15T23:00:00Z"; got != want {
+		t.Errorf("ART trigger Value = %q, want %q (resolved in Buenos Aires)", got, want)
+	}
+
+	// Same clock in UTC: 20:00 has passed, shifted to tomorrow.
+	if got, want := absoluteTriggerValue(t,
+		`{"title":"comprar SSD","absolute_time":"20:00"}`,
+		WithNow(func() time.Time { return time.Date(2026, 1, 15, 21, 0, 0, 0, time.UTC) })),
+		"2026-01-16T20:00:00Z"; got != want {
+		t.Errorf("UTC trigger Value = %q, want %q (shifted to tomorrow)", got, want)
+	}
+
+	// Explicit date resolved in ART carries the UTC-3 offset.
+	if got, want := absoluteTriggerValue(t,
+		`{"title":"comprar SSD","absolute_time":"09:00","absolute_date":"2026-03-01"}`,
+		WithTimezone(ba)), "2026-03-01T12:00:00Z"; got != want {
+		t.Errorf("explicit-date trigger Value = %q, want %q (resolved in Buenos Aires)", got, want)
+	}
+}
+
+// TestCreateReminderAbsoluteAcceptedTimeFormats pins the parseable time formats
+// shared with the NL contract (service.ParseHHMM): "10h" implies :00 and
+// "10.30" normalizes to 10:30, both resolving to the same-day wall clock.
+func TestCreateReminderAbsoluteAcceptedTimeFormats(t *testing.T) {
+	cases := []struct {
+		name string
+		time string
+		want string
+	}{
+		{"hour_only", "10h", "2026-01-15T10:00:00Z"},
+		{"dot_separator", "10.30", "2026-01-15T10:30:00Z"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := fmt.Sprintf(`{"title":"x","absolute_time":%q}`, tc.time)
+			if got := absoluteTriggerValue(t, args); got != tc.want {
+				t.Errorf("trigger Value = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One-shot absolute validation (ErrInvalidArgs)
+// ---------------------------------------------------------------------------
+
+// TestCreateReminderAbsoluteRejectsInvalidArgs covers the semantic validation
+// of the one-shot absolute case: absolute_date without absolute_time, malformed
+// absolute_time values, unsupported absolute_date values, and the cross-case
+// combinations with relative and recurrence.
+func TestCreateReminderAbsoluteRejectsInvalidArgs(t *testing.T) {
+	ts, _ := buildTaskService()
+	h := NewCreateReminderHandler(buildReminderService(ts), WithNow(func() time.Time { return fixedNow }), WithTimezone(time.UTC))
+
+	cases := []struct {
+		name string
+		args string
+	}{
+		{"absolute_date_without_time", `{"title":"x","absolute_date":"tomorrow"}`},
+		{"invalid_hour", `{"title":"x","absolute_time":"25:00"}`},
+		{"invalid_minute", `{"title":"x","absolute_time":"20:99"}`},
+		{"bare_number_ambiguous", `{"title":"x","absolute_time":"20"}`},
+		{"invalid_date", `{"title":"x","absolute_time":"20:00","absolute_date":"ayer"}`},
+		{"invalid_date_format", `{"title":"x","absolute_time":"20:00","absolute_date":"2026/03/01"}`},
+		{"relative_plus_absolute", `{"title":"x","relative":"30m","absolute_time":"20:00"}`},
+		{"recurrence_plus_absolute", `{"title":"x","absolute_time":"20:00","recurrence":{"freq":"daily","time":"09:00"}}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.Execute(context.Background(), json.RawMessage(tc.args))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrInvalidArgs) {
+				t.Errorf("errors.Is(err, ErrInvalidArgs) = false, err = %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Handler semantic validation (ErrInvalidArgs)
 // ---------------------------------------------------------------------------
 
@@ -184,11 +358,14 @@ func TestCreateReminderRelativeRejectsMissingOrInvalidRelative(t *testing.T) {
 	}
 }
 
-// TestCreateReminderRejectsUnimplementedCases verifies that the fields of the
-// other two contract cases (one-shot absolute and recurring) are rejected with
-// ErrInvalidArgs: standalone, and combined with relative (the contract keeps
-// the three cases mutually exclusive).
-func TestCreateReminderRejectsUnimplementedCases(t *testing.T) {
+// TestCreateReminderRejectsInvalidCombinationsAndRecurrence verifies that the
+// cross-case combinations of the contract are rejected with ErrInvalidArgs:
+// relative combined with any absolute field, recurrence combined with any other
+// field, and recurrence on its own (the recurring case is declared by the
+// contract but not implemented in this step). The absolute-only inputs that
+// used to be rejected as unimplemented are now valid and covered by the
+// one-shot absolute tests below.
+func TestCreateReminderRejectsInvalidCombinationsAndRecurrence(t *testing.T) {
 	ts, _ := buildTaskService()
 	h := NewCreateReminderHandler(buildReminderService(ts), WithNow(func() time.Time { return fixedNow }))
 
@@ -199,8 +376,7 @@ func TestCreateReminderRejectsUnimplementedCases(t *testing.T) {
 		{"relative_plus_absolute_time", `{"title":"x","relative":"30m","absolute_time":"20:00"}`},
 		{"relative_plus_absolute_date", `{"title":"x","relative":"30m","absolute_date":"tomorrow"}`},
 		{"relative_plus_recurrence", `{"title":"x","relative":"30m","recurrence":{"freq":"daily","time":"09:00"}}`},
-		{"absolute_time_only", `{"title":"x","absolute_time":"20:00"}`},
-		{"absolute_date_only", `{"title":"x","absolute_date":"tomorrow"}`},
+		{"absolute_plus_recurrence", `{"title":"x","absolute_time":"20:00","recurrence":{"freq":"daily","time":"09:00"}}`},
 		{"recurrence_only", `{"title":"x","recurrence":{"freq":"weekly","time":"09:00","weekdays":[1]}}`},
 	}
 
@@ -393,11 +569,21 @@ func TestRegisterShippedCapabilitiesRegistersCreateReminder(t *testing.T) {
 	}
 
 	// The registered handler is dispatchable with the default clock (only the
-	// success path is asserted; the resolved fire time is time-dependent).
+	// success path is asserted): the resolved fire time is time-dependent for
+	// relative, and an absolute time with an explicit date always resolves
+	// deterministically — today/tomorrow fallback applies only to no-date.
 	d := NewDispatcher(reg)
 	raw, err := d.Dispatch(context.Background(), "create_reminder", json.RawMessage(`{"title":"x","relative":"30m"}`))
 	if err != nil {
 		t.Fatalf("Dispatch relative reminder through the shipped registry must succeed: %v", err)
+	}
+	if _, ok := raw.Data.(CreateReminderResult); !ok {
+		t.Fatalf("unexpected result type %T", raw.Data)
+	}
+
+	raw, err = d.Dispatch(context.Background(), "create_reminder", json.RawMessage(`{"title":"x","absolute_time":"10:30","absolute_date":"tomorrow"}`))
+	if err != nil {
+		t.Fatalf("Dispatch absolute reminder through the shipped registry must succeed: %v", err)
 	}
 	if _, ok := raw.Data.(CreateReminderResult); !ok {
 		t.Fatalf("unexpected result type %T", raw.Data)

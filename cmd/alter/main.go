@@ -105,6 +105,21 @@ func main() {
 	triggerSvc := service.NewTriggerService(triggers, tasks)
 	reminderSvc := service.NewReminderService(taskSvc, triggerSvc)
 
+	// User timezone: parsed once from ALTER_TIMEZONE (falling back to the
+	// system timezone) and shared by every consumer — the capability registry
+	// (CreateReminderHandler via WithTimezone) and the NaturalIntent fallback —
+	// so "today"/"tomorrow" resolution rules use the same timezone everywhere
+	// and the parsing logic is not duplicated between the two routes.
+	tz := time.Local
+	if cfg.Timezone != "" {
+		loc, err := time.LoadLocation(cfg.Timezone)
+		if err != nil {
+			logger.Printf("runtime: invalid ALTER_TIMEZONE %q, using system timezone: %v", cfg.Timezone, err)
+		} else {
+			tz = loc
+		}
+	}
+
 	// Pi Agent: shared between the Scheduler action (notifications) and
 	// natural language interpretation. Declared here so both can reuse it.
 	//
@@ -118,7 +133,7 @@ func main() {
 	var piAgent *agent.PiAgent
 	if cfg.PiEnabled {
 		registry = capability.NewRegistry()
-		capability.RegisterShippedCapabilities(registry, taskSvc, reminderSvc)
+		capability.RegisterShippedCapabilities(registry, taskSvc, reminderSvc, capability.WithTimezone(tz))
 		piAgent = agent.NewPiAgent(
 			agent.PiConfig{
 				Bin:          cfg.PiBin,
@@ -198,17 +213,6 @@ func main() {
 		// reply is only replaced when the fallback actually acted.
 		var fallback telegram.NaturalRecognizer
 		if cfg.NaturalEnabled {
-			// Parse timezone.
-			tz := time.Local
-			if cfg.Timezone != "" {
-				loc, err := time.LoadLocation(cfg.Timezone)
-				if err != nil {
-					logger.Printf("runtime: invalid ALTER_TIMEZONE %q, using system timezone: %v", cfg.Timezone, err)
-				} else {
-					tz = loc
-				}
-			}
-
 			// Reuse the same PiAgent instance for interpretation.
 			// The interpreter wraps it via PiRunnerAdapter.
 			natInterpreter := naturalintent.NewPiNaturalInterpreter(
