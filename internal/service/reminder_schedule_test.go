@@ -1,8 +1,6 @@
 // This file is the comprehensive test suite of the pure reminder resolution
 // and recurrence building logic (ResolveTime, BuildRecurrenceJSON, ParseHHMM).
-// The naturalintent package keeps a slimmer adapter-level suite over these
-// functions; this suite is the direct, type-level coverage that future
-// capability callers (which import this package, not naturalintent) rely on.
+// It is the direct, type-level coverage that the capability callers rely on.
 package service
 
 import (

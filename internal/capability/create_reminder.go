@@ -44,8 +44,8 @@ const sourceCapabilityReminder = "capability:create_reminder"
 // reusing the existing reminder logic with zero duplication.
 //
 // The clock (WithNow) and the user's timezone (WithTimezone) are injected so
-// resolution is deterministic and independent of NaturalIntent: the default
-// clock is time.Now and the default timezone is time.Local.
+// resolution is deterministic: the default clock is time.Now and the default
+// timezone is time.Local.
 type CreateReminderHandler struct {
 	reminders *service.ReminderService
 	now       func() time.Time

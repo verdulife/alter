@@ -13,7 +13,7 @@ import "github.com/verdu/alter/internal/service"
 //
 // reminderSvc is the dependency seam for the create_reminder capability: passing
 // the shared ReminderService here means a handler can be registered against it
-// without duplicating services or reaching into naturalintent.
+// without duplicating services.
 //
 // handlerOpts are forwarded to the create_reminder handler constructor — the
 // existing Option pattern (e.g. WithTimezone(tz)) — so the runtime can inject

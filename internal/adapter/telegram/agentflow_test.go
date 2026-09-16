@@ -65,23 +65,12 @@ func newTestFlow(t *testing.T, agent domain.Agent, seed func(*capability.Registr
 	)
 }
 
-// stubRecognizer implements telegram.NaturalRecognizer with a scripted answer.
-type stubRecognizer struct {
-	reply      string
-	recognized bool
-	err        error
-}
-
-func (s *stubRecognizer) HandleMessageStructured(_ context.Context, _ string) (string, bool, error) {
-	return s.reply, s.recognized, s.err
-}
-
 // --- Tests -------------------------------------------------------------------
 
 func TestAgentFlowHandlerPlanExecutesCapability(t *testing.T) {
 	agent := &stubAgent{resp: `{"calls":[{"capability":"list_tasks","args":{}}],"clarification":null}`}
 	flow := newTestFlow(t, agent, seedListTasks)
-	h := NewAgentFlowHandler(flow, nil)
+	h := NewAgentFlowHandler(flow)
 
 	reply, err := h.Handle(context.Background(), "muestra mis tareas")
 	if err != nil {
@@ -101,46 +90,10 @@ func TestAgentFlowHandlerPlanExecutesCapability(t *testing.T) {
 	}
 }
 
-func TestAgentFlowHandlerConversationFallsBackWhenRecognized(t *testing.T) {
-	agent := &stubAgent{resp: "claro, dime qué necesitas"}
-	flow := newTestFlow(t, agent, seedListTasks)
-	fallback := &stubRecognizer{
-		reply:      "Tarea creada: comprar SSD ✓",
-		recognized: true,
-	}
-	h := NewAgentFlowHandler(flow, fallback)
-
-	reply, err := h.Handle(context.Background(), "comprar SSD")
-	if err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if reply != "Tarea creada: comprar SSD ✓" {
-		t.Errorf("reply = %q, want the recognized fallback reply", reply)
-	}
-}
-
-func TestAgentFlowHandlerConversationKeepsPiWhenFallbackNotRecognized(t *testing.T) {
-	agent := &stubAgent{resp: "buenos días, ¿en qué te ayudo?"}
-	flow := newTestFlow(t, agent, seedListTasks)
-	fallback := &stubRecognizer{
-		reply:      "Hola, soy ALTER. Puedo crear tareas y recordatorios.",
-		recognized: false,
-	}
-	h := NewAgentFlowHandler(flow, fallback)
-
-	reply, err := h.Handle(context.Background(), "hola")
-	if err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if reply != "buenos días, ¿en qué te ayudo?" {
-		t.Errorf("reply = %q, want the conversational Pi reply", reply)
-	}
-}
-
-func TestAgentFlowHandlerConversationWithoutFallbackKeepsPi(t *testing.T) {
+func TestAgentFlowHandlerConversationKeepsPi(t *testing.T) {
 	agent := &stubAgent{resp: "hola, ¿en qué te ayudo?"}
 	flow := newTestFlow(t, agent, seedListTasks)
-	h := NewAgentFlowHandler(flow, nil)
+	h := NewAgentFlowHandler(flow)
 
 	reply, err := h.Handle(context.Background(), "hola")
 	if err != nil {
@@ -151,30 +104,10 @@ func TestAgentFlowHandlerConversationWithoutFallbackKeepsPi(t *testing.T) {
 	}
 }
 
-func TestAgentFlowHandlerFlowErrorFallsBackWhenRecognized(t *testing.T) {
-	// The Agent fails, so Handle() takes the flow-error branch: the fallback is
-	// consulted and its recognized reply wins.
-	agent := &stubAgent{resp: "irrelevant", err: errors.New("provider timeout")}
-	flow := newTestFlow(t, agent, seedListTasks)
-	fallback := &stubRecognizer{
-		reply:      "Recordatorio creado ✓",
-		recognized: true,
-	}
-	h := NewAgentFlowHandler(flow, fallback)
-
-	reply, err := h.Handle(context.Background(), "recuérdame algo")
-	if err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if reply != "Recordatorio creado ✓" {
-		t.Errorf("reply = %q, want the fallback reply on flow error", reply)
-	}
-}
-
-func TestAgentFlowHandlerFlowErrorWithoutFallbackSurfacesError(t *testing.T) {
+func TestAgentFlowHandlerFlowErrorSurfacesError(t *testing.T) {
 	agent := &stubAgent{resp: "anything", err: errors.New("provider timeout")}
 	flow := newTestFlow(t, agent, seedListTasks)
-	h := NewAgentFlowHandler(flow, nil)
+	h := NewAgentFlowHandler(flow)
 
 	reply, err := h.Handle(context.Background(), "recuérdame algo")
 	if err == nil {
@@ -188,5 +121,4 @@ func TestAgentFlowHandlerFlowErrorWithoutFallbackSurfacesError(t *testing.T) {
 	}
 }
 
-var _ NaturalRecognizer = (*stubRecognizer)(nil)
 var _ = domain.AgentRequest{} // keep the domain import used (fakeAgent construction)

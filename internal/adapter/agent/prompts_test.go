@@ -11,9 +11,7 @@ import (
 // TestPlannerPromptContract locks the planner instruction contract: a user
 // request matching an available capability MUST be answered with a Plan JSON
 // (never prose), args must follow the declared schema, and a conversational
-// reply is only allowed when no capability applies. This is the contract the
-// create_task E2E regression depended on: Pi's response was conversational and
-// NaturalIntent executed the operation as fallback.
+// reply is only allowed when no capability applies.
 func TestPlannerPromptContract(t *testing.T) {
 	ctx := capability.PlannerContext{Capabilities: []capability.CatalogEntry{
 		{

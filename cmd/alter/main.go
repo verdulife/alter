@@ -25,7 +25,6 @@ import (
 	"github.com/verdu/alter/internal/adapter/semantic"
 	"github.com/verdu/alter/internal/adapter/telegram"
 	"github.com/verdu/alter/internal/application"
-	"github.com/verdu/alter/internal/application/naturalintent"
 	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/config"
 	"github.com/verdu/alter/internal/domain"
@@ -106,10 +105,9 @@ func main() {
 	reminderSvc := service.NewReminderService(taskSvc, triggerSvc)
 
 	// User timezone: parsed once from ALTER_TIMEZONE (falling back to the
-	// system timezone) and shared by every consumer — the capability registry
-	// (CreateReminderHandler via WithTimezone) and the NaturalIntent fallback —
-	// so "today"/"tomorrow" resolution rules use the same timezone everywhere
-	// and the parsing logic is not duplicated between the two routes.
+	// system timezone) and injected into the capability registry
+	// (CreateReminderHandler via WithTimezone), so "today"/"tomorrow"
+	// resolution rules use the user's timezone.
 	tz := time.Local
 	if cfg.Timezone != "" {
 		loc, err := time.LoadLocation(cfg.Timezone)
@@ -120,8 +118,8 @@ func main() {
 		}
 	}
 
-	// Pi Agent: shared between the Scheduler action (notifications) and
-	// natural language interpretation. Declared here so both can reuse it.
+	// Pi Agent: shared between the Scheduler action (notifications) and the
+	// inbound AgentFlow free-text route. Declared here so both can reuse it.
 	//
 	// The runtime capability registry is built alongside: it is the single
 	// source of truth for the shipped capabilities (list_tasks over the shared
@@ -199,38 +197,16 @@ func main() {
 
 	// Inbound free text: with the Pi Agent enabled the AgentFlow capability
 	// pipeline is the primary route (Pi decides conversational reply vs Plan
-	// JSON; a Plan executes registered capabilities such as list_tasks).
-	// NaturalIntent is kept as the temporary fallback for operations not yet
-	// migrated to capabilities (create/reminder/complete/cancel), and only when
-	// explicitly opted-in via ALTER_NATURAL_ENABLED. With ALTER_PI_ENABLED=false
+	// JSON; a Plan executes registered capabilities: list_tasks, create_task,
+	// complete_task, cancel_task, create_reminder). With ALTER_PI_ENABLED=false
 	// there is no AgentFlow and no natural handler: the behavior is exactly the
 	// pre-slice one (slash commands + help fallback).
 	var naturalHandler telegram.NaturalHandler
 	if agentFlow != nil {
-		// Fallback seam: the natural-language service (only when opted-in). It
-		// shares the same PiAgent for interpretation and reports whether it
-		// recognized-and-executed an actionable operation, so Pi's conversational
-		// reply is only replaced when the fallback actually acted.
-		var fallback telegram.NaturalRecognizer
-		if cfg.NaturalEnabled {
-			// Reuse the same PiAgent instance for interpretation.
-			// The interpreter wraps it via PiRunnerAdapter.
-			natInterpreter := naturalintent.NewPiNaturalInterpreter(
-				naturalintent.NewPiRunnerAdapter(piAgent),
-			)
-			natSvc := naturalintent.NewService(natInterpreter, taskSvc, reminderSvc, taskSvc, tz,
-				naturalintent.WithLogger(logger),
-			)
-			fallback = natSvc
-			logger.Printf("runtime: natural language interpretation fallback enabled (timezone=%s)", tz)
-		} else {
-			logger.Printf("runtime: natural language interpretation fallback disabled (set ALTER_NATURAL_ENABLED=true)")
-		}
-
-		naturalHandler = telegram.NewAgentFlowHandler(agentFlow, fallback).Handle
-		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities), fallback=NaturalIntent(%t)", cfg.NaturalEnabled)
+		naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
+		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities)")
 	} else {
-		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true and ALTER_NATURAL_ENABLED=true)")
+		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true)")
 	}
 
 	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {

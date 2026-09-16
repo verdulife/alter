@@ -8,8 +8,8 @@ import (
 
 // TaskRefMatch is the result of resolving a textual task reference against a
 // set of tasks. It classifies the resolution without deciding on errors, so
-// every caller keeps its own error semantics (user-facing messages in
-// NaturalIntent, sentinel errors in the capability layer).
+// every caller keeps its own error semantics (user-facing messages in the
+// command service, sentinel errors in the capability layer).
 type TaskRefMatch struct {
 	// Ref is the original reference the match was computed for.
 	Ref string

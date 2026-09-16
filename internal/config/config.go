@@ -45,11 +45,6 @@ type Config struct {
 	// PiSystemPrompt is an optional extra system prompt appended via --append-system-prompt.
 	PiSystemPrompt string
 
-	// NaturalEnabled opts the runtime into natural language interpretation:
-	// when true and PiEnabled is also true, non-slash Telegram messages are
-	// interpreted via Pi to create tasks/reminders. When false, only slash
-	// commands are accepted.
-	NaturalEnabled bool
 	// Timezone is the user's timezone for resolving time expressions.
 	// Defaults to the system timezone (time.Local).
 	Timezone string
@@ -94,9 +89,7 @@ func Load() Config {
 		PiNoTools:      parseBoolEnv("ALTER_PI_NO_TOOLS", true),
 		PiSystemPrompt: envOr("ALTER_PI_SYSTEM_PROMPT", ""),
 
-		// Natural language: off unless explicitly enabled. Requires PiEnabled.
-		NaturalEnabled: parseBoolEnv("ALTER_NATURAL_ENABLED", false),
-		Timezone:       envOr("ALTER_TIMEZONE", ""),
+		Timezone: envOr("ALTER_TIMEZONE", ""),
 
 		// Semantic search: off by default; provider/URL optional and unused until
 		// a provider is implemented.

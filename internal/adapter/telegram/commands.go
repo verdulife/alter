@@ -61,8 +61,8 @@ type NaturalHandler func(ctx context.Context, text string) (string, error)
 // Presentation ownership: every reply returned by Handle is either produced by
 // format.go (HTML-safe) or, for the natural language path, the plain-text reply
 // of the application service escaped by the adapter before it reaches the
-// HTML-parsed Telegram send. The application layers (naturalintent, command
-// service) never know about Telegram formatting.
+// HTML-parsed Telegram send. The application layers never know about Telegram
+// formatting.
 func Handle(ctx context.Context, svc CommandService, text string, natural NaturalHandler) (string, error) {
 	trimmed := strings.TrimSpace(text)
 
