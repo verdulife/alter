@@ -50,8 +50,8 @@ func TestPlannerContextDerivesFromSameRegistry(t *testing.T) {
 	planner := NewPlannerContextBuilder(catalog)
 	ctxDoc := planner.Build()
 
-	if len(ctxDoc.Capabilities) != 4 {
-		t.Fatalf("planner context capabilities = %d, want 4", len(ctxDoc.Capabilities))
+	if len(ctxDoc.Capabilities) != 5 {
+		t.Fatalf("planner context capabilities = %d, want 5", len(ctxDoc.Capabilities))
 	}
 	// Same source: the entry parameters and description must match the
 	// registry definition, for every shipped capability.

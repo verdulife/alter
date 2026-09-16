@@ -98,7 +98,7 @@ func main() {
 	// TriggerService and ReminderService are shared like the TaskService: they
 	// back every reminder route (natural language one-shot/recurring and
 	// /recordar) and, since the reminder refactor, the capability registry seam
-	// for the future create_reminder. They are built here, before the Scheduler
+	// for create_reminder. They are built here, before the Scheduler
 	// and the registry, because the registry needs ReminderService; their
 	// optional rescan hints are wired below once the Scheduler exists (the same
 	// option-function pattern the TaskService hint uses).

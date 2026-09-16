@@ -11,10 +11,11 @@ import "github.com/verdu/alter/internal/service"
 // can actually execute. Registration follows Registry.Register semantics (panic
 // on empty name, duplicate name or nil handler).
 //
-// reminderSvc is the dependency seam for the future create_reminder capability:
-// passing the shared ReminderService here means a handler can be registered
-// against it without duplicating services or reaching into naturalintent. It is
-// intentionally not consumed by the shipped capabilities yet.
+// reminderSvc is the dependency seam for the create_reminder capability: passing
+// the shared ReminderService here means a handler can be registered against it
+// without duplicating services or reaching into naturalintent. The handler owns
+// its own clock/timezone injection (NewCreateReminderHandler defaults to
+// time.Now/time.Local) so the registration point stays dependency-free.
 func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, reminderSvc *service.ReminderService) {
 	reg.Register(
 		Capability{
@@ -71,5 +72,27 @@ func RegisterShippedCapabilities(reg *Registry, taskSvc *service.TaskService, re
 			}`),
 		},
 		NewCancelTaskHandler(taskSvc),
+	)
+
+	reg.Register(
+		Capability{
+			Name:        "create_reminder",
+			Description: "Create a reminder task (one-shot relative, one-shot absolute, or recurring)",
+			Parameters: []byte(`{
+				"type": "object",
+				"properties": {
+					"title":         {"type": "string"},
+					"relative":      {"type": "string"},
+					"absolute_time": {"type": "string"},
+					"absolute_date": {"type": "string"},
+					"recurrence":    {"type": "object"}
+				},
+				"required": ["title"]
+			}`),
+		},
+		// Only the one-shot relative case is implemented in this step: the handler
+		// rejects absolute_time/absolute_date/recurrence with ErrInvalidArgs until
+		// those cases are implemented (the schema keeps the full contract).
+		NewCreateReminderHandler(reminderSvc),
 	)
 }
