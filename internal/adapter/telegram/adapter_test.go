@@ -113,6 +113,30 @@ func TestHandleUpdateStreamsDraftThenFinalizes(t *testing.T) {
 	}
 }
 
+func TestUpdateStreamStopsTypingOnFirstDelta(t *testing.T) {
+	client := &recordingClient{}
+	first := 0
+	s := &updateStream{
+		client:       client,
+		chatID:       1,
+		draftID:      5,
+		logger:       log.New(io.Discard, "", 0),
+		onFirstDelta: func() { first++ },
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.Update(context.Background(), "x"); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+	}
+	// The typing keepalive must be signalled exactly once, on the first delta.
+	if first != 1 {
+		t.Errorf("onFirstDelta called %d times, want 1", first)
+	}
+	if len(client.drafts) != 3 {
+		t.Errorf("expected 3 drafts, got %d", len(client.drafts))
+	}
+}
+
 func TestHandleUpdateSkipsNonTextMessages(t *testing.T) {
 	sentErr := &recordingClient{}
 	adapter := newTestAdapter(sentErr, func(context.Context, string, Stream) (string, error) {

@@ -4,7 +4,14 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
+	"time"
 )
+
+// typingInterval is how often the adapter re-sends the "typing" chat action
+// while waiting for the first streamed delta, because Telegram's typing bubble
+// only lasts ~5s on its own.
+const typingInterval = 4 * time.Second
 
 // Stream is the per-message publishing seam for streaming responses. While a
 // handler generates its reply it calls Update to refresh the ephemeral message
@@ -69,13 +76,24 @@ func (a *Adapter) handleUpdate(ctx context.Context, u Update) {
 		a.logger.Printf("telegram: sendChatAction: %v", err)
 	}
 
+	// Keep the typing bubble alive during the model's time-to-first-token: pi
+	// can take several seconds before its first text_delta, and Telegram's
+	// typing action only lasts ~5s. The keepalive stops on the first delta
+	// (when the animated draft takes over) or when the handler returns.
+	stopTyping := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(stopTyping) }) }
+	go a.keepaliveTyping(ctx, chatID, stopTyping)
+
 	stream := &updateStream{
-		client:  a.client,
-		chatID:  chatID,
-		draftID: u.Message.MessageID,
-		logger:  a.logger,
+		client:       a.client,
+		chatID:       chatID,
+		draftID:      u.Message.MessageID,
+		logger:       a.logger,
+		onFirstDelta: stop,
 	}
 	reply, hErr := a.handler(ctx, u.Message.Text, stream)
+	stop() // handler done: stop the typing keepalive
 
 	// Finalize: the returned reply is the persisted message (sendMessage). The
 	// ephemeral draft is not persisted by Telegram.
@@ -87,17 +105,46 @@ func (a *Adapter) handleUpdate(ctx context.Context, u Update) {
 	}
 }
 
+// keepaliveTyping re-sends the "typing" chat action periodically until done is
+// closed or ctx is cancelled, so a slow time-to-first-token does not leave the
+// chat silent.
+func (a *Adapter) keepaliveTyping(ctx context.Context, chatID int64, done <-chan struct{}) {
+	ticker := time.NewTicker(typingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := a.client.SendChatAction(ctx, chatID, "typing"); err != nil {
+				a.logger.Printf("telegram: sendChatAction (keepalive): %v", err)
+			}
+		}
+	}
+}
+
 // updateStream publishes drafts for one incoming message. A stable, non-zero
 // draftID (the originating message id) makes Telegram animate the updates.
 type updateStream struct {
-	client  APIClient
-	chatID  int64
-	draftID int
-	logger  *log.Logger
+	client       APIClient
+	chatID       int64
+	draftID      int
+	logger       *log.Logger
+	// onFirstDelta, when non-nil, is called once on the first successful
+	// draft publication so the caller can stop the typing keepalive.
+	onFirstDelta func()
+	once         sync.Once
 }
 
 // Update refreshes the message draft with the current partial text.
 func (s *updateStream) Update(ctx context.Context, text string) error {
+	s.once.Do(func() {
+		if s.onFirstDelta != nil {
+			s.onFirstDelta()
+		}
+	})
 	draftID := s.draftID
 	if draftID == 0 {
 		draftID = 1 // Bot API requires a non-zero draft id
