@@ -25,6 +25,7 @@ import (
 	"github.com/verdu/alter/internal/adapter/semantic"
 	"github.com/verdu/alter/internal/adapter/telegram"
 	"github.com/verdu/alter/internal/application"
+	"github.com/verdu/alter/internal/bridge"
 	"github.com/verdu/alter/internal/capability"
 	"github.com/verdu/alter/internal/config"
 	"github.com/verdu/alter/internal/domain"
@@ -195,18 +196,32 @@ func main() {
 
 	cmdSvc := commandService{tasks: taskSvc, reminders: reminderSvc}
 
-	// Inbound free text: with the Pi Agent enabled the AgentFlow capability
-	// pipeline is the primary route (Pi decides conversational reply vs Plan
-	// JSON; a Plan executes registered capabilities: list_tasks, create_task,
-	// complete_task, cancel_task, create_reminder). With ALTER_PI_ENABLED=false
-	// there is no AgentFlow and no natural handler: the behavior is exactly the
-	// pre-slice one (slash commands + help fallback).
+	// Inbound free text: with the bridge enabled (ALTER_PI_BRIDGE) it is the
+	// direct Telegram→Pi path (a persistent pi session, clean loaded, no
+	// orchestrator). Otherwise, with the Pi Agent enabled the AgentFlow
+	// capability pipeline is the primary route (Pi decides conversational reply
+	// vs Plan JSON; a Plan executes registered capabilities: list_tasks,
+	// create_task, complete_task, cancel_task, create_reminder). With neither
+	// enabled there is no natural handler: the behavior is exactly the pre-slice
+	// one (slash commands + help fallback).
 	var naturalHandler telegram.NaturalHandler
-	if agentFlow != nil {
+	var bridgeSession *bridge.Session
+	switch {
+	case cfg.PiBridgeEnabled:
+		bridgeSession = bridge.NewSession(bridge.Config{
+			Bin:         cfg.PiBin,
+			Provider:    cfg.PiProvider,
+			Model:       cfg.PiModel,
+			Timeout:     cfg.PiTimeout,
+			SessionName: cfg.BridgeSessionName,
+		}, bridge.WithLogger(logger))
+		naturalHandler = bridgeSession.Handle
+		logger.Printf("runtime: inbound free text = bridge (Telegram→pi directo, sesión persistente, bin=%q)", cfg.PiBin)
+	case agentFlow != nil:
 		naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
 		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities)")
-	} else {
-		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true)")
+	default:
+		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true or ALTER_PI_BRIDGE=true)")
 	}
 
 	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {
@@ -247,6 +262,11 @@ func main() {
 	}
 	if second != nil && !errors.Is(second, context.Canceled) {
 		logger.Printf("runtime: %v", second)
+	}
+	// Terminate the persistent bridge pi process (if the bridge was wired) so it
+	// is not left as an orphan child when the runtime exits.
+	if bridgeSession != nil {
+		bridgeSession.Close()
 	}
 	logger.Printf("runtime: shutdown complete")
 }

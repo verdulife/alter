@@ -45,6 +45,17 @@ type Config struct {
 	// PiSystemPrompt is an optional extra system prompt appended via --append-system-prompt.
 	PiSystemPrompt string
 
+	// PiBridgeEnabled opts the inbound free-text route into the direct
+	// Telegram→Pi bridge (internal/bridge): one persistent pi process with
+	// session persistence and a clean load (no extensions, skills, prompt
+	// templates, themes, context files or tools). When true it takes precedence
+	// over the AgentFlow free-text route for inbound messages only; the Scheduler
+	// action is untouched. Off by default.
+	PiBridgeEnabled bool
+	// BridgeSessionName is the pi session display name for the persistent bridge
+	// process (--name), used to identify the saved session.
+	BridgeSessionName string
+
 	// Timezone is the user's timezone for resolving time expressions.
 	// Defaults to the system timezone (time.Local).
 	Timezone string
@@ -64,6 +75,8 @@ type Config struct {
 const (
 	defaultPiBin     = "pi"
 	defaultPiTimeout = 60 * time.Second
+	// defaultBridgeSessionName is used to name the persistent bridge pi session.
+	defaultBridgeSessionName = "alter-bridge"
 	// defaultSearchLimit caps semantic search results when ALTER_SEARCH_LIMIT
 	// is unset (0 in SearchOptions means "adapter default").
 	defaultSearchLimit = 5
@@ -88,6 +101,9 @@ func Load() Config {
 		PiTimeout:      parseDurationEnv("ALTER_PI_TIMEOUT", defaultPiTimeout),
 		PiNoTools:      parseBoolEnv("ALTER_PI_NO_TOOLS", true),
 		PiSystemPrompt: envOr("ALTER_PI_SYSTEM_PROMPT", ""),
+
+		PiBridgeEnabled:    parseBoolEnv("ALTER_PI_BRIDGE", false),
+		BridgeSessionName:  envOr("ALTER_BRIDGE_SESSION_NAME", defaultBridgeSessionName),
 
 		Timezone: envOr("ALTER_TIMEZONE", ""),
 
