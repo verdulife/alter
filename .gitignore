@@ -24,3 +24,7 @@ Thumbs.db
 # Local Pi runtime state
 .atl/
 undefined/
+
+# Local build artifact + CodeGraph index (bridge work)
+alter-bin
+.codegraph/

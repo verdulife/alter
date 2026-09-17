@@ -108,6 +108,14 @@ func NewSession(cfg Config, opts ...Option) *Session {
 // assistant text. It serializes access and, if the process died mid-run,
 // restarts it once and retries the prompt.
 func (s *Session) Prompt(ctx context.Context, instruction string) (string, error) {
+	return s.PromptStream(ctx, instruction, nil)
+}
+
+// PromptStream is Prompt with an optional onDelta callback: as pi streams the
+// assistant text (RPC message_update / text_delta), onDelta is called with the
+// accumulated partial text so callers can publish a live draft. The final
+// return value is the authoritative text from get_last_assistant_text.
+func (s *Session) PromptStream(ctx context.Context, instruction string, onDelta func(text string)) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
@@ -118,7 +126,7 @@ func (s *Session) Prompt(ctx context.Context, instruction string) (string, error
 		return "", err
 	}
 
-	text, err := s.roundTrip(ctx, instruction)
+	text, err := s.roundTrip(ctx, instruction, onDelta)
 	// A process that died before settling is retryable: restart and retry once.
 	if err != nil && errors.Is(err, errProcessEnded) {
 		if ctx.Err() != nil {
@@ -128,7 +136,7 @@ func (s *Session) Prompt(ctx context.Context, instruction string) (string, error
 		if rerr := s.restart(ctx); rerr != nil {
 			return "", rerr
 		}
-		text, err = s.roundTrip(ctx, instruction)
+		text, err = s.roundTrip(ctx, instruction, onDelta)
 	}
 	if err != nil {
 		return "", err
@@ -245,7 +253,7 @@ func (s *Session) args() []string {
 // roundTrip sends one prompt and reads stdout until the run settles and the
 // final assistant text is returned. It is tolerant of a hung process: reads run
 // in a goroutine so the per-prompt context can abort and trigger a restart.
-func (s *Session) roundTrip(ctx context.Context, instruction string) (string, error) {
+func (s *Session) roundTrip(ctx context.Context, instruction string, onDelta func(string)) (string, error) {
 	if err := writeJSON(s.stdin, promptCommand(instruction)); err != nil {
 		return "", classify(domain.AgentErrorKindInternal, fmt.Errorf("bridge: pi: write prompt: %w", err))
 	}
@@ -257,7 +265,7 @@ func (s *Session) roundTrip(ctx context.Context, instruction string) (string, er
 	ch := make(chan result, 1)
 	sc := s.sc // pinned: the reader must never touch a reassigned (restarted) scanner
 	go func() {
-		var st runState
+		st := runState{delta: onDelta}
 		for sc.Scan() {
 			done, err := s.handleLine(sc.Bytes(), &st)
 			if err != nil {
@@ -307,6 +315,10 @@ type runState struct {
 	runnerErr      error
 	gotText        bool
 	text           string
+	// draft is the accumulated streamed assistant text; delta, when non-nil,
+	// receives each updated draft so callers can publish a live preview.
+	draft string
+	delta func(string)
 }
 
 // handleLine processes one RPC event line. It returns done=true when the run
@@ -368,6 +380,22 @@ func (s *Session) handleLine(line []byte, st *runState) (bool, error) {
 		// the run: record it so we return retryable and skip the final text.
 		if ev.Success != nil && !*ev.Success {
 			st.runnerErr = errors.New(nonEmpty(ev.FinalError, "provider error after retries"))
+		}
+
+	case "message_update":
+		// Streamed assistant text: accumulate text_delta deltas and publish the
+		// running draft. The final text still comes from get_last_assistant_text.
+		var mu struct {
+			Evt *struct {
+				Type  string `json:"type"`
+				Delta string `json:"delta"`
+			} `json:"assistantMessageEvent"`
+		}
+		if err := json.Unmarshal(line, &mu); err == nil && mu.Evt != nil && mu.Evt.Type == "text_delta" {
+			st.draft += mu.Evt.Delta
+			if st.delta != nil {
+				st.delta(st.draft)
+			}
 		}
 
 	case "extension_ui_request":

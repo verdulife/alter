@@ -215,7 +215,19 @@ func main() {
 			Timeout:     cfg.PiTimeout,
 			SessionName: cfg.BridgeSessionName,
 		}, bridge.WithLogger(logger))
-		naturalHandler = bridgeSession.Handle
+		// Stream pi's deltas to Telegram as an animated draft; the final text is
+		// persisted by the adapter via sendMessage. Each draft update is bounded
+		// so a slow Telegram call cannot stall pi's event reader.
+		naturalHandler = func(ctx context.Context, text string, stream telegram.Stream) (string, error) {
+			return bridgeSession.PromptStream(ctx, text, func(partial string) {
+				if stream == nil {
+					return
+				}
+				dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				_ = stream.Update(dctx, partial)
+			})
+		}
 		logger.Printf("runtime: inbound free text = bridge (Telegram→pi directo, sesión persistente, bin=%q)", cfg.PiBin)
 	case agentFlow != nil:
 		naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
@@ -224,8 +236,8 @@ func main() {
 		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true or ALTER_PI_BRIDGE=true)")
 	}
 
-	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {
-		return telegram.Handle(ctx, cmdSvc, text, naturalHandler)
+	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string, stream telegram.Stream) (string, error) {
+		return telegram.Handle(ctx, cmdSvc, text, stream, naturalHandler)
 	}, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

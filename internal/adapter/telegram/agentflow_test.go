@@ -72,7 +72,7 @@ func TestAgentFlowHandlerPlanExecutesCapability(t *testing.T) {
 	flow := newTestFlow(t, agent, seedListTasks)
 	h := NewAgentFlowHandler(flow)
 
-	reply, err := h.Handle(context.Background(), "muestra mis tareas")
+	reply, err := h.Handle(context.Background(), "muestra mis tareas", nil)
 	if err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
@@ -95,7 +95,7 @@ func TestAgentFlowHandlerConversationKeepsPi(t *testing.T) {
 	flow := newTestFlow(t, agent, seedListTasks)
 	h := NewAgentFlowHandler(flow)
 
-	reply, err := h.Handle(context.Background(), "hola")
+	reply, err := h.Handle(context.Background(), "hola", nil)
 	if err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
@@ -109,7 +109,7 @@ func TestAgentFlowHandlerFlowErrorSurfacesError(t *testing.T) {
 	flow := newTestFlow(t, agent, seedListTasks)
 	h := NewAgentFlowHandler(flow)
 
-	reply, err := h.Handle(context.Background(), "recuérdame algo")
+	reply, err := h.Handle(context.Background(), "recuérdame algo", nil)
 	if err == nil {
 		t.Fatal("expected the Agent error to propagate")
 	}

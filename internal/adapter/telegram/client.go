@@ -38,6 +38,13 @@ type Chat struct {
 type APIClient interface {
 	GetUpdates(ctx context.Context, offset int) ([]Update, error)
 	SendMessage(ctx context.Context, chatID int64, text string) error
+	// SendChatAction shows a transient chat action (e.g. "typing") as cheap
+	// feedback while a reply is being generated.
+	SendChatAction(ctx context.Context, chatID int64, action string) error
+	// SendMessageDraft streams a partial message to a private chat (Bot API
+	// sendMessageDraft). The draft is an ephemeral preview that the SAME draftID
+	// animates across updates; the final message is persisted by SendMessage.
+	SendMessageDraft(ctx context.Context, chatID int64, draftID int, text string) error
 }
 
 // Client is an HTTP-backed APIClient for the Telegram Bot API.
@@ -80,6 +87,29 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) err
 		return err
 	}
 	return nil
+}
+
+// SendChatAction shows a transient chat action (Bot API sendChatAction), e.g.
+// "typing", to give feedback while the reply is generated.
+func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	return c.call(ctx, "sendChatAction", map[string]any{
+		"chat_id": chatID,
+		"action":  action,
+	}, nil)
+}
+
+// SendMessageDraft streams a partial message to a private chat (Bot API
+// sendMessageDraft). The draft is an ephemeral ~30s preview; the client must
+// call SendMessage with the complete text to persist it. draftID must be
+// non-zero and stable across updates of the same draft so Telegram animates the
+// transition instead of replacing it.
+func (c *Client) SendMessageDraft(ctx context.Context, chatID int64, draftID int, text string) error {
+	var result bool
+	return c.call(ctx, "sendMessageDraft", map[string]any{
+		"chat_id":  chatID,
+		"draft_id": draftID,
+		"text":     text,
+	}, &result)
 }
 
 // call performs a JSON POST to a Bot API method and decodes the result envelope.

@@ -128,6 +128,13 @@ func runBridgeRPCFake(scenario string) error {
 			case "prompt_rejected":
 				emit(`{"type":"response","command":"prompt","success":false,"error":"Model not found: invalid/model"}`)
 				return nil
+			case "stream":
+				// Streamed assistant text: text_delta events carry the partial text.
+				emit(`{"type":"message_start","message":{}}`)
+				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hola "}}`)
+				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"mundo"}}`)
+				emit(`{"type":"message_end","message":{}}`)
+				emit(`{"type":"agent_settled"}`)
 			default: // echo, empty_text
 				emit(`{"type":"message_start","message":{}}`)
 				emit(`{"type":"message_end","message":{}}`)
@@ -142,6 +149,8 @@ func runBridgeRPCFake(scenario string) error {
 					return err
 				}
 				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":` + string(text) + `}}`)
+			case "stream":
+				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"Hola mundo"}}`)
 			case "empty_text":
 				emit(`{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":null}}`)
 			}
@@ -233,6 +242,32 @@ func TestSessionRestartAfterCrash(t *testing.T) {
 	}
 	if got != "tras el crash" {
 		t.Errorf("got %q, want %q", got, "tras el crash")
+	}
+	s.Close()
+}
+
+func TestSessionStreamsDeltas(t *testing.T) {
+	// text_delta events are accumulated and pushed to the onDelta callback; the
+	// returned text is the authoritative get_last_assistant_text value.
+	s := newHarness(t, "stream", Config{}, nil)
+	var got []string
+	text, err := s.PromptStream(context.Background(), "x", func(partial string) {
+		got = append(got, partial)
+	})
+	if err != nil {
+		t.Fatalf("PromptStream: %v", err)
+	}
+	if text != "Hola mundo" {
+		t.Errorf("final text = %q, want %q", text, "Hola mundo")
+	}
+	want := []string{"Hola ", "Hola mundo"}
+	if len(got) != len(want) {
+		t.Fatalf("deltas = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("delta[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 	s.Close()
 }

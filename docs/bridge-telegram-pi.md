@@ -168,6 +168,7 @@ No se depende de "que Pi se porte bien":
 |---|---|---|
 | **M0** | Este documento + rama `bridge`. | Doc aprobado por Verdu. |
 | **M1** | Canal Telegram→Pi con **sesión persistente**, sin tools aún (spike). Solo charla continua desde Telegram. | Mensajes encadenados en el mismo hilo desde Telegram, sin DB. |
+| **M1.5** | **Streaming** de respuesta: typing (`sendChatAction`) + draft animado (`sendMessageDraft`) mientras pi genera, finalizando con `sendMessage`. | La respuesta se ve escribir carácter a carácter en Telegram y se persiste al final. |
 | **M2** | **Primera tool determinista** como extensión + allowlist (p. ej. `list_tasks`). | Desde Telegram, Pi *llama* la tool y devuelve el resultado; se verifica que no edita directo. |
 | **M3** | Ampliar a `create_task`, `complete_task`, `cancel_task`, `create_reminder`; afinar schemas. | Operaciones CRUD vía Pi por Telegram. |
 | **M4** | Ciclo de vida del proceso único: reconexión/resuperación, timeouts, reinicio limpio tras caída. | El puente se recupera solo tras caída de Pi/red, sin servicio manual. |

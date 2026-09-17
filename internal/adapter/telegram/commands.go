@@ -43,9 +43,10 @@ type CommandService interface {
 
 // NaturalHandler processes a free-text message through the natural language
 // interpreter and returns a reply. It is the V1 seam for lenguaje natural:
-// when no slash command matches, the message is passed here.
+// when no slash command matches, the message is passed here. The stream lets a
+// streaming implementation publish partial text while it generates the reply.
 // If nil, the adapter falls back to the existing "unknown command" reply.
-type NaturalHandler func(ctx context.Context, text string) (string, error)
+type NaturalHandler func(ctx context.Context, text string, stream Stream) (string, error)
 
 // Handle maps an incoming message text to an application action and returns the
 // reply to send back to the originating chat.
@@ -63,7 +64,7 @@ type NaturalHandler func(ctx context.Context, text string) (string, error)
 // of the application service escaped by the adapter before it reaches the
 // HTML-parsed Telegram send. The application layers never know about Telegram
 // formatting.
-func Handle(ctx context.Context, svc CommandService, text string, natural NaturalHandler) (string, error) {
+func Handle(ctx context.Context, svc CommandService, text string, stream Stream, natural NaturalHandler) (string, error) {
 	trimmed := strings.TrimSpace(text)
 
 	// 1. Slash commands: direct handling, no natural language fallback.
@@ -129,7 +130,7 @@ func Handle(ctx context.Context, svc CommandService, text string, natural Natura
 	// is Go-generated plain text (it may embed Pi-authored clarification text);
 	// the adapter escapes it before it reaches the HTML-parsed Telegram send.
 	if natural != nil {
-		reply, err := natural(ctx, trimmed)
+		reply, err := natural(ctx, trimmed, stream)
 		if err != nil {
 			return escapeHTML(reply), err
 		}

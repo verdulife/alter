@@ -113,7 +113,7 @@ func (f *fakeCommandService) CancelTaskByRef(_ context.Context, ref string) (dom
 
 func TestHandleNueva(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/nueva comprar pan", nil)
+	reply, err := Handle(context.Background(), svc, "/nueva comprar pan", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestHandleNueva(t *testing.T) {
 
 func TestHandleNuevaEmptyTitle(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/nueva", nil)
+	reply, err := Handle(context.Background(), svc, "/nueva", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestHandleNuevaEmptyTitle(t *testing.T) {
 
 func TestHandleUnknownCommand(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	reply, err := Handle(context.Background(), svc, "/listar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestHandleUnknownCommand(t *testing.T) {
 
 func TestHandleAppErrorSurfaces(t *testing.T) {
 	svc := &fakeCommandService{err: errApp}
-	reply, err := Handle(context.Background(), svc, "/nueva algo", nil)
+	reply, err := Handle(context.Background(), svc, "/nueva algo", nil, nil)
 	if err == nil {
 		t.Fatal("expected the application error to be returned")
 	}
@@ -212,7 +212,7 @@ func TestParseReminderEmptyTitle(t *testing.T) {
 
 func TestHandleRecordarValid(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/recordar recoger pedido in 10s", nil)
+	reply, err := Handle(context.Background(), svc, "/recordar recoger pedido in 10s", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestHandleRecordarValid(t *testing.T) {
 
 func TestHandleRecordarBadSyntaxShowsUsage(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/recordar sin duración", nil)
+	reply, err := Handle(context.Background(), svc, "/recordar sin duración", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestHandleRecordarBadSyntaxShowsUsage(t *testing.T) {
 
 func TestHandleRecordarAppErrorSurfaces(t *testing.T) {
 	svc := &fakeCommandService{err: errPartial}
-	reply, err := Handle(context.Background(), svc, "/recordar algo in 5s", nil)
+	reply, err := Handle(context.Background(), svc, "/recordar algo in 5s", nil, nil)
 	if err == nil {
 		t.Fatal("expected the application error to be returned")
 	}
@@ -259,7 +259,7 @@ func TestHandleRecordarAppErrorSurfaces(t *testing.T) {
 
 func TestHandleListarEmpty(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{}}
-	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	reply, err := Handle(context.Background(), svc, "/listar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestHandleListarWithTasks(t *testing.T) {
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	reply, err := Handle(context.Background(), svc, "/listar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestHandleListarFiltersCompleted(t *testing.T) {
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "tarea completada", Status: domain.TaskStatusCompleted},
 	}}
-	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	reply, err := Handle(context.Background(), svc, "/listar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestHandleListarFiltersCompleted(t *testing.T) {
 
 func TestHandleListarError(t *testing.T) {
 	svc := &fakeCommandService{listErr: errApp}
-	reply, err := Handle(context.Background(), svc, "/listar", nil)
+	reply, err := Handle(context.Background(), svc, "/listar", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -319,7 +319,7 @@ func TestHandleCompletarValid(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/completar SSD", nil)
+	reply, err := Handle(context.Background(), svc, "/completar SSD", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestHandleCompletarValid(t *testing.T) {
 
 func TestHandleCompletarEmptyRef(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/completar", nil)
+	reply, err := Handle(context.Background(), svc, "/completar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestHandleCompletarNoMatch(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/completar inexistente", nil)
+	reply, err := Handle(context.Background(), svc, "/completar inexistente", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -360,7 +360,7 @@ func TestHandleCompletarMultipleMatches(t *testing.T) {
 		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/completar SSD", nil)
+	reply, err := Handle(context.Background(), svc, "/completar SSD", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for multiple matches")
 	}
@@ -375,7 +375,7 @@ func TestHandleCancelarValid(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
 		{ID: "1", Title: "llamar al fontanero", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/cancelar fontanero", nil)
+	reply, err := Handle(context.Background(), svc, "/cancelar fontanero", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -389,7 +389,7 @@ func TestHandleCancelarValid(t *testing.T) {
 
 func TestHandleCancelarEmptyRef(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "/cancelar", nil)
+	reply, err := Handle(context.Background(), svc, "/cancelar", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestHandleCancelarNoMatch(t *testing.T) {
 	svc := &fakeCommandService{listTasks: []domain.Task{
 		{ID: "1", Title: "comprar SSD", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/cancelar inexistente", nil)
+	reply, err := Handle(context.Background(), svc, "/cancelar inexistente", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -416,7 +416,7 @@ func TestHandleCancelarMultipleMatches(t *testing.T) {
 		{ID: "1", Title: "comprar SSD negro", Status: domain.TaskStatusPending},
 		{ID: "2", Title: "comprar SSD blanco", Status: domain.TaskStatusPending},
 	}}
-	reply, err := Handle(context.Background(), svc, "/cancelar SSD", nil)
+	reply, err := Handle(context.Background(), svc, "/cancelar SSD", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for multiple matches")
 	}
@@ -430,14 +430,14 @@ func TestHandleCancelarMultipleMatches(t *testing.T) {
 func TestHandleNaturalLanguageFallback(t *testing.T) {
 	svc := &fakeCommandService{}
 	called := false
-	natural := func(_ context.Context, text string) (string, error) {
+	natural := func(_ context.Context, text string, _ Stream) (string, error) {
 		called = true
 		if text == "comprar SSD" {
 			return "Tarea creada ✓ \"comprar SSD\"", nil
 		}
 		return "fallback", nil
 	}
-	reply, err := Handle(context.Background(), svc, "comprar SSD", natural)
+	reply, err := Handle(context.Background(), svc, "comprar SSD", nil, natural)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestHandleNaturalLanguageFallback(t *testing.T) {
 
 func TestHandleNaturalLanguageNilFallsBackToHelp(t *testing.T) {
 	svc := &fakeCommandService{}
-	reply, err := Handle(context.Background(), svc, "comprar SSD", nil)
+	reply, err := Handle(context.Background(), svc, "comprar SSD", nil, nil)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -466,11 +466,11 @@ func TestHandleNaturalLanguageNilFallsBackToHelp(t *testing.T) {
 func TestHandleSlashCommandPrecedesNatural(t *testing.T) {
 	svc := &fakeCommandService{}
 	naturalCalled := false
-	natural := func(_ context.Context, text string) (string, error) {
+	natural := func(_ context.Context, text string, _ Stream) (string, error) {
 		naturalCalled = true
 		return "natural", nil
 	}
-	reply, err := Handle(context.Background(), svc, "/nueva SSD", natural)
+	reply, err := Handle(context.Background(), svc, "/nueva SSD", nil, natural)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}

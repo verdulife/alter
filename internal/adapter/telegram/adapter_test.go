@@ -16,7 +16,11 @@ type recordingClient struct {
 		chatID int64
 		text   string
 	}
-	sendErr error
+	drafts    []string
+	actions   []string
+	sendErr   error
+	draftErr  error
+	actionErr error
 }
 
 func (r *recordingClient) GetUpdates(context.Context, int) ([]Update, error) { return r.updates, nil }
@@ -32,6 +36,22 @@ func (r *recordingClient) SendMessage(_ context.Context, chatID int64, text stri
 	return nil
 }
 
+func (r *recordingClient) SendChatAction(_ context.Context, _ int64, action string) error {
+	if r.actionErr != nil {
+		return r.actionErr
+	}
+	r.actions = append(r.actions, action)
+	return nil
+}
+
+func (r *recordingClient) SendMessageDraft(_ context.Context, _ int64, _ int, text string) error {
+	if r.draftErr != nil {
+		return r.draftErr
+	}
+	r.drafts = append(r.drafts, text)
+	return nil
+}
+
 func newTestAdapter(client APIClient, h Handler) *Adapter {
 	return NewAdapter(client, h, log.New(io.Discard, "", 0))
 }
@@ -39,8 +59,8 @@ func newTestAdapter(client APIClient, h Handler) *Adapter {
 func TestHandleUpdateRepliesToOriginatingChat(t *testing.T) {
 	svc := &fakeCommandService{}
 	client := &recordingClient{}
-	adapter := newTestAdapter(client, func(ctx context.Context, text string) (string, error) {
-		return Handle(ctx, svc, text, nil)
+	adapter := newTestAdapter(client, func(ctx context.Context, text string, stream Stream) (string, error) {
+		return Handle(ctx, svc, text, stream, nil)
 	})
 
 	adapter.handleUpdate(context.Background(), Update{
@@ -60,11 +80,42 @@ func TestHandleUpdateRepliesToOriginatingChat(t *testing.T) {
 	if client.sent[0].text == "" {
 		t.Error("reply text should not be empty")
 	}
+	// Cheap feedback before generating the reply.
+	if len(client.actions) != 1 || client.actions[0] != "typing" {
+		t.Errorf("expected one typing chat action, got %v", client.actions)
+	}
+}
+
+func TestHandleUpdateStreamsDraftThenFinalizes(t *testing.T) {
+	client := &recordingClient{}
+	adapter := newTestAdapter(client, func(_ context.Context, _ string, stream Stream) (string, error) {
+		if err := stream.Update(context.Background(), "Hola"); err != nil {
+			t.Errorf("stream update: %v", err)
+		}
+		if err := stream.Update(context.Background(), "Hola mun"); err != nil {
+			t.Errorf("stream update: %v", err)
+		}
+		return "Hola mundo", nil
+	})
+
+	adapter.handleUpdate(context.Background(), Update{
+		ID:      9,
+		Message: &Message{Chat: Chat{ID: 5}, MessageID: 42, Text: "hola"},
+	})
+
+	// The partial drafts were streamed in order...
+	if len(client.drafts) != 2 || client.drafts[0] != "Hola" || client.drafts[1] != "Hola mun" {
+		t.Errorf("drafts = %v, want [Hola, Hola mun]", client.drafts)
+	}
+	// ...and the complete reply was persisted with sendMessage.
+	if len(client.sent) != 1 || client.sent[0].text != "Hola mundo" {
+		t.Errorf("finalized = %v, want [Hola mundo]", client.sent)
+	}
 }
 
 func TestHandleUpdateSkipsNonTextMessages(t *testing.T) {
 	sentErr := &recordingClient{}
-	adapter := newTestAdapter(sentErr, func(context.Context, string) (string, error) {
+	adapter := newTestAdapter(sentErr, func(context.Context, string, Stream) (string, error) {
 		return "unexpected", nil
 	})
 
@@ -83,7 +134,7 @@ func TestHandleUpdateSkipsNonTextMessages(t *testing.T) {
 
 func TestHandleUpdateLogsSendFailureWithoutPanic(t *testing.T) {
 	client := &recordingClient{sendErr: errors.New("network down")}
-	adapter := newTestAdapter(client, func(context.Context, string) (string, error) {
+	adapter := newTestAdapter(client, func(context.Context, string, Stream) (string, error) {
 		return "reply", nil
 	})
 	adapter.handleUpdate(context.Background(), Update{
@@ -91,4 +142,20 @@ func TestHandleUpdateLogsSendFailureWithoutPanic(t *testing.T) {
 		Message: &Message{Chat: Chat{ID: 1}, Text: "/nueva x"},
 	})
 	// A send failure must not panic; it is logged and the loop continues.
+}
+
+func TestHandleUpdateDraftFailureDoesNotBreakReply(t *testing.T) {
+	client := &recordingClient{draftErr: errors.New("draft unsupported")}
+	adapter := newTestAdapter(client, func(_ context.Context, _ string, stream Stream) (string, error) {
+		_ = stream.Update(context.Background(), "parcial")
+		return "final", nil
+	})
+	adapter.handleUpdate(context.Background(), Update{
+		ID:      6,
+		Message: &Message{Chat: Chat{ID: 3}, MessageID: 7, Text: "x"},
+	})
+	// The final reply must still be sent even if the draft call failed.
+	if len(client.sent) != 1 || client.sent[0].text != "final" {
+		t.Errorf("final reply missing after draft failure: %v", client.sent)
+	}
 }

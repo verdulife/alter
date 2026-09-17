@@ -34,7 +34,8 @@ func NewAgentFlowHandler(flow *application.AgentFlow) *AgentFlowHandler {
 
 // Handle implements the telegram.NaturalHandler seam for free text. The reply
 // it returns is the user-facing text for Telegram; the caller owns HTML escape.
-func (h *AgentFlowHandler) Handle(ctx context.Context, text string) (string, error) {
+// The AgentFlow path does not stream, so the stream is ignored.
+func (h *AgentFlowHandler) Handle(ctx context.Context, text string, _ Stream) (string, error) {
 	result, err := h.flow.Execute(ctx, domain.AgentRequest{
 		Instruction: freeTextInstruction(text),
 	})
