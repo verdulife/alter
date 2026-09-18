@@ -131,6 +131,13 @@ func Handle(ctx context.Context, svc CommandService, text string, stream Stream,
 	// the adapter escapes it before it reaches the HTML-parsed Telegram send.
 	if natural != nil {
 		reply, err := natural(ctx, trimmed, stream)
+		// A failing reply path must never deliver an empty message to the user:
+		// the bridge (the only natural handler today) returns an empty string on
+		// error (timeout, dead pi process, provider failure), so substitute the
+		// fallback text before escaping.
+		if err != nil && strings.TrimSpace(reply) == "" {
+			reply = MsgBridgeUnavailable()
+		}
 		if err != nil {
 			return escapeHTML(reply), err
 		}

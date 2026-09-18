@@ -204,10 +204,15 @@ func main() {
 	// create_task, complete_task, cancel_task, create_reminder). With neither
 	// enabled there is no natural handler: the behavior is exactly the pre-slice
 	// one (slash commands + help fallback).
+	// Inbound free text: the ONLY entry route is the direct Telegram→Pi bridge
+	// (ALTER_PI_BRIDGE). The legacy AgentFlow natural-handler route is retired
+	// from the inbound path and can never reappear: with the bridge disabled,
+	// free text stays disabled (slash commands + help only) instead of falling
+	// back to the old capability pipeline. AgentFlow itself remains only for the
+	// Scheduler Orchestrator notifications until its full retirement (M5).
 	var naturalHandler telegram.NaturalHandler
 	var bridgeSession *bridge.Session
-	switch {
-	case cfg.PiBridgeEnabled:
+	if cfg.PiBridgeEnabled {
 		bridgeSession = bridge.NewSession(bridge.Config{
 			Bin:         cfg.PiBin,
 			Provider:    cfg.PiProvider,
@@ -229,11 +234,8 @@ func main() {
 			})
 		}
 		logger.Printf("runtime: inbound free text = bridge (Telegram→pi directo, sesión persistente, bin=%q)", cfg.PiBin)
-	case agentFlow != nil:
-		naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
-		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities)")
-	default:
-		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true or ALTER_PI_BRIDGE=true)")
+	} else {
+		logger.Printf("runtime: inbound free text DISABLED (enable ALTER_PI_BRIDGE=true; the AgentFlow entry route is retired)")
 	}
 
 	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string, stream telegram.Stream) (string, error) {

@@ -452,6 +452,22 @@ func TestHandleNaturalLanguageFallback(t *testing.T) {
 	}
 }
 
+func TestHandleNaturalLanguageFailureNeverDeliversEmpty(t *testing.T) {
+	svc := &fakeCommandService{}
+	// A failing reply path (e.g. the bridge returning an empty text on error)
+	// must surface the bridge fallback instead of an empty message.
+	bridgeLike := func(_ context.Context, _ string, _ Stream) (string, error) {
+		return "", errors.New("bridge: pi: timed out after 60s")
+	}
+	reply, err := Handle(context.Background(), svc, "regar plantas", nil, bridgeLike)
+	if err == nil {
+		t.Fatal("expected the bridge error to propagate")
+	}
+	if !strings.Contains(reply, "No pude generar la respuesta") {
+		t.Errorf("reply = %q, want the bridge fallback text", reply)
+	}
+}
+
 func TestHandleNaturalLanguageNilFallsBackToHelp(t *testing.T) {
 	svc := &fakeCommandService{}
 	reply, err := Handle(context.Background(), svc, "comprar SSD", nil, nil)

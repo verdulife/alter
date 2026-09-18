@@ -30,6 +30,7 @@ empezando por el canal de comunicación Telegram ↔ Pi con sesión persistente.
 | D5 | No se borra código viejo en la rama todavía; se retira al final si la vía nueva triunfa. | ✅ acordado |
 | D6 | Persistencia de sesión: mecanismo concreto **pendiente** (ver §5). | ⏳ abierta |
 | D7 | **Un solo chat / un solo usuario** (el dueño). No existe concurrencia entre chats. | ✅ confirmado |
+| D8 | **El bridge es la única ruta de entrada de texto libre.** El natural handler AgentFlow queda retirado del camino de entrada en `cmd/alter/main.go`: con `ALTER_PI_BRIDGE` desactivado el texto libre queda deshabilitado (nunca cae de nuevo en AgentFlow). AgentFlow se conserva solo para el Orchestrator del Scheduler (notificaciones) hasta su retirada total en M5. | ✅ hecho |
 
 ## 3. Inventario que se conserva
 

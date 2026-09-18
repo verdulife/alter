@@ -174,6 +174,14 @@ func MsgUnrecognized() string {
 
 // --- NL-specific errors -----------------------------------------------------
 
+// MsgBridgeUnavailable returns the user-facing fallback when the Telegram→Pi
+// bridge fails to produce a reply (timeout, pi process died, provider error).
+// It is neutral Spanish and deliberately free of the voseo used in legacy
+// messages, matching the project's Spain-Spanish convention.
+func MsgBridgeUnavailable() string {
+	return "No pude generar la respuesta. Vuelve a intentarlo en un momento."
+}
+
 // MsgNLErrInterpret returns the error when Pi fails to parse a message.
 func MsgNLErrInterpret() string {
 	return "No pude entender tu mensaje. Intentá con más detalle."

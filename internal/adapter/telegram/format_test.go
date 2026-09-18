@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func TestMsgBridgeUnavailable(t *testing.T) {
+	msg := MsgBridgeUnavailable()
+	if strings.TrimSpace(msg) == "" {
+		t.Fatal("MsgBridgeUnavailable must not be empty")
+	}
+	// Neutral Spain Spanish: no voseo ("Intentá") and no leading HTML.
+	if strings.Contains(msg, "Intentá") {
+		t.Errorf("MsgBridgeUnavailable uses voseo: %q", msg)
+	}
+}
+
 func TestEscapeHTML(t *testing.T) {
 	tests := []struct {
 		input, want string
