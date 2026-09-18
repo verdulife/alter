@@ -27,4 +27,6 @@ undefined/
 
 # Local build artifact + CodeGraph index (bridge work)
 alter-bin
+alter-bin.exe~
+alter-run.log
 .codegraph/
