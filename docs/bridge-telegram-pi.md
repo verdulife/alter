@@ -31,6 +31,8 @@ empezando por el canal de comunicación Telegram ↔ Pi con sesión persistente.
 | D6 | Persistencia de sesión: mecanismo concreto **pendiente** (ver §5). | ⏳ abierta |
 | D7 | **Un solo chat / un solo usuario** (el dueño). No existe concurrencia entre chats. | ✅ confirmado |
 | D8 | **El bridge es la única ruta de entrada de texto libre.** El natural handler AgentFlow queda retirado del camino de entrada en `cmd/alter/main.go`: con `ALTER_PI_BRIDGE` desactivado el texto libre queda deshabilitado (nunca cae de nuevo en AgentFlow). AgentFlow se conserva solo para el Orchestrator del Scheduler (notificaciones) hasta su retirada total en M5. | ✅ hecho |
+| D9 | **Permisos de pi en el bridge: solo lectura.** Allowlist estricta `--tools read,grep,find,ls` por defecto (`ALTER_BRIDGE_TOOLS`). Se descartan `bash`/`edit`/`write` (ejecución/escritura en el servidor). Las tools deterministas (grupo C) se añadirán a la misma allowlist en M2. | ✅ hecho |
+| D10 | **Personalidad del bridge en archivo .md.** Uno o varios markdowns se inyectan al system prompt vía `--append-system-prompt` (`ALTER_BRIDGE_PROMPT_FILES`, separados por `;`). `bridge-persona.md` define el secretario virtual (español de España, conciso, sin voseo). No se necesita trust de proyecto: `--no-context-files`/`--no-approve` se mantienen. | ✅ hecho |
 
 ## 3. Inventario que se conserva
 
@@ -130,8 +132,13 @@ Pi (ya sea A o B), la consigna es:
 - **Mantener** la sesión → **sin** `--no-session`.
 - **Desactivar** descubrimiento automático: `--no-skills --no-prompt-templates
   --no-themes --no-context-files` (y `-na` para ignorar archivos de proyecto).
-- **No** pasar `--no-tools` (Pi debe poder llamar tools), pero **sí** restringir
-  con `--tools <allowlist>`: solo las tools deterministas registradas.
+- **Allowlist de tools solo lectura** por defecto: `--tools read,grep,find,ls`
+  (D9). `bash`, `edit` y `write` quedan fuera: pi no ejecuta ni escribe en el
+  servidor. En M2 la allowlist se amplía con los nombres de las tools
+  deterministas.
+- **Personalidad** (D10): `--append-system-prompt <archivo.md>` por cada
+  fichero de `ALTER_BRIDGE_PROMPT_FILES`. Pi resuelve la ruta y lee el
+  contenido; no depende del trust de proyecto.
 - `--no-extensions` **NO** se aplica en esta rama: las tools deterministas se
   entregan como extensión (los adapters de la rama de hoy — engram, gentle-pi —
   son ajenos a este cambio y no se cargan en el bridge).

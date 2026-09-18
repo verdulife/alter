@@ -51,6 +51,14 @@ type Config struct {
 	Timeout time.Duration
 	// SessionName optionally names the persistent pi session (--name).
 	SessionName string
+	// Tools is the comma-separated tool allowlist (--tools). pi treats it as a
+	// STRICT allowlist: only the listed tools stay active. Empty keeps the
+	// legacy --no-tools behavior (tools off).
+	Tools string
+	// PromptFiles are persona/system-prompt markdown files appended to the pi
+	// system prompt via --append-system-prompt, one flag per file. pi resolves
+	// each path and reads the file contents.
+	PromptFiles []string
 }
 
 // Option configures a Session (testing seam and diagnostics).
@@ -236,10 +244,16 @@ func (s *Session) args() []string {
 	if s.cfg.SessionName != "" {
 		args = append(args, "--name", s.cfg.SessionName)
 	}
-	// Clean load + persistence ON (no --no-session). M1 carries no tools yet;
-	// M2 will swap --no-tools for a --tools allowlist.
+	// Clean load + persistence ON (no --no-session). The read-only tool allowlist
+	// is already active by default; M2 will extend it with deterministic tool
+	// names.
+	if s.cfg.Tools != "" {
+		args = append(args, "--tools", s.cfg.Tools)
+	} else {
+		// Legacy default for an unset allowlist: all tools off.
+		args = append(args, "--no-tools")
+	}
 	args = append(args,
-		"--no-tools",
 		"--no-extensions",
 		"--no-skills",
 		"--no-prompt-templates",
@@ -247,6 +261,9 @@ func (s *Session) args() []string {
 		"--no-context-files",
 		"--no-approve",
 	)
+	for _, file := range s.cfg.PromptFiles {
+		args = append(args, "--append-system-prompt", file)
+	}
 	return args
 }
 

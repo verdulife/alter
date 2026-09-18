@@ -219,6 +219,8 @@ func main() {
 			Model:       cfg.PiModel,
 			Timeout:     cfg.PiTimeout,
 			SessionName: cfg.BridgeSessionName,
+			Tools:       cfg.BridgeTools,
+			PromptFiles: cfg.BridgePromptFiles,
 		}, bridge.WithLogger(logger))
 		// Stream pi's deltas to Telegram as an animated draft; the final text is
 		// persisted by the adapter via sendMessage. Each draft update is bounded

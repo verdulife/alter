@@ -191,6 +191,47 @@ func TestSessionArgsCleanAndPersistent(t *testing.T) {
 	}
 }
 
+func TestSessionArgsToolsAllowlistAndPromptFiles(t *testing.T) {
+	// A configured tool allowlist replaces --no-tools, and persona files append
+	// --append-system-prompt once per file.
+	var args []string
+	s := newHarness(t, "echo", Config{
+		SessionName: "alter-bridge",
+		Tools:       "read,grep,find,ls",
+		PromptFiles: []string{"persona.md"},
+	}, &args)
+
+	ctx := context.Background()
+	if _, err := s.Prompt(ctx, "hola"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	s.Close()
+
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"--mode rpc",
+		"--name alter-bridge",
+		"--tools read,grep,find,ls",
+		"--append-system-prompt persona.md",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+		"--no-approve",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q: got %v", want, args)
+		}
+	}
+	if strings.Contains(joined, "--no-tools") {
+		t.Errorf("tool allowlist must replace --no-tools, but args contain it: %v", args)
+	}
+	if strings.Contains(joined, "--no-session") {
+		t.Errorf("bridge must keep session persistence, but args contain --no-session: %v", args)
+	}
+}
+
 func TestSessionPromptsReturnEcho(t *testing.T) {
 	// Single prompt returns the assistant text.
 	s := newHarness(t, "echo", Config{}, nil)

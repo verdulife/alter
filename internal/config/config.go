@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,13 +49,24 @@ type Config struct {
 	// PiBridgeEnabled opts the inbound free-text route into the direct
 	// Telegram→Pi bridge (internal/bridge): one persistent pi process with
 	// session persistence and a clean load (no extensions, skills, prompt
-	// templates, themes, context files or tools). When true it takes precedence
-	// over the AgentFlow free-text route for inbound messages only; the Scheduler
-	// action is untouched. Off by default.
+	// templates, themes or context files; only the read-only tool allowlist by
+	// default). When true it takes precedence over the AgentFlow free-text route
+	// for inbound messages only; the Scheduler action is untouched. Off by
+	// default.
 	PiBridgeEnabled bool
 	// BridgeSessionName is the pi session display name for the persistent bridge
 	// process (--name), used to identify the saved session.
 	BridgeSessionName string
+	// BridgeTools is the comma-separated allowlist of tools for the bridge pi
+	// process (--tools). It is a STRICT allowlist in pi: only the listed tools
+	// stay active (read, grep, find, ls by default), so system tools such as
+	// bash, edit and write are off. Empty keeps the legacy --no-tools behavior.
+	BridgeTools string
+	// BridgePromptFiles are persona/system-prompt markdown files appended to the
+	// bridge pi process via --append-system-prompt, one flag per file. Paths are
+	// semicolon-separated in ALTER_BRIDGE_PROMPT_FILES; pi resolves each path
+	// and reads the file contents into the system prompt.
+	BridgePromptFiles []string
 
 	// Timezone is the user's timezone for resolving time expressions.
 	// Defaults to the system timezone (time.Local).
@@ -77,6 +89,9 @@ const (
 	defaultPiTimeout = 60 * time.Second
 	// defaultBridgeSessionName is used to name the persistent bridge pi session.
 	defaultBridgeSessionName = "alter-bridge"
+	// defaultBridgeTools is the read-only tool allowlist for the bridge pi
+	// process; system tools (bash, edit, write) are intentionally not listed.
+	defaultBridgeTools = "read,grep,find,ls"
 	// defaultSearchLimit caps semantic search results when ALTER_SEARCH_LIMIT
 	// is unset (0 in SearchOptions means "adapter default").
 	defaultSearchLimit = 5
@@ -104,6 +119,8 @@ func Load() Config {
 
 		PiBridgeEnabled:    parseBoolEnv("ALTER_PI_BRIDGE", false),
 		BridgeSessionName:  envOr("ALTER_BRIDGE_SESSION_NAME", defaultBridgeSessionName),
+		BridgeTools:        envOr("ALTER_BRIDGE_TOOLS", defaultBridgeTools),
+		BridgePromptFiles:  parseListEnv("ALTER_BRIDGE_PROMPT_FILES"),
 
 		Timezone: envOr("ALTER_TIMEZONE", ""),
 
@@ -122,6 +139,16 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseListEnv splits a semicolon-separated environment variable into a list,
+// returning nil when unset or empty.
+func parseListEnv(key string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ";")
 }
 
 // parseInt64Env parses an integer environment variable, falling back to def when

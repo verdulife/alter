@@ -142,6 +142,47 @@ func TestLoadPiMalformedFallsBack(t *testing.T) {
 	}
 }
 
+func TestLoadBridgeDefaults(t *testing.T) {
+	t.Setenv("ALTER_BRIDGE_TOOLS", "")
+	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "")
+
+	cfg := Load()
+	if cfg.BridgeTools != "read,grep,find,ls" {
+		t.Errorf("BridgeTools = %q, want default read-only allowlist", cfg.BridgeTools)
+	}
+	if cfg.BridgePromptFiles != nil {
+		t.Errorf("BridgePromptFiles = %v, want nil when unset", cfg.BridgePromptFiles)
+	}
+}
+
+func TestLoadBridgeFromEnv(t *testing.T) {
+	t.Setenv("ALTER_BRIDGE_TOOLS", "read,grep")
+	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "persona.md;system.md")
+
+	cfg := Load()
+	if cfg.BridgeTools != "read,grep" {
+		t.Errorf("BridgeTools = %q, want the configured allowlist", cfg.BridgeTools)
+	}
+	want := []string{"persona.md", "system.md"}
+	if len(cfg.BridgePromptFiles) != len(want) {
+		t.Fatalf("BridgePromptFiles = %v, want %v", cfg.BridgePromptFiles, want)
+	}
+	for i := range want {
+		if cfg.BridgePromptFiles[i] != want[i] {
+			t.Errorf("BridgePromptFiles[%d] = %q, want %q", i, cfg.BridgePromptFiles[i], want[i])
+		}
+	}
+}
+
+func TestLoadBridgePromptFilesEmpty(t *testing.T) {
+	// Empty env string parses to nil, never to a list with an empty element.
+	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "")
+	cfg := Load()
+	if cfg.BridgePromptFiles != nil {
+		t.Errorf("BridgePromptFiles = %v, want nil for empty env", cfg.BridgePromptFiles)
+	}
+}
+
 func TestLoadSearchFromEnv(t *testing.T) {
 	t.Setenv("ALTER_SEARCH_ENABLED", "true")
 	t.Setenv("ALTER_EMBEDDING_PROVIDER", "ollama")
