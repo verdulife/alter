@@ -232,6 +232,69 @@ func TestSessionArgsToolsAllowlistAndPromptFiles(t *testing.T) {
 	}
 }
 
+func TestSessionWebToolsArgs(t *testing.T) {
+	// Web access (D-W): with WebTools on, the pi-web-access tool names are
+	// appended to the allowlist and the extension is loaded with -e, while
+	// --no-extensions stays active for the rest of the clean load.
+	var args []string
+	s := newHarness(t, "echo", Config{
+		SessionName: "alter-bridge",
+		Tools:       "read,grep,find,ls",
+		WebTools:    true,
+		Extensions:  []string{"/workspace/.pi/pi-web-access/index.ts"},
+	}, &args)
+	ctx := context.Background()
+	if _, err := s.Prompt(ctx, "busca algo"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	s.Close()
+
+	joined := strings.Join(args, " ")
+	want := []string{
+		"--mode rpc",
+		"--name alter-bridge",
+		"--tools read,grep,find,ls,web_search,fetch_content,get_search_content",
+		"--extension /workspace/.pi/pi-web-access/index.ts",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+		"--no-approve",
+	}
+	for _, w := range want {
+		if !strings.Contains(joined, w) {
+			t.Errorf("args missing %q: got %v", w, args)
+		}
+	}
+	if strings.Contains(joined, "--no-tools") {
+		t.Errorf("web allowlist must replace --no-tools: %v", args)
+	}
+}
+
+func TestSessionWebToolsWithoutAllowlistStaysNoTools(t *testing.T) {
+	// WebTools without a base allowlist must not silently give the web tools
+	// free rein: with Tools empty, the legacy --no-tools behavior wins.
+	var args []string
+	s := newHarness(t, "echo", Config{
+		SessionName: "alter-bridge",
+		WebTools:    true,
+		Extensions:  []string{"/workspace/.pi/pi-web-access/index.ts"},
+	}, &args)
+	ctx := context.Background()
+	if _, err := s.Prompt(ctx, "x"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	s.Close()
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--no-tools") {
+		t.Errorf("unset allowlist must keep --no-tools even with WebTools: %v", args)
+	}
+	if strings.Contains(joined, "--tools") {
+		t.Errorf("no --tools expected without a base allowlist: %v", args)
+	}
+}
+
 func TestSessionPromptsReturnEcho(t *testing.T) {
 	// Single prompt returns the assistant text.
 	s := newHarness(t, "echo", Config{}, nil)

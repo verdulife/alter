@@ -220,6 +220,8 @@ func main() {
 			Timeout:     cfg.PiTimeout,
 			SessionName: cfg.BridgeSessionName,
 			Tools:       cfg.BridgeTools,
+			WebTools:    cfg.BridgeWebTools,
+			Extensions:  cfg.BridgeExtensions,
 			PromptFiles: cfg.BridgePromptFiles,
 		}, bridge.WithLogger(logger))
 		// Stream pi's deltas to Telegram as an animated draft; the final text is

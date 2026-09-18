@@ -145,6 +145,8 @@ func TestLoadPiMalformedFallsBack(t *testing.T) {
 func TestLoadBridgeDefaults(t *testing.T) {
 	t.Setenv("ALTER_BRIDGE_TOOLS", "")
 	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "")
+	t.Setenv("ALTER_BRIDGE_EXTENSIONS", "")
+	t.Setenv("ALTER_BRIDGE_WEB_TOOLS", "")
 
 	cfg := Load()
 	if cfg.BridgeTools != "read,grep,find,ls" {
@@ -152,6 +154,13 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	}
 	if cfg.BridgePromptFiles != nil {
 		t.Errorf("BridgePromptFiles = %v, want nil when unset", cfg.BridgePromptFiles)
+	}
+	// Web access is strictly opt-in (D-W): off by default, no extension loaded.
+	if cfg.BridgeWebTools {
+		t.Error("BridgeWebTools = true, want false by default")
+	}
+	if cfg.BridgeExtensions != nil {
+		t.Errorf("BridgeExtensions = %v, want nil when unset", cfg.BridgeExtensions)
 	}
 }
 
@@ -170,6 +179,43 @@ func TestLoadBridgeFromEnv(t *testing.T) {
 	for i := range want {
 		if cfg.BridgePromptFiles[i] != want[i] {
 			t.Errorf("BridgePromptFiles[%d] = %q, want %q", i, cfg.BridgePromptFiles[i], want[i])
+		}
+	}
+}
+
+func TestLoadBridgeWebToolsFromEnv(t *testing.T) {
+	// Web tools on + an explicit pi-web-access extension path. The web tool
+	// names are added at the bridge args level, not here; config only records
+	// the switch and the extension paths.
+	t.Setenv("ALTER_BRIDGE_WEB_TOOLS", "true")
+	t.Setenv("ALTER_BRIDGE_EXTENSIONS", "/workspace/.pi/pi-web-access/index.ts")
+
+	cfg := Load()
+	if !cfg.BridgeWebTools {
+		t.Error("BridgeWebTools = false, want true")
+	}
+	want := []string{"/workspace/.pi/pi-web-access/index.ts"}
+	if len(cfg.BridgeExtensions) != len(want) {
+		t.Fatalf("BridgeExtensions = %v, want %v", cfg.BridgeExtensions, want)
+	}
+	for i := range want {
+		if cfg.BridgeExtensions[i] != want[i] {
+			t.Errorf("BridgeExtensions[%d] = %q, want %q", i, cfg.BridgeExtensions[i], want[i])
+		}
+	}
+}
+
+func TestLoadBridgeExtensionsMultiple(t *testing.T) {
+	// Semicolon-separated paths parse into a list; empty parts are dropped.
+	t.Setenv("ALTER_BRIDGE_EXTENSIONS", "a.ts;b.ts")
+	cfg := Load()
+	want := []string{"a.ts", "b.ts"}
+	if len(cfg.BridgeExtensions) != len(want) {
+		t.Fatalf("BridgeExtensions = %v, want %v", cfg.BridgeExtensions, want)
+	}
+	for i := range want {
+		if cfg.BridgeExtensions[i] != want[i] {
+			t.Errorf("BridgeExtensions[%d] = %q, want %q", i, cfg.BridgeExtensions[i], want[i])
 		}
 	}
 }

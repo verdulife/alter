@@ -68,6 +68,20 @@ type Config struct {
 	// and reads the file contents into the system prompt.
 	BridgePromptFiles []string
 
+	// BridgeWebTools, when true, appends the pi-web-access web tools
+	// (web_search, fetch_content, get_search_content) to the bridge allowlist
+	// (ALTER_BRIDGE_TOOLS) and expects a pi-web-access extension to be loaded
+	// via BridgeExtensions. Off by default (D-W): web access is an outbound
+	// network effect and cost on the host provider account, not read-only local
+	// access, so it must be opted in explicitly.
+	BridgeWebTools bool
+	// BridgeExtensions are explicit extension files loaded by the bridge pi
+	// process with -e, one flag per path (ALTER_BRIDGE_EXTENSIONS). Each loads
+	// only the named extension (pi-web-access) and works even while
+	// --no-extensions stays active (explicit -e paths win), so the bridge keeps
+	// its clean load and never auto-discovers the host's packages.
+	BridgeExtensions []string
+
 	// Timezone is the user's timezone for resolving time expressions.
 	// Defaults to the system timezone (time.Local).
 	Timezone string
@@ -92,6 +106,12 @@ const (
 	// defaultBridgeTools is the read-only tool allowlist for the bridge pi
 	// process; system tools (bash, edit, write) are intentionally not listed.
 	defaultBridgeTools = "read,grep,find,ls"
+	// bridgeWebTools are appended to the allowlist when BridgeWebTools is on
+	// (see §12 of docs/bridge-telegram-pi.md). They come from the pi-web-access
+	// extension and only make sense with it loaded via BridgeExtensions. This
+	// is the safe, curated subset: search + fetch (and the lookup back into
+	// stored results); source_check is intentionally excluded for M2-W.
+	bridgeWebTools = ",web_search,fetch_content,get_search_content"
 	// defaultSearchLimit caps semantic search results when ALTER_SEARCH_LIMIT
 	// is unset (0 in SearchOptions means "adapter default").
 	defaultSearchLimit = 5
@@ -120,6 +140,8 @@ func Load() Config {
 		PiBridgeEnabled:    parseBoolEnv("ALTER_PI_BRIDGE", false),
 		BridgeSessionName:  envOr("ALTER_BRIDGE_SESSION_NAME", defaultBridgeSessionName),
 		BridgeTools:        envOr("ALTER_BRIDGE_TOOLS", defaultBridgeTools),
+		BridgeWebTools:     parseBoolEnv("ALTER_BRIDGE_WEB_TOOLS", false),
+		BridgeExtensions:   parseListEnv("ALTER_BRIDGE_EXTENSIONS"),
 		BridgePromptFiles:  parseListEnv("ALTER_BRIDGE_PROMPT_FILES"),
 
 		Timezone: envOr("ALTER_TIMEZONE", ""),

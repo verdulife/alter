@@ -55,6 +55,15 @@ type Config struct {
 	// STRICT allowlist: only the listed tools stay active. Empty keeps the
 	// legacy --no-tools behavior (tools off).
 	Tools string
+	// WebTools, when true, appends the pi-web-access web tools (web_search,
+	// fetch_content, get_search_content) to the allowlist. Requires a
+	// pi-web-access extension loaded via Extensions (D-W).
+	WebTools bool
+	// Extensions are explicit extension files loaded with -e, one flag per
+	// path. They work even while --no-extensions stays active (explicit -e
+	// paths win), so the clean load is preserved and only the named extensions
+	// are pulled in.
+	Extensions []string
 	// PromptFiles are persona/system-prompt markdown files appended to the pi
 	// system prompt via --append-system-prompt, one flag per file. pi resolves
 	// each path and reads the file contents.
@@ -246,12 +255,19 @@ func (s *Session) args() []string {
 	}
 	// Clean load + persistence ON (no --no-session). The read-only tool allowlist
 	// is already active by default; M2 will extend it with deterministic tool
-	// names.
-	if s.cfg.Tools != "" {
-		args = append(args, "--tools", s.cfg.Tools)
-	} else {
-		// Legacy default for an unset allowlist: all tools off.
+	// names. Web tools (D-W) are appended to the allowlist when configured; the
+	// -e flag loads only the pi-web-access extension while --no-extensions stays
+	// active for everything else.
+	tools := s.cfg.Tools
+	if tools == "" {
+		// Legacy default for an unset allowlist: all tools off (no web access
+		// either, even if WebTools was set without an allowlist).
 		args = append(args, "--no-tools")
+	} else {
+		if s.cfg.WebTools {
+			tools += webToolsSuffix
+		}
+		args = append(args, "--tools", tools)
 	}
 	args = append(args,
 		"--no-extensions",
@@ -261,6 +277,12 @@ func (s *Session) args() []string {
 		"--no-context-files",
 		"--no-approve",
 	)
+	// Explicit -e paths still load even with --no-extensions active, so the
+	// clean load is preserved and only the named extension(s) are pulled in.
+	// Web access only works when the pi-web-access extension is listed here.
+	for _, ext := range s.cfg.Extensions {
+		args = append(args, "--extension", ext)
+	}
 	for _, file := range s.cfg.PromptFiles {
 		args = append(args, "--append-system-prompt", file)
 	}
@@ -487,3 +509,10 @@ func classify(kind domain.AgentErrorKind, err error) error {
 
 // piMaxLine is the maximum length of a single RPC line.
 const piMaxLine = 8 * 1024 * 1024
+
+// webToolsSuffix names the pi-web-access web tools appended to the allowlist
+// when Config.WebTools is set (docs/bridge-telegram-pi.md §12.4). The curated
+// subset: search + fetch + lookup into stored results; source_check is excluded
+// for M2-W. These names only exist if the pi-web-access extension is loaded via
+// Config.Extensions.
+const webToolsSuffix = ",web_search,fetch_content,get_search_content"
