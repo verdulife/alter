@@ -13,6 +13,11 @@ import (
 // only lasts ~5s on its own.
 const typingInterval = 4 * time.Second
 
+// typingTimeout caps how long the initial sendChatAction may take before the
+// handler starts: the typing bubble is cheap feedback and must never delay the
+// reply path (time-to-first-token). The keepalive re-sends typing afterwards.
+const typingTimeout = 500 * time.Millisecond
+
 // Stream is the per-message publishing seam for streaming responses. While a
 // handler generates its reply it calls Update to refresh the ephemeral message
 // draft (Bot API sendMessageDraft) with the current partial text. The inbound
@@ -72,7 +77,12 @@ func (a *Adapter) handleUpdate(ctx context.Context, u Update) {
 	chatID := u.Message.Chat.ID
 
 	// Cheap feedback while the reply is generated, before any streamed delta.
-	if err := a.client.SendChatAction(ctx, chatID, "typing"); err != nil {
+	// Capped: a slow Telegram round-trip must not delay the handler start, so
+	// the initial typing is best-effort and the keepalive covers the gap.
+	actionCtx, cancel := context.WithTimeout(ctx, typingTimeout)
+	err := a.client.SendChatAction(actionCtx, chatID, "typing")
+	cancel()
+	if err != nil && ctx.Err() == nil {
 		a.logger.Printf("telegram: sendChatAction: %v", err)
 	}
 

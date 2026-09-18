@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"testing"
+	"time"
 )
 
 var errApp = errors.New("boom")
@@ -54,6 +55,45 @@ func (r *recordingClient) SendMessageDraft(_ context.Context, _ int64, _ int, te
 
 func newTestAdapter(client APIClient, h Handler) *Adapter {
 	return NewAdapter(client, h, log.New(io.Discard, "", 0))
+}
+
+// blockingActionClient models a Telegram endpoint that never answers the cheap
+// sendChatAction call. Everything else succeeds immediately.
+type blockingActionClient struct{}
+
+func (blockingActionClient) GetUpdates(context.Context, int) ([]Update, error) { return nil, nil }
+
+func (blockingActionClient) SendMessage(context.Context, int64, string) error { return nil }
+
+func (blockingActionClient) SendMessageDraft(context.Context, int64, int, string) error {
+	return nil
+}
+
+func (blockingActionClient) SendChatAction(ctx context.Context, _ int64, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHandleUpdateCapsInitialChatActionLatency(t *testing.T) {
+	client := blockingActionClient{}
+	started := make(chan struct{})
+	adapter := newTestAdapter(client, func(context.Context, string, Stream) (string, error) {
+		close(started)
+		return "ok", nil
+	})
+
+	go adapter.handleUpdate(context.Background(), Update{
+		ID:      1,
+		Message: &Message{Chat: Chat{ID: 9}, Text: "hola"},
+	})
+
+	// The handler must start shortly after the typing timeout expires, never
+	// blocked indefinitely on the unanswered sendChatAction.
+	select {
+	case <-started:
+	case <-time.After(2 * typingTimeout):
+		t.Fatal("handler start blocked by slow sendChatAction")
+	}
 }
 
 func TestHandleUpdateRepliesToOriginatingChat(t *testing.T) {
