@@ -53,11 +53,20 @@ server local debe soportar Bot API 10.1+ para no perder Rich Messages.
 
 ## Tasks
 
-**Slice 1 (cerrado, commit `f0861e4`):** T1 + documento de feature. 412 líneas
-revisables. A partir de aquí los slices se cortan por *capacidad observable*
-(T2+T3 = salida rica; T4+T5 = entrada y archivos; T6 = proceso Pi; T7+T8 =
-tools y persona; T9+T10 = wiring y verificación), no acumulando trabajo en un
-único diff.
+**Estrategia de entrega:** el total de la fase 1 excede con holgura un diff
+revisable, así que se entrega en slices por *capacidad observable*, no por
+acumulación. Slices cerrados:
+
+| Slice | Contenido | Commit |
+|---|---|---|
+| 1 | T1 (config) + documento de feature | `f0861e4` |
+| 2 | T2 (cliente Bot API) | `544c3ba` |
+| 3 | T3 (salida rica + fallback) | siguiente |
+
+Si en algún momento se abre PR, va partido en chained PRs siguiendo
+`gentle-ai-chained-pr`: este documento y los slices 1-3 no caben en una sola
+revisión de 400 líneas. La rama `minimal` no se publica sin decisión explícita
+de Verdu.
 
 | ID | Tarea | Specs | Ruta | Commit |
 |---|---|---|---|---|
