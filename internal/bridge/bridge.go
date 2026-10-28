@@ -86,11 +86,16 @@ type Session struct {
 
 	// mu serializes prompts and lifecycle changes: only one prompt is in flight
 	// at a time, and start/restart/close never race a reader.
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	sc     *bufio.Scanner
-	stderr io.Writer
+	mu sync.Mutex
+	// cmd is the live process; nil while none is running. stdin, stdout and sc
+	// belong to it. readerDone is closed by the goroutine currently reading
+	// stdout, so killProcess can wait for the reader before reaping the child.
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     io.Closer
+	sc         *bufio.Scanner
+	readerDone chan struct{}
+	stderr     io.Writer
 }
 
 // errWriter forwards pi's stderr to the logger, which is safe for concurrent use.
@@ -139,12 +144,19 @@ func (s *Session) Prompt(ctx context.Context, text string) (string, error) {
 // assistant text each time a text_delta arrives, so callers can publish a live
 // draft. The returned text is the authoritative get_last_assistant_text value,
 // not the accumulated draft.
+//
+// A prompt pi handles without starting a run returns "" with a nil error: there
+// is no final text to publish, so the caller sends nothing rather than an empty
+// message.
 func (s *Session) PromptStream(ctx context.Context, text string, onDelta func(accumulated string)) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
-	defer cancel()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// The per-turn budget starts once the prompt owns the session. Creating it
+	// before the lock would make a prompt queued behind an in-flight one inherit
+	// an already-consumed budget and kill the healthy process it just started.
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	defer cancel()
 
 	if err := s.ensureStarted(); err != nil {
 		return "", err
@@ -209,6 +221,7 @@ func (s *Session) start() error {
 
 	s.cmd = cmd
 	s.stdin = stdin
+	s.stdout = stdout
 	s.sc = sc
 	return nil
 }
@@ -219,18 +232,45 @@ func (s *Session) restart() error {
 	return s.start()
 }
 
-// killProcess terminates the process and clears the session state. The caller
-// must hold s.mu. It also unblocks a reader waiting on a dead or hung stdout.
+// killProcess terminates the process, reaps it exactly once and clears the
+// session state. The caller must hold s.mu.
+//
+// Reaping is what releases the zombie and the parent-side pipes, so every
+// termination path (timeout, restart, Close) goes through here: a long-lived
+// daemon must not accumulate zombies or open descriptors. It also unblocks a
+// reader waiting on a dead or hung stdout.
 func (s *Session) killProcess() {
+	if s.cmd == nil {
+		return
+	}
+	// Closing stdin first releases a reader blocked writing a protocol record to
+	// a pi that stopped reading.
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
+	// Closing the read side releases a reader blocked on stdout. The reader must
+	// be gone before cmd.Wait runs: Wait closes the same pipe, so waiting first
+	// keeps the two from racing and losing buffered records.
+	if s.stdout != nil {
+		_ = s.stdout.Close()
+	}
+	if s.readerDone != nil {
+		<-s.readerDone
+	}
+	if s.cmd.Process != nil {
+		// Safe when the child already exited and was reaped: Kill then reports
+		// os.ErrProcessDone and changes nothing.
 		_ = s.cmd.Process.Kill()
 	}
+	// cmd.Wait is called once per spawned process: it reaps the child and closes
+	// the parent-side pipes.
+	_ = s.cmd.Wait()
+
 	s.cmd = nil
 	s.stdin = nil
+	s.stdout = nil
 	s.sc = nil
+	s.readerDone = nil
 }
 
 // args builds the pi CLI arguments: clean load, explicit extensions, the tool
@@ -282,15 +322,20 @@ func (s *Session) roundTrip(ctx context.Context, text string, onDelta func(strin
 	}
 	ch := make(chan result, 1)
 	sc := s.sc // pinned: a restart must never swap the scanner under the reader
+	// Publish the reader's lifetime so killProcess can wait for it before it
+	// reaps the child.
+	readerDone := make(chan struct{})
+	s.readerDone = readerDone
 	go func() {
+		defer close(readerDone)
 		st := runState{delta: onDelta}
 		for sc.Scan() {
-			done, err := s.handleLine(sc.Bytes(), &st, stdin)
+			settled, err := s.handleLine(sc.Bytes(), &st, stdin)
 			if err != nil {
 				ch <- result{err: err}
 				return
 			}
-			if done {
+			if settled {
 				ch <- result{text: st.text, handled: st.handled, err: st.err}
 				return
 			}
@@ -351,9 +396,14 @@ func (s *Session) handleLine(line []byte, st *runState, stdin io.Writer) (bool, 
 				Disposition string `json:"disposition"`
 			}
 			if err := json.Unmarshal(ev.Data, &data); err == nil && data.Disposition == "handled" {
-				// No run started: waiting for agent_settled would hang forever.
+				// No run started: waiting for agent_settled would hang forever. The
+				// run is decided with an explicitly empty text. The final text only
+				// ever comes from get_last_assistant_text, so the streamed draft is
+				// never promoted to it; handled tells PromptStream that empty means
+				// "nothing to publish" instead of an empty response error, leaving
+				// the caller free not to send a message.
 				st.handled = true
-				st.text = st.draft
+				st.text = ""
 				return true, nil
 			}
 		case "get_last_assistant_text":

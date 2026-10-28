@@ -207,28 +207,51 @@ func TestArgsUseCleanLoadToolsExtensionsAndPromptFiles(t *testing.T) {
 	s.Close()
 
 	args := spawns.argsAt(0)
-	joined := strings.Join(args, " ")
-	for _, want := range []string{
-		"--mode rpc",
-		"--no-extensions",
-		"--no-skills",
-		"--no-prompt-templates",
-		"--no-themes",
-		"--no-context-files",
-		"--no-approve",
-		"--tools read,grep,find,ls",
-		"-e /ext/tools.ts",
-		"-e /ext/extra.ts",
-		"--session-id alter-telegram",
-		"--append-system-prompt /persona.md",
-		"--append-system-prompt /formato.md",
+	if len(args) < 2 || args[0] != "--mode" || args[1] != "rpc" {
+		t.Fatalf("args must start with --mode rpc, got %v", args)
+	}
+	// Exact cardinality: a substring match cannot see a duplicated -e or
+	// --append-system-prompt, which would change the loaded set, nor a repeated
+	// --tools, which replaces the allowlist instead of extending it.
+	for _, tc := range []struct {
+		flag string
+		want int
+	}{
+		{"-e", 2},
+		{"--append-system-prompt", 2},
+		{"--tools", 1},
+		{"--session-id", 1},
+		{"--no-extensions", 1},
+		{"--no-skills", 1},
+		{"--no-prompt-templates", 1},
+		{"--no-themes", 1},
+		{"--no-context-files", 1},
+		{"--no-approve", 1},
+		{"--no-session", 0},
 	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("args missing %q: got %v", want, args)
+		if got := countFlag(args, tc.flag); got != tc.want {
+			t.Errorf("%s appears %d times, want %d: %v", tc.flag, got, tc.want, args)
 		}
 	}
-	if strings.Contains(joined, "--no-session") {
-		t.Errorf("session persistence must stay ON, but args contain --no-session: %v", args)
+	for _, tc := range []struct {
+		flag string
+		want []string
+	}{
+		{"-e", []string{"/ext/tools.ts", "/ext/extra.ts"}},
+		{"--append-system-prompt", []string{"/persona.md", "/formato.md"}},
+		{"--tools", []string{"read,grep,find,ls"}},
+		{"--session-id", []string{"alter-telegram"}},
+	} {
+		got := flagValues(args, tc.flag)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s has values %v, want %v: %v", tc.flag, got, tc.want, args)
+			continue
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s value[%d] = %q, want %q: %v", tc.flag, i, got[i], tc.want[i], args)
+			}
+		}
 	}
 }
 
@@ -313,13 +336,88 @@ func TestProcessDeathBeforeSettleIsRetriedOnce(t *testing.T) {
 	}
 }
 
+// countFlag reports how many times flag appears in args, so a test can assert
+// exact cardinality instead of mere presence.
+func countFlag(args []string, flag string) int {
+	n := 0
+	for _, arg := range args {
+		if arg == flag {
+			n++
+		}
+	}
+	return n
+}
+
+// flagValues returns the argument following each occurrence of flag, in order.
+func flagValues(args []string, flag string) []string {
+	var values []string
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			values = append(values, args[i+1])
+		}
+	}
+	return values
+}
+
+// countOpenFDs reports how many descriptors this process holds, so a test can
+// prove a session released its pipes. It skips where /proc is unavailable.
+func countOpenFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("no /proc/self/fd: %v", err)
+	}
+	return len(entries)
+}
+
+// unreapedChildren lists the children of this process that already exited but
+// were never waited for (state Z): each one is a missing cmd.Wait.
+func unreapedChildren(t *testing.T) []string {
+	t.Helper()
+	var zombies []string
+	files, _ := filepath.Glob("/proc/self/task/*/children")
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, pid := range strings.Fields(string(raw)) {
+			stat, err := os.ReadFile("/proc/" + pid + "/stat")
+			if err != nil {
+				continue
+			}
+			s := string(stat)
+			// The state sits after the parenthesised command name, which may
+			// itself contain spaces and parentheses.
+			i := strings.LastIndex(s, ")")
+			if i < 0 {
+				continue
+			}
+			if fields := strings.Fields(s[i+1:]); len(fields) > 0 && fields[0] == "Z" {
+				zombies = append(zombies, pid)
+			}
+		}
+	}
+	return zombies
+}
+
 func TestCloseTwiceIsSafe(t *testing.T) {
+	baseFDs := countOpenFDs(t)
 	s := newTestSession(t, Config{}, nil, "", "echo")
 	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
 		t.Fatalf("Prompt: %v", err)
 	}
 	s.Close()
 	s.Close()
+
+	// Idempotent shutdown must also leave nothing behind: no child waiting to be
+	// reaped and no descriptor still held by the dead process's pipes.
+	if zombies := unreapedChildren(t); len(zombies) > 0 {
+		t.Errorf("unreaped children after Close %v: cmd.Wait must run on every termination path", zombies)
+	}
+	if after := countOpenFDs(t); after > baseFDs {
+		t.Errorf("descriptors grew from %d to %d across start and Close: the pipes must be released", baseFDs, after)
+	}
 
 	never := newTestSession(t, Config{}, nil, "", "echo")
 	never.Close()

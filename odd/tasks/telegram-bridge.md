@@ -65,7 +65,7 @@ acumulación. Slices cerrados:
 | 4 | T4 (poller de entrada) | `eccfead` |
 | 5 | T5 (vault) | `1b8a6c6` |
 | 6 | T8 (persona y reglas de formato) | `cf8c6f2` |
-| 7 | T6 (sesión Pi persistente) | siguiente |
+| 7 | T6 (sesión Pi persistente) | `d8f7e0a` + fix |
 
 Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 
@@ -119,3 +119,50 @@ de anidamiento, 50 media, 20 columnas por tabla. Markdown GFM-compatible con HTM
 arbitrario. Los media blocks solo aceptan HTTP/HTTPS, así que `sendDocument`
 sigue siendo el transporte de archivos locales. **No verificado empíricamente en
 esta sesión** (sin token ni salida a Telegram): la primera prueba real es T2.
+
+**L7** (verificación independiente de T6, commit `d8f7e0a`). Tres defectos
+reproducidos con probes propios, no opiniones:
+
+1. **Sin `cmd.Wait`** → un hijo zombie y ~1,7 fds perdidos por cada timeout,
+   reinicio y `Close`. En un daemon de larga vida eso crece sin límite.
+2. **Deadline antes del mutex**: un segundo prompt encolado hereda el
+   presupuesto ya consumido por el primero y, al expirar, mata el proceso sano
+   que acaba de arrancar. Realista en T9 (el usuario manda otro mensaje
+   mientras Pi piensa).
+3. **`handled` devolvía el draft como texto final** y `text=""` con `err=nil`,
+   que el caller enviaría a Telegram como mensaje vacío.
+
+Hallazgo que condiciona T7: `--tools` **reemplaza** la selección completa de
+Pi, no la amplía. Con el fallback silencioso a `read,grep,find,ls`, olvidar
+`ALTER_BRIDGE_TOOLS` desactiva las tools de escritura sin error visible. T7
+debe añadir explícitamente `save_note,append_note,send_file,ask_options` a la
+allowlist y verificarlo.
+
+No verificado en ninguna de las dos pasadas: ninguna ejecución real de
+`pi --mode rpc` (sin red ni modelo en alcance). Todo el protocolo se apoya en
+los docs instalados y en un fake RPC.
+
+## Contrato de tools (T7)
+
+El bridge levanta un servidor HTTP en `127.0.0.1:0` con un token efímero por
+proceso. La extensión de Pi recibe la URL por `ALTER_TOOLS_URL` y el token por
+`ALTER_TOOLS_TOKEN`, y registra cuatro tools con `pi.registerTool`.
+
+| Tool | Args | Efecto |
+|---|---|---|
+| `save_note` | `{title, body, folder?, tags?}` | `vault.SaveNote`; devuelve la ruta relativa |
+| `append_note` | `{note, line}` | `vault.AppendLine` |
+| `send_file` | `{path, caption?}` | `sendDocument`/`sendPhoto` al chat dueño |
+| `ask_options` | `{question, options: 2..4}` | envía botones `callback_data` y espera la pulsación |
+
+Reglas:
+
+- Toda ruta se resuelve contra el vault y se rechaza si escapa del root.
+- El servidor exige el token en `X-Alter-Token`; sin él responde 403. Evita que
+  cualquier proceso local use las tools del bridge.
+- Error de negocio → 4xx con `{"error": "..."}`; la tool devuelve ese texto al
+  modelo para que lo explique al usuario, sin reintentar a ciegas.
+- `ask_options` espera como máximo 10 minutos y se cancela con el contexto del
+  turno. Sin respuesta, devuelve "sin respuesta" en vez de colgar el turno.
+- Las cuatro tools deben estar en `ALTER_BRIDGE_TOOLS`: `--tools` reemplaza la
+  selección completa de Pi, no la amplía (hallazgo de L7).
