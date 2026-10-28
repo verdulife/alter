@@ -19,14 +19,47 @@ import (
 
 // Telegram wire types (the subset of the Bot API the adapter needs).
 type Update struct {
-	ID      int      `json:"update_id"`
-	Message *Message `json:"message"`
+	ID            int            `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
 }
 
 type Message struct {
-	MessageID int    `json:"message_id"`
-	Chat      Chat   `json:"chat"`
-	Text      string `json:"text"`
+	MessageID int         `json:"message_id"`
+	Chat      Chat        `json:"chat"`
+	Text      string      `json:"text"`
+	Caption   string      `json:"caption"`
+	Document  *Document   `json:"document"`
+	Photo     []PhotoSize `json:"photo"`
+}
+
+// Document is an inbound file attachment.
+type Document struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+// PhotoSize is one resolution of an inbound photo; the last entry is the
+// largest and is the one worth downloading.
+type PhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
+// CallbackQuery is an inline-button press, carrying the opaque data the bridge
+// attached when it rendered the button.
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	Data    string   `json:"data"`
+	From    *User    `json:"from"`
+	Message *Message `json:"message"`
+}
+
+type User struct {
+	ID int64 `json:"id"`
 }
 
 type Chat struct {
@@ -102,6 +135,14 @@ func (c *Client) call(ctx context.Context, method string, payload map[string]any
 	}
 	defer resp.Body.Close()
 
+	return decodeEnvelope(resp, method, out)
+}
+
+// decodeEnvelope validates the {ok, result} envelope shared by every Bot API
+// method and decodes result into out when provided. A non-ok envelope becomes an
+// *APIError so callers can react to the Telegram reason (for example degrading
+// a rich message to classic HTML) instead of parsing strings.
+func decodeEnvelope(resp *http.Response, method string, out any) error {
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -109,6 +150,7 @@ func (c *Client) call(ctx context.Context, method string, payload map[string]any
 
 	var envelope struct {
 		OK          bool            `json:"ok"`
+		ErrorCode   int             `json:"error_code"`
 		Description string          `json:"description"`
 		Result      json.RawMessage `json:"result"`
 	}
@@ -116,7 +158,7 @@ func (c *Client) call(ctx context.Context, method string, payload map[string]any
 		return fmt.Errorf("telegram: decode response: %w", err)
 	}
 	if !envelope.OK {
-		return fmt.Errorf("telegram: %s failed: %s", method, envelope.Description)
+		return &APIError{Method: method, Code: envelope.ErrorCode, Description: envelope.Description}
 	}
 	if out != nil && len(envelope.Result) > 0 {
 		if err := json.Unmarshal(envelope.Result, out); err != nil {
