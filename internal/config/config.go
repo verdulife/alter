@@ -2,7 +2,9 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -45,6 +47,36 @@ type Config struct {
 	// PiSystemPrompt is an optional extra system prompt appended via --append-system-prompt.
 	PiSystemPrompt string
 
+	// TelegramAPIBase is the Bot API base URL, without a trailing slash.
+	// Defaults to the public cloud API. Setting it to a self-hosted
+	// telegram-bot-api server (e.g. http://127.0.0.1:8081) unlocks uploads up to
+	// 2000 MB, downloads without a limit and file:// uploads, with no code change.
+	TelegramAPIBase string
+
+	// VaultDir is the global notes vault served to Pi as its working directory.
+	// Defaults to $HOME/vault. It is data, never a boot dependency: a missing
+	// directory is created lazily on first write.
+	VaultDir string
+
+	// BridgeEnabled opts the runtime into the Telegram <-> Pi bridge as the only
+	// free-text entry path.
+	BridgeEnabled bool
+	// BridgeSessionID is the Pi session resumed across messages, so the
+	// conversation keeps its thread. Defaults to "telegram".
+	BridgeSessionID string
+	// BridgeTools is the Pi tool allowlist passed via --tools. Pi never gets
+	// bash/edit/write: the vault is read with read/grep/find/ls and mutated only
+	// through deterministic extension tools.
+	BridgeTools string
+	// BridgePromptFiles are markdown files appended to the system prompt via
+	// --append-system-prompt, in order.
+	BridgePromptFiles []string
+	// BridgeExtensions are explicit extension entry points loaded with -e. They
+	// coexist with --no-extensions (discovery off, explicit paths still load).
+	BridgeExtensions []string
+	// BridgeTimeout bounds one full bridge turn (spawn + model + tools + reply).
+	BridgeTimeout time.Duration
+
 	// Timezone is the user's timezone for resolving time expressions.
 	// Defaults to the system timezone (time.Local).
 	Timezone string
@@ -67,6 +99,11 @@ const (
 	// defaultSearchLimit caps semantic search results when ALTER_SEARCH_LIMIT
 	// is unset (0 in SearchOptions means "adapter default").
 	defaultSearchLimit = 5
+
+	defaultTelegramAPIBase = "https://api.telegram.org"
+	defaultBridgeSessionID = "telegram"
+	defaultBridgeTools     = "read,grep,find,ls"
+	defaultBridgeTimeout   = 120 * time.Second
 )
 
 // Load returns the application configuration from environment variables
@@ -89,6 +126,16 @@ func Load() Config {
 		PiNoTools:      parseBoolEnv("ALTER_PI_NO_TOOLS", true),
 		PiSystemPrompt: envOr("ALTER_PI_SYSTEM_PROMPT", ""),
 
+		TelegramAPIBase: normalizeBaseURL(envOr("ALTER_TELEGRAM_API_BASE", defaultTelegramAPIBase)),
+		VaultDir:        envOr("ALTER_VAULT_DIR", defaultVaultDir()),
+
+		BridgeEnabled:     parseBoolEnv("ALTER_BRIDGE_ENABLED", false),
+		BridgeSessionID:   envOr("ALTER_BRIDGE_SESSION_ID", defaultBridgeSessionID),
+		BridgeTools:       envOr("ALTER_BRIDGE_TOOLS", defaultBridgeTools),
+		BridgePromptFiles: splitListEnv("ALTER_BRIDGE_PROMPT_FILES"),
+		BridgeExtensions:  splitListEnv("ALTER_BRIDGE_EXTENSIONS"),
+		BridgeTimeout:     parseDurationEnv("ALTER_BRIDGE_TIMEOUT", defaultBridgeTimeout),
+
 		Timezone: envOr("ALTER_TIMEZONE", ""),
 
 		// Semantic search: off by default; provider/URL optional and unused until
@@ -98,6 +145,44 @@ func Load() Config {
 		EmbeddingURL:      envOr("ALTER_EMBEDDING_URL", ""),
 		SearchLimit:       parseIntEnv("ALTER_SEARCH_LIMIT", defaultSearchLimit),
 	}
+}
+
+// normalizeBaseURL removes trailing slashes so path joins stay predictable and
+// the self-hosted Bot API server (http://host:port) works the same as the cloud
+// API. An empty value falls back to the public API.
+func normalizeBaseURL(v string) string {
+	v = strings.TrimRight(strings.TrimSpace(v), "/")
+	if v == "" {
+		return defaultTelegramAPIBase
+	}
+	return v
+}
+
+// defaultVaultDir returns $HOME/vault, which is where this server keeps its
+// notes. It is a default only: ALTER_VAULT_DIR always wins.
+func defaultVaultDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "vault"
+	}
+	return filepath.Join(home, "vault")
+}
+
+// splitListEnv parses a semicolon-separated list, trimming whitespace and
+// dropping empty entries. An unset variable yields nil.
+func splitListEnv(key string) []string {
+	raw := os.Getenv(key)
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // envOr returns the environment variable value or a default when empty.
