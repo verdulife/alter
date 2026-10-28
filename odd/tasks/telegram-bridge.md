@@ -61,7 +61,10 @@ acumulación. Slices cerrados:
 |---|---|---|
 | 1 | T1 (config) + documento de feature | `f0861e4` |
 | 2 | T2 (cliente Bot API) | `544c3ba` |
-| 3 | T3 (salida rica + fallback) | siguiente |
+| 3 | T3 (salida rica + fallback) | `379bce0` |
+| 4 | T4 (poller de entrada) | `eccfead` |
+
+Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 
 Si en algún momento se abre PR, va partido en chained PRs siguiendo
 `gentle-ai-chained-pr`: este documento y los slices 1-3 no caben en una sola
