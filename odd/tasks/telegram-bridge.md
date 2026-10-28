@@ -64,7 +64,8 @@ acumulación. Slices cerrados:
 | 3 | T3 (salida rica + fallback) | `379bce0` |
 | 4 | T4 (poller de entrada) | `eccfead` |
 | 5 | T5 (vault) | `1b8a6c6` |
-| 6 | T8 (persona y reglas de formato) | siguiente |
+| 6 | T8 (persona y reglas de formato) | `cf8c6f2` |
+| 7 | T6 (sesión Pi persistente) | siguiente |
 
 Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 
