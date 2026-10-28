@@ -1,5 +1,6 @@
 # Binaries
 /alter
+/bin/
 *.exe
 
 # SQLite databases
@@ -7,6 +8,7 @@
 *.db-journal
 *.db-wal
 *.db-shm
+*.db.backup-*
 
 # IDE
 .vscode/
@@ -24,3 +26,6 @@ Thumbs.db
 # Local Pi runtime state
 .atl/
 undefined/
+
+# Local CodeGraph index (machine-specific)
+.codegraph/
