@@ -63,6 +63,7 @@ acumulación. Slices cerrados:
 | 2 | T2 (cliente Bot API) | `544c3ba` |
 | 3 | T3 (salida rica + fallback) | `379bce0` |
 | 4 | T4 (poller de entrada) | `eccfead` |
+| 5 | T5 (vault) | siguiente |
 
 Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 
