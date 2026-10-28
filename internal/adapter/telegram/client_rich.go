@@ -53,7 +53,7 @@ func NewClientWithBase(token, baseURL string) *Client {
 func (c *Client) SendRich(ctx context.Context, chatID int64, markdown string) (Message, error) {
 	var msg Message
 	err := c.call(ctx, "sendRichMessage", map[string]any{
-		"chat_id":       chatID,
+		"chat_id":      chatID,
 		"rich_message": inputRichMessage{Markdown: markdown},
 	}, &msg)
 	return msg, err
@@ -64,8 +64,8 @@ func (c *Client) SendRich(ctx context.Context, chatID int64, markdown string) (M
 // SendRich/SendMessage call.
 func (c *Client) SendRichDraft(ctx context.Context, chatID int64, draftID int, markdown string) error {
 	return c.call(ctx, "sendRichMessageDraft", map[string]any{
-		"chat_id":       chatID,
-		"draft_id":      draftID,
+		"chat_id":      chatID,
+		"draft_id":     draftID,
 		"rich_message": inputRichMessage{Markdown: markdown},
 	}, nil)
 }

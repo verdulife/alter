@@ -15,11 +15,19 @@ contenido de código (diffs, ficheros, salidas de herramientas) no se reenvía
 como tal salvo que forme parte de la respuesta redactada.
 
 **S3 — Mensajes ricos.** Texto con formato (negrita, cursiva, código inline,
-citas, listas, enlaces), **markdown**, **tablas**, **preguntas** y **opciones**
+listas, citas, enlaces), **markdown**, **tablas**, **preguntas** y **opciones**
 seleccionables. Debe sentirse como una terminal con Pi, no como un chat plano.
+Se implementa con **Bot API Rich Messages** (10.1+): `sendRichMessage` acepta el
+markdown de Pi tal cual (GFM-compatible: títulos, listas, task lists, tablas
+nativas, blockquotes, footnotes, fórmulas, `<details>`), con 32768 caracteres y
+500 bloques por mensaje, y opciones como `<tg-button type="callback_data">`. El
+HTML clásico (`parse_mode: HTML`, 4096 caracteres por trozo) queda como
+**fallback** cuando Telegram rechaza el rich message.
 
 **S4 — Archivos en ambos sentidos.** El dueño puede enviar archivos por Telegram
-y Pi recibirlos; Pi puede enviar archivos al dueño.
+y Pi recibirlos; Pi puede enviar archivos al dueño. Los bloques de media de un
+rich message admiten **solo HTTP/HTTPS**, así que los archivos del vault viajan
+por `sendDocument`/`sendPhoto` en multipart, no como bloque de media.
 
 **S5 — Enlaces en ambos sentidos.** El dueño puede enviar enlaces; Pi puede
 enviar enlaces con preview.
@@ -36,24 +44,30 @@ y entradas de enlace como `- [título](url) — metadata`.
 las tools nativas de solo lectura (`read`, `grep`, `find`, `ls`) ejecutando con
 `cwd` = vault, y **toda escritura pasa por tools deterministas** expuestas por el
 bridge (`save_note`, `append_note`, `send_file`, `ask_options`).
-
 **S8 — Bot API server propio diferido.** La base URL de Telegram es
 configurable (`ALTER_TELEGRAM_API_BASE`, default `https://api.telegram.org`) para
 poder migrar al Bot API server local (`--local`: subida 2000 MB, descarga sin
 límite, `file://`) sin tocar código. El límite de la API cloud (50 MB subida,
-20 MB descarga) se acepta en esta fase.
+20 MB descarga) se acepta en esta fase. Requisito para la migración futura: el
+server local debe soportar Bot API 10.1+ para no perder Rich Messages.
 
 ## Tasks
+
+**Slice 1 (cerrado, commit `f0861e4`):** T1 + documento de feature. 412 líneas
+revisables. A partir de aquí los slices se cortan por *capacidad observable*
+(T2+T3 = salida rica; T4+T5 = entrada y archivos; T6 = proceso Pi; T7+T8 =
+tools y persona; T9+T10 = wiring y verificación), no acumulando trabajo en un
+único diff.
 
 | ID | Tarea | Specs | Ruta | Commit |
 |---|---|---|---|---|
 | T1 | Config: `ALTER_TELEGRAM_API_BASE`, `ALTER_VAULT_DIR`, `ALTER_BRIDGE_*`, carga de `.env` | S1,S6,S8 | inline | — |
-| T2 | Cliente Bot API: sendMessage HTML, sendDocument por ruta, sendPhoto, getFile+descarga, sendChatAction, sendMessageDraft, inline keyboards, answerCallbackQuery | S3,S4,S5,S8 | inline | — |
-| T3 | Render markdown→HTML de Telegram, tablas→`<pre>`, troceo a 4096 sin romper bloques ni entidades | S2,S3 | inline | — |
+| T2 | Cliente Bot API: `sendRichMessage`, `sendRichMessageDraft`, `sendMessage` HTML (fallback), `sendDocument` por ruta, `sendPhoto`, `getFile`+descarga, `sendChatAction`, `answerCallbackQuery` | S3,S4,S5,S8 | inline | — |
+| T3 | Salida rica: markdown directo a `sendRichMessage`, validación de límites (32768 chars / 500 bloques / 20 columnas) con degradación a HTML clásico + troceo a 4096 | S2,S3 | inline | — |
 | T4 | Poll loop: texto, documento, foto (con caption), `callback_query`; un único chat dueño | S3,S4 | inline | — |
 | T5 | Vault: guardado de adjuntos entrantes en `inbox/`, notas markdown con frontmatter, nombres seguros, límites de tamaño | S4,S6 | inline | — |
 | T6 | Bridge Pi: proceso persistente `pi --mode rpc`, sesión nombrada, streaming por drafts, timeout y recuperación | S1 | inline | — |
-| T7 | Extensión de tools para Pi: `save_note`, `append_note`, `send_file`, `ask_options` (keyboard + espera de callback) | S3,S4,S6,S7 | inline | — |
+| T7 | Extensión de tools para Pi: `save_note`, `append_note`, `send_file`, `ask_options` (botones `callback_data` en el rich message + espera de callback) | S3,S4,S6,S7 | inline | — |
 | T8 | Persona/prompt de sistema adaptado a fase 1 con reglas de formato y de opciones | S2,S3 | inline | — |
 | T9 | Wiring en `cmd/alter`: bridge como única ruta de texto libre; retirar AgentFlow de la entrada | S1 | inline | — |
 | T10 | Verificación: unitarios (render/chunking, cliente con httptest, vault con tmpdir, bridge con RPC falso) + end-to-end con Telegram falso | S1-S8 | inline | — |
@@ -80,3 +94,13 @@ descubrimiento pero **las rutas explícitas `-e` siguen cargando**; existe
 `--no-builtin-tools` para dejar solo tools de extensión; `--session-id` crea o
 reanuda una sesión concreta. Esto resuelve la discrepancia §11 del design record
 de `bridge` y habilita la carga limpia con extensión propia.
+
+**L6** (decisión de formato): preguntado por la nueva API de rich messages, se
+confirma como camino principal sobre el plan inicial de markdown→HTML. Evidencia
+documental: Bot API 10.1 (2026-06-11) añade Rich Messages, `sendRichMessage` y
+`sendRichMessageDraft`; 10.2 (2026-07-14) añade media y bloques de input; 10.3
+añade tablas nativas. Límites: 32768 caracteres UTF-8, 500 bloques, 16 niveles
+de anidamiento, 50 media, 20 columnas por tabla. Markdown GFM-compatible con HTML
+arbitrario. Los media blocks solo aceptan HTTP/HTTPS, así que `sendDocument`
+sigue siendo el transporte de archivos locales. **No verificado empíricamente en
+esta sesión** (sin token ni salida a Telegram): la primera prueba real es T2.

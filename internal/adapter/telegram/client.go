@@ -44,9 +44,9 @@ type Document struct {
 // PhotoSize is one resolution of an inbound photo; the last entry is the
 // largest and is the one worth downloading.
 type PhotoSize struct {
-	FileID   string `json:"file_id"`
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
+	FileID string `json:"file_id"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
 }
 
 // CallbackQuery is an inline-button press, carrying the opaque data the bridge

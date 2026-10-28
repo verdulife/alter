@@ -1,6 +1,10 @@
 package telegram
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -39,7 +43,9 @@ func TestRichFitsRejectsOversizedPayloads(t *testing.T) {
 func TestMarkdownToHTMLEscapesAndFormats(t *testing.T) {
 	got := MarkdownToHTML("# Título\n\n**negrita** y *cursiva* y `codigo`\n\n[enlace](https://t.me/?a=1&b=2)\n\n<script>alert(1)</script>")
 	for _, want := range []string{
-		"<h1>Título</h1>",
+		// Classic Telegram HTML has no heading tags: bold is the closest legal
+		// rendering, so # lines become <b>.
+		"<b>Título</b>",
 		"<b>negrita</b>",
 		"<i>cursiva</i>",
 		"<code>codigo</code>",
@@ -91,5 +97,43 @@ func TestSplitMarkdownBreaksUnbreakableLine(t *testing.T) {
 	}
 	if strings.Join(chunks, "") != long {
 		t.Error("splitting an unbreakable line lost content")
+	}
+}
+
+// TestSendFormattedFallsBackToHTML pins the degradation contract: when Telegram
+// rejects the rich message, the same content is delivered as classic HTML split
+// into legal message sizes instead of failing the turn.
+func TestSendFormattedFallsBackToHTML(t *testing.T) {
+	bodies := map[string]string{}
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		body, _ := io.ReadAll(r.Body)
+		bodies[r.URL.Path] = string(body)
+		if strings.HasSuffix(r.URL.Path, "/sendRichMessage") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"ok":false,"error_code":400,"description":"Bad Request: can't parse rich message"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":7}}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClientWithBase("TOKEN", srv.URL)
+	if err := c.SendFormatted(context.Background(), 7, "**hola**"); err != nil {
+		t.Fatalf("SendFormatted: %v", err)
+	}
+
+	if len(paths) != 2 {
+		t.Fatalf("paths = %v, want [sendRichMessage sendMessage]", paths)
+	}
+	if !strings.HasSuffix(paths[0], "/sendRichMessage") || !strings.HasSuffix(paths[1], "/sendMessage") {
+		t.Fatalf("paths = %v, want rich first then HTML fallback", paths)
+	}
+	html := bodies["/botTOKEN/sendMessage"]
+	// encoding/json escapes '<' as \u003c on the wire, so the literal is compared
+	// in its encoded form.
+	if !strings.Contains(html, `\u003cb\u003ehola\u003c/b\u003e`) {
+		t.Errorf("fallback body = %s, want escaped HTML bold", html)
 	}
 }
