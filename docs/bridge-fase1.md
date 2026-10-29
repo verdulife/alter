@@ -133,15 +133,16 @@ Ambos se cargan siempre de forma explícita con `-e` y `--append-system-prompt`,
 
 ## Permisos y ámbito (T11)
 
-El bridge **no** recorta a Pi. Arranca con `--mode rpc`, `--no-approve` (las
-aprobaciones por botones llegan en T13), las rutas `-e` del bridge, la sesión
-nombrada y los `--append-system-prompt`; todo lo demás lo decide Pi con tu
-configuración global. `--tools` solo aparece si configuras `ALTER_BRIDGE_TOOLS` a
-mano.
+El bridge **no** recorta a Pi. Arranca con `--mode rpc`, las rutas `-e` del
+bridge, la sesión nombrada y los `--append-system-prompt`; todo lo demás lo decide
+Pi con tu configuración global. `--tools` solo aparece si configuras
+`ALTER_BRIDGE_TOOLS` a mano. **No** se pasa `--no-approve`: las confirmaciones se
+responden por botones.
 
 Las consecuencias son las que declara `docs/alter-limites.md`: con `bash` y `write`
-en `$HOME`, un mensaje puede tocar cualquier cosa tuya. Mientras T13 no exista, la
-frontera es el token del bot y tu chat ID, no una allowlist.
+en `$HOME`, un mensaje puede tocar cualquier cosa tuya. La frontera real es el gate
+de aprobación (todo `bash`, `write` y `edit` pide botón) más el token del bot y tu
+chat ID.
 
 ## Qué está verificado y qué no
 
@@ -156,10 +157,15 @@ frontera es el token del bot y tu chat ID, no una allowlist.
 - Bridge completo contra un RPC falso: drafts, entrega final, línea humana cuando
   Pi no devuelve texto, reintento tras un `getUpdates` fallido, y orden de
   apagado (poller → tools → sesión).
-- Ámbito del bridge (T11): los argumentos no llevan ningún `--no-*` salvo
-  `--no-approve`, un `ALTER_BRIDGE_TOOLS` vacío **no** emite `--tools`, el `cwd`
-  del hijo es `ALTER_BRIDGE_WORKDIR` (nunca el vault) y el defecto de timeout es
-  300 s.
+- Ámbito del bridge (T11): los argumentos no llevan ningún `--no-*`, un
+  `ALTER_BRIDGE_TOOLS` vacío **no** emite `--tools`, el `cwd` del hijo es
+  `ALTER_BRIDGE_WORKDIR` (nunca el vault) y el defecto de timeout es 300 s.
+- Aprobaciones (T13): un diálogo `confirm` llega al bridge y se convierte en dos
+  botones; un `select` en una lista de botones; `input`/`editor` se cancelan con
+  traza. Sin respuesta, error o cancelación: `cancelled`, nunca permitido.
+  `ask_options` y las aprobaciones comparten un único hueco pendiente. Los turnos
+  corren fuera del bucle de polling, porque un bucle bloqueado dentro de un turno
+  no podría recibir la pulsación que lo desbloquea.
 - Archivos entrantes: descarga única, guardado en `inbox/`, rechazo por tamaño
   declarado (sin descargar) y por tamaño real (durante el stream), y que un fallo
   de descarga no tumba el canal.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/verdu/alter/internal/adapter/telegram"
+	"github.com/verdu/alter/internal/bridge"
 	"github.com/verdu/alter/internal/config"
 )
 
@@ -88,6 +90,9 @@ func runFakePiScenario(scenario string) {
 	in.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	emit := func(line string) { _, _ = io.WriteString(os.Stdout, line+"\n") }
 
+	// dialogReply keeps the extension_ui_response the bridge wrote back in the
+	// dialog scenarios, so the final text reports exactly what Pi received.
+	var dialogReply string
 	for in.Scan() {
 		var cmd struct {
 			Type string `json:"type"`
@@ -97,6 +102,10 @@ func runFakePiScenario(scenario string) {
 			continue
 		}
 		switch cmd.Type {
+		case "extension_ui_response":
+			// The dialog was answered: the run settles and reports the record.
+			dialogReply = string(in.Bytes())
+			emit(`{"type":"agent_settled"}`)
 		case "prompt":
 			if scenario == "handled" {
 				// Pi consumed the prompt without starting a run: no text follows.
@@ -106,17 +115,30 @@ func runFakePiScenario(scenario string) {
 			}
 			emit(`{"type":"response","command":"prompt","success":true,"id":"` + cmd.ID +
 				`","data":{"disposition":"started"}}`)
-			if scenario == "stream" {
+			switch scenario {
+			case "dialog-confirm", "dialog-select", "dialog-input":
+				// One blocking dialog: the run only settles once the bridge answers
+				// it, exactly like Pi. The message carries markup characters on
+				// purpose, so the question the owner receives proves the escaping.
+				emit(dialogRequestLine(scenario))
+			case "stream":
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hola "}}`)
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"desde Pi"}}`)
+				emit(`{"type":"agent_settled"}`)
+			default:
+				emit(`{"type":"agent_settled"}`)
 			}
-			emit(`{"type":"agent_settled"}`)
 		case "get_last_assistant_text":
 			// The empty scenario settles with no text at all: the chat must get
 			// a human error line instead of an empty message.
 			text := ""
-			if scenario == "stream" {
+			switch scenario {
+			case "stream":
 				text = "Hola desde Pi, **con markdown**"
+			default:
+				if strings.HasPrefix(scenario, "dialog-") {
+					text = dialogReply
+				}
 			}
 			encoded, err := json.Marshal(text)
 			if err != nil {
@@ -125,6 +147,24 @@ func runFakePiScenario(scenario string) {
 			emit(`{"type":"response","command":"get_last_assistant_text","success":true,"id":"` + cmd.ID +
 				`","data":{"text":` + string(encoded) + `}}`)
 		}
+	}
+}
+
+// dialogRequestLine renders the RPC record the fake Pi emits for the dialog
+// method of the scenario under test.
+func dialogRequestLine(scenario string) string {
+	switch scenario {
+	case "dialog-select":
+		return `{"type":"extension_ui_request","id":"ui-dialog","method":"select",` +
+			`"title":"¿Qué hago con el enlace?","options":["guardar","descartar"]}`
+	case "dialog-input":
+		return `{"type":"extension_ui_request","id":"ui-dialog","method":"input",` +
+			`"title":"Escribe un nombre","placeholder":"nombre"}`
+	default:
+		// The `confirm` dialog is what the extension asks before a destructive
+		// tool: the title names the tool and the message carries its arguments.
+		return `{"type":"extension_ui_request","id":"ui-dialog","method":"confirm",` +
+			`"title":"¿Ejecutar bash?","message":"{\"command\":\"echo <b>hola</b>&& ls\"}"}`
 	}
 }
 
@@ -910,4 +950,310 @@ func equalStages(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// dialogHarness is one running wiring under test whose log is captured, so a test
+// can assert what the owner sees and what the bridge explained in the log.
+type dialogHarness struct {
+	runtime *bridgeRuntime
+	bot     *fakeAskBot
+	spawns  *argsRecorder
+	logs    *bytes.Buffer
+	cancel  context.CancelFunc
+	finish  chan struct{}
+	runErr  error
+}
+
+// startDialogBridge composes and runs the real wiring against the ask fake, so a
+// dialog started by Pi travels the whole route: reader → broker → Telegram →
+// poller → child. A non-positive timeout keeps the 20 s used by the other slice
+// tests; a short one drives the fail-closed path.
+func startDialogBridge(t *testing.T, scenario string, timeout time.Duration) *dialogHarness {
+	t.Helper()
+
+	bot, srv := newFakeAskBot(t)
+	spawns := &argsRecorder{}
+	logs := &bytes.Buffer{}
+	t.Setenv(envFakePiScenario, scenario)
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+
+	cfg := config.Config{
+		TelegramToken:   testBotToken,
+		TelegramChatID:  testOwnerID,
+		TelegramAPIBase: srv.URL,
+		VaultDir:        t.TempDir(),
+		BridgeSessionID: "dialog-session",
+		BridgeTimeout:   timeout,
+		PiBin:           "pi",
+	}
+
+	rt, err := newBridgeRuntime(cfg, log.New(logs, "", 0),
+		withBridgeCommandFactory(fakePiFactory(spawns)))
+	if err != nil {
+		t.Fatalf("newBridgeRuntime: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &dialogHarness{runtime: rt, bot: bot, spawns: spawns, logs: logs, cancel: cancel, finish: make(chan struct{})}
+	go func() {
+		h.runErr = rt.Run(ctx)
+		close(h.finish)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-h.finish:
+		case <-time.After(20 * time.Second):
+		}
+	})
+	return h
+}
+
+// rich returns every rich message the chat received, in order.
+func (h *dialogHarness) rich() []string {
+	finals, _, _, _ := h.bot.snapshot()
+	return finals
+}
+
+// waitRich blocks until the chat received at least want rich messages.
+func (h *dialogHarness) waitRich(t *testing.T, want int) []string {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := h.rich(); len(got) >= want {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d rich messages, got %v; log: %s", want, h.rich(), h.logs.String())
+	return nil
+}
+
+// sendText pushes one owner message, which starts a turn.
+func (h *dialogHarness) sendText(updateID, messageID int, text string) {
+	pushUpdates(h.bot.fakeBot, telegram.Update{
+		ID: updateID,
+		Message: &telegram.Message{
+			MessageID: messageID,
+			Chat:      telegram.Chat{ID: testOwnerID},
+			Text:      text,
+		},
+	})
+}
+
+// stop cancels the runtime and returns the error Run finished with.
+func (h *dialogHarness) stop(t *testing.T) error {
+	t.Helper()
+	h.cancel()
+	select {
+	case <-h.finish:
+		return h.runErr
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+		return nil
+	}
+}
+
+// decodeDialogAnswer reads the record the child received back from the reply the
+// fake Pi produced: its final text is exactly the extension_ui_response line.
+func decodeDialogAnswer(t *testing.T, markdown string) map[string]any {
+	t.Helper()
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(markdown), &resp); err != nil {
+		t.Fatalf("reply %q is not the dialog record Pi received: %v", markdown, err)
+	}
+	return resp
+}
+
+// TestBridgeConfirmDialogBecomesApprovalButtons drives the whole approval route:
+// Pi asks `confirm` before a destructive tool, the bridge posts the question with
+// exactly two buttons and the press is what Pi receives. Both answers are pinned,
+// because a rejection that reaches Pi as an approval would defeat the gate.
+func TestBridgeConfirmDialogBecomesApprovalButtons(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		press         int
+		wantConfirmed bool
+	}{
+		{name: "aprobar", press: 0, wantConfirmed: true},
+		{name: "rechazar", press: 1, wantConfirmed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startDialogBridge(t, "dialog-confirm", 0)
+			h.sendText(1, 1, "borra el log")
+
+			question := h.waitRich(t, 1)[0]
+			if !strings.Contains(question, "¿Ejecutar bash?") {
+				t.Errorf("question %q does not name the tool", question)
+			}
+			// The arguments are shown, escaped and truncated: the owner must see
+			// what will run, and the model's text must never become markup.
+			if !strings.Contains(question, "echo &lt;b&gt;hola&lt;/b&gt;&amp;&amp; ls") {
+				t.Errorf("question %q does not carry the escaped arguments", question)
+			}
+			if strings.Contains(question, "<b>") {
+				t.Errorf("question %q carries unescaped markup from the tool arguments", question)
+			}
+			if !strings.Contains(question, ">Aprobar<") || !strings.Contains(question, ">Rechazar<") {
+				t.Errorf("question %q does not carry exactly the two approval buttons", question)
+			}
+
+			datas := askButtonData(t, question)
+			if len(datas) != 2 {
+				t.Fatalf("buttons = %d (%v), want exactly two", len(datas), datas)
+			}
+			for _, data := range datas {
+				if len(data) > askMaxCallbackBytes {
+					t.Errorf("payload %q is %d bytes, over Telegram's %d limit", data, len(data), askMaxCallbackBytes)
+				}
+				for _, secret := range []string{"bash", "Aprobar", "echo"} {
+					if strings.Contains(data, secret) {
+						t.Errorf("payload %q leaks %q: the button data must stay opaque", data, secret)
+					}
+				}
+			}
+
+			pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-dialog", datas[tc.press]))
+			reply := h.waitRich(t, 2)[1]
+			resp := decodeDialogAnswer(t, reply)
+			if resp["type"] != "extension_ui_response" || resp["id"] != "ui-dialog" {
+				t.Errorf("Pi received %v, want an extension_ui_response for ui-dialog", resp)
+			}
+			if resp["confirmed"] != tc.wantConfirmed {
+				t.Errorf("Pi received confirmed=%v after pressing %v, want %v", resp["confirmed"], tc.name, tc.wantConfirmed)
+			}
+			if _, cancelled := resp["cancelled"]; cancelled {
+				t.Errorf("Pi received %v, want the owner's answer, not a cancellation", resp)
+			}
+			if acks := h.bot.acknowledgements(); len(acks) != 1 || acks[0] != "cb-dialog" {
+				t.Errorf("acknowledged = %v, want [cb-dialog]", acks)
+			}
+
+			// T13 also removes --no-approve: Pi must keep its project-file trust
+			// check, and approvals are the bridge's job now.
+			args := h.spawns.first()
+			if args == nil {
+				t.Fatal("pi was never spawned")
+			}
+			for _, arg := range args {
+				if arg == "--no-approve" {
+					t.Errorf("args still carry --no-approve: %v", args)
+				}
+			}
+
+			if err := h.stop(t); !errors.Is(err, context.Canceled) {
+				t.Errorf("Run returned %v, want context.Canceled", err)
+			}
+		})
+	}
+}
+
+// TestBridgeSelectDialogBecomesAButtonList turns a `select` dialog into one button
+// per option and returns the chosen option as the value Pi expects.
+func TestBridgeSelectDialogBecomesAButtonList(t *testing.T) {
+	h := startDialogBridge(t, "dialog-select", 0)
+	h.sendText(1, 1, "mira el enlace")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "¿Qué hago con el enlace?") {
+		t.Errorf("question %q does not carry the dialog title", question)
+	}
+	datas := askButtonData(t, question)
+	if len(datas) != 2 {
+		t.Fatalf("buttons = %d (%v), want one per option", len(datas), datas)
+	}
+	if !strings.Contains(question, ">guardar<") || !strings.Contains(question, ">descartar<") {
+		t.Errorf("question %q does not render the option labels", question)
+	}
+
+	pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-select", datas[1]))
+	reply := h.waitRich(t, 2)[1]
+	resp := decodeDialogAnswer(t, reply)
+	if resp["value"] != "descartar" {
+		t.Errorf("Pi received %v, want value descartar", resp)
+	}
+	if _, ok := resp["confirmed"]; ok {
+		t.Errorf("Pi received %v, want a value answer for select", resp)
+	}
+}
+
+// TestBridgeFreeTextDialogIsCancelled proves input/editor are dismissed with
+// cancelled instead of inventing an answer, and that the bridge says why in the
+// log. A free-text answer is out of scope for this task, so the only safe answer
+// is none.
+func TestBridgeFreeTextDialogIsCancelled(t *testing.T) {
+	h := startDialogBridge(t, "dialog-input", 0)
+	h.sendText(1, 1, "pregunta lo que sea")
+
+	rich := h.waitRich(t, 1)
+	reply := rich[len(rich)-1]
+	resp := decodeDialogAnswer(t, reply)
+	if resp["cancelled"] != true {
+		t.Errorf("Pi received %v, want cancelled:true", resp)
+	}
+	if _, ok := resp["value"]; ok {
+		t.Errorf("Pi received %v, want no value: the bridge must not answer for the owner", resp)
+	}
+	// No question was posted: a free-text prompt would need a text reply the
+	// bridge cannot collect.
+	if len(rich) != 1 {
+		t.Errorf("chat received %v, want only the final reply", rich)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "free text") || !strings.Contains(logs, "ui-dialog") {
+		t.Errorf("log %q does not explain the cancelled free-text dialog", logs)
+	}
+}
+
+// TestBridgeApprovalWithoutAnswerBlocksTheTurn is the fail-closed case at the
+// wiring level: nobody presses the buttons, the turn deadline fires, and the tool
+// is never approved. The chat gets the human error line instead of a silent yes.
+func TestBridgeApprovalWithoutAnswerBlocksTheTurn(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm", 400*time.Millisecond)
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q was not posted with the approval buttons", question)
+	}
+
+	rich := h.waitRich(t, 2)
+	if rich[1] != bridgeErrorReply {
+		t.Errorf("second delivery = %q, want the human error line %q: an unanswered approval blocks the turn", rich[1], bridgeErrorReply)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "approval") {
+		t.Errorf("log %q does not report the unanswered approval", logs)
+	}
+}
+
+// TestDialogQuestionEscapesAndTruncates pins the rendering of the question text
+// itself: markup from the tool arguments is escaped, and a long command is cut so
+// one approval cannot fill the chat.
+func TestDialogQuestionEscapesAndTruncates(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	long := strings.Repeat("a", 4000) + "<tg-button>x</tg-button>"
+	question := r.dialogQuestion(bridge.DialogRequest{
+		Method:  "confirm",
+		Title:   "¿Ejecutar bash?",
+		Message: long,
+	})
+	if !strings.Contains(question, "¿Ejecutar bash?") {
+		t.Errorf("question %q does not carry the title", question)
+	}
+	if strings.Contains(question, "<tg-button>") {
+		t.Errorf("question %q lets tool arguments inject markup", question)
+	}
+	if !strings.HasSuffix(question, "…") {
+		t.Errorf("question %q does not mark the truncated arguments", question)
+	}
+	if got, limit := len([]rune(question)), bridgeDialogTitleLimit+bridgeDialogMessageLimit+4; got > limit {
+		t.Errorf("question is %d runes, want at most %d", got, limit)
+	}
+
+	short := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Title: "¿Ejecutar edit?", Message: "a && b"})
+	if !strings.Contains(short, "a &amp;&amp; b") {
+		t.Errorf("question %q does not escape the ampersand", short)
+	}
 }

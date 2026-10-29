@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/verdu/alter/internal/adapter/telegram"
@@ -40,6 +41,12 @@ const (
 	// must always answer something the owner can act on.
 	bridgeEmptyReply = "Pi no devolvió ningún texto. Prueba a reformular el mensaje."
 	bridgeErrorReply = "No pude terminar la respuesta. Inténtalo de nuevo en un momento."
+
+	// bridgeDialogTitleLimit and bridgeDialogMessageLimit bound how much of a Pi
+	// dialog reaches the chat. An approval must show what will run, but one long
+	// command cannot be allowed to fill the conversation.
+	bridgeDialogTitleLimit   = 120
+	bridgeDialogMessageLimit = 280
 )
 
 // The two variables that configure the files Pi needs. They appear in the
@@ -132,9 +139,18 @@ type bridgeRuntime struct {
 	// check and the store so both enforce the same number.
 	inboundMax int64
 
-	// asks is the single pending ask_options question. Button presses reach it
-	// through handleEvent and never reach Pi as text.
+	// asks is the single pending question: an ask_options question or a tool
+	// approval. Button presses reach it through handleEvent and never reach Pi as
+	// text.
 	asks *bridgeAskBroker
+
+	// turnMu keeps one turn's typing, drafts and replies from interleaving with
+	// another's: the Pi session already serializes prompts, but the chat would
+	// still see two halves of two answers.
+	turnMu sync.Mutex
+	// turns tracks the turn goroutines started by the poller, so teardown can wait
+	// for them before it takes the session and the tools server away.
+	turns sync.WaitGroup
 
 	chatID   int64
 	toolsURL string
@@ -248,6 +264,9 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		// cwd = the owner's directory ($HOME by default), never the vault.
 		WorkDir: cfg.WorkDir,
 		Env:     env,
+		// T13: every blocking dialog Pi raises is answered here, by the owner's
+		// button press or with a cancellation.
+		OnDialog: r.onDialog,
 	}, sessionOpts...)
 
 	r.client = client
@@ -265,6 +284,10 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 // outlive the endpoint its tools call, and the poller must not outlive either.
 func (r *bridgeRuntime) Run(ctx context.Context) error {
 	err := r.poller.Run(ctx)
+	// A turn started by the poll loop may still be running: it must finish (or be
+	// cancelled with the same context) before the session and the tools server it
+	// uses disappear.
+	r.turns.Wait()
 	r.teardown("poller")
 
 	if cerr := r.tools.Close(); cerr != nil {
@@ -289,9 +312,10 @@ func (r *bridgeRuntime) teardown(stage string) {
 }
 
 // handleEvent dispatches one inbound event. Text and inbound files (S4) run the
-// same turn pipeline; a button press only settles the pending ask_options
-// question, so it is answered here and deliberately never handed to Pi: a
-// press is not free text and must not become a prompt (S1).
+// same turn pipeline; a button press only settles the pending question (an
+// ask_options question or a tool approval), so it is answered here and
+// deliberately never handed to Pi: a press is not free text and must not become
+// a prompt (S1).
 func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) error {
 	chatID := ev.ChatID
 	if chatID == 0 {
@@ -310,15 +334,88 @@ func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) erro
 	return nil
 }
 
-// handleText runs one text turn through the shared turn pipeline.
+// onDialog answers one blocking UI dialog Pi raised. confirm becomes the approval
+// prompt with two buttons, select becomes one button per option, and input/editor
+// are dismissed with cancelled: a free-text answer would need a reply the bridge
+// cannot collect, and guessing one would defeat the gate (T13).
+func (r *bridgeRuntime) onDialog(ctx context.Context, req bridge.DialogRequest) (bridge.DialogResponse, error) {
+	switch req.Method {
+	case "confirm":
+		approved, err := r.asks.Approve(ctx, r.dialogQuestion(req))
+		if err != nil {
+			return bridge.DialogResponse{}, err
+		}
+		return bridge.DialogResponse{Confirmed: approved}, nil
+
+	case "select":
+		if len(req.Options) < 2 || len(req.Options) > 4 {
+			// The broker posts between 2 and 4 buttons: a one-choice question has
+			// nothing to press and a longer list would silently drop options, so
+			// the honest answer is a cancellation.
+			return bridge.DialogResponse{}, fmt.Errorf("select offers %d options; the bridge can ask between 2 and 4", len(req.Options))
+		}
+		choice, err := r.asks.AskOptions(ctx, r.dialogQuestion(req), req.Options)
+		if err != nil {
+			return bridge.DialogResponse{}, err
+		}
+		return bridge.DialogResponse{Value: choice}, nil
+
+	default: // input, editor
+		r.logger.Printf("bridge: %s dialog %q needs a free text answer, which the bridge cannot ask for; cancelling it",
+			req.Method, req.ID)
+		return bridge.DialogResponse{Cancelled: true}, nil
+	}
+}
+
+// dialogQuestion renders a dialog's title and message as the text of the button
+// prompt. The text is escaped and truncated because it carries model-controlled
+// arguments (the command about to run): markup from a tool call must never become
+// buttons or formatting in the owner's chat.
+func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = "Aprobación"
+	}
+
+	var out strings.Builder
+	out.WriteString(escapeAskText(truncateAskText(title, bridgeDialogTitleLimit)))
+	if message := strings.TrimSpace(req.Message); message != "" {
+		out.WriteString("\n\n")
+		out.WriteString(escapeAskText(truncateAskText(message, bridgeDialogMessageLimit)))
+	}
+	return out.String()
+}
+
+// handleText starts one text turn through the shared turn pipeline.
 func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text string) error {
 	return r.runTurn(ctx, chatID, text)
 }
 
-// runTurn runs one prompt: typing feedback, throttled streamed drafts, then the
+// runTurn starts one prompt: typing feedback, throttled streamed drafts, then the
 // final markdown. A failed or empty turn still answers the chat with a short
 // human line, never an empty message and never silence.
+//
+// The turn runs on its own goroutine because the poll loop must keep receiving
+// while Pi works: an approval button, an ask_options press and the next message
+// all arrive there, and a poll loop blocked inside a turn would leave the owner
+// pressing buttons nobody reads. turnMu keeps the turns themselves serialized.
 func (r *bridgeRuntime) runTurn(ctx context.Context, chatID int64, prompt string) error {
+	r.turns.Add(1)
+	go func() {
+		defer r.turns.Done()
+		r.turnMu.Lock()
+		defer r.turnMu.Unlock()
+		if err := r.promptTurn(ctx, chatID, prompt); err != nil {
+			// The poller no longer waits for this turn, so its failure is logged
+			// here instead of travelling back to the poll loop.
+			r.logger.Printf("bridge: turn: %v", err)
+		}
+	}()
+	return nil
+}
+
+// promptTurn is the body of one turn.
+func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt string) error {
 	if err := r.client.SendChatAction(ctx, chatID, bridgeTypingAction); err != nil {
 		// Cosmetic only: the typing indicator must never fail a turn.
 		r.logger.Printf("bridge: chat action: %v", err)

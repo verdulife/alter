@@ -2,13 +2,16 @@ package bridge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +134,9 @@ func runFakePi(scenario string) {
 	emit := func(line string) { _, _ = io.WriteString(os.Stdout, line+"\n") }
 
 	var lastPrompt string
+	// dialogReply keeps the extension_ui_response the client wrote back in the
+	// dialog scenario, so the final text can report exactly what arrived.
+	var dialogReply string
 	for in.Scan() {
 		var cmd struct {
 			Type    string `json:"type"`
@@ -141,11 +147,21 @@ func runFakePi(scenario string) {
 			continue
 		}
 		switch cmd.Type {
+		case "extension_ui_response":
+			// A dialog was answered: the run can settle and report the record.
+			dialogReply = string(in.Bytes())
+			emit(`{"type":"agent_settled"}`)
 		case "prompt":
 			lastPrompt = cmd.Message
 			accepted := `{"type":"response","command":"prompt","success":true,"id":"` + cmd.ID + `"` +
 				`,"data":{"disposition":"started"}}`
 			switch scenario {
+			case "dialog":
+				// One blocking confirm dialog: the run only settles once the
+				// client answers it, exactly like Pi.
+				emit(accepted)
+				emit(`{"type":"extension_ui_request","id":"ui-1","method":"confirm",` +
+					`"title":"¿Ejecutar bash?","message":"rm -rf /tmp/prueba"}`)
 			case "handled":
 				emit(`{"type":"response","command":"prompt","success":true,"id":"` + cmd.ID +
 					`","data":{"disposition":"handled"}}`)
@@ -168,10 +184,14 @@ func runFakePi(scenario string) {
 			}
 		case "get_last_assistant_text":
 			text := lastPrompt
-			if scenario == "stream" {
+			switch scenario {
+			case "stream":
 				// Differs from the accumulated draft on purpose: the final text
 				// must come from this authoritative response.
 				text = "Hola mundo (autoritativo)"
+			case "dialog":
+				// The child reports the dialog record it actually received.
+				text = dialogReply
 			}
 			encoded, err := json.Marshal(text)
 			if err != nil {
@@ -208,10 +228,10 @@ func TestPromptStreamAccumulatesDeltasAndReturnsAuthoritativeText(t *testing.T) 
 	}
 }
 
-// TestArgsLoadGlobalConfigWithExplicitAssets pins T11: Pi starts with the same
-// global configuration it loads in a terminal. Discovery stays enabled (no
-// --no-* switch except --no-approve, which T13 replaces), while the bridge assets
-// stay additive through -e and --append-system-prompt.
+// TestArgsLoadGlobalConfigWithExplicitAssets pins T11 and T13: Pi starts with the
+// same global configuration it loads in a terminal, with no --no-* switch left and
+// no --no-approve either (the bridge answers approvals itself now), while the
+// bridge assets stay additive through -e and --append-system-prompt.
 func TestArgsLoadGlobalConfigWithExplicitAssets(t *testing.T) {
 	spawns := &fakeSpawns{}
 	s := newTestSession(t, Config{
@@ -241,7 +261,9 @@ func TestArgsLoadGlobalConfigWithExplicitAssets(t *testing.T) {
 		{"--append-system-prompt", 2},
 		{"--tools", 1},
 		{"--session-id", 1},
-		{"--no-approve", 1},
+		// T13: approvals are the bridge's job now, so project-file trust is no
+		// longer disabled behind the owner's back.
+		{"--no-approve", 0},
 		{"--no-session", 0},
 		// The global load must stay on: each of these disables a piece of it.
 		{"--no-extensions", 0},
@@ -556,6 +578,233 @@ func TestConcurrentPromptsAreSerialized(t *testing.T) {
 // TestEmptyToolsOmitsTheToolsFlag pins T11: an empty Config.Tools means "no
 // restriction", so --tools is not passed at all and Pi keeps its own full
 // selection. A silent read-only fallback is exactly what T11 removes.
+// dialogRecord is the RPC record Pi emits for one blocking dialog request.
+func dialogRecord(t *testing.T, id, method string, extra map[string]any) []byte {
+	t.Helper()
+	record := map[string]any{"type": "extension_ui_request", "id": id, "method": method}
+	for key, value := range extra {
+		record[key] = value
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("encode dialog record: %v", err)
+	}
+	return raw
+}
+
+// answerDialog drives one extension_ui_request through the reader with the given
+// configuration and returns the record the bridge wrote back to Pi.
+func answerDialog(t *testing.T, cfg Config, ctx context.Context, line []byte) (map[string]any, error) {
+	t.Helper()
+	s := NewSession(cfg)
+	defer s.Close()
+
+	out := &bytes.Buffer{}
+	settled, err := s.handleLine(ctx, line, &runState{}, out)
+	if settled {
+		t.Fatal("handleLine reported the run settled for a dialog request")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if out.Len() == 0 {
+		t.Fatal("the bridge wrote nothing back to Pi: a dialog would hang the extension forever")
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("bridge wrote %q, want one JSON record: %v", out.String(), err)
+	}
+	return resp, nil
+}
+
+// TestDialogRequestReachesTheCallbackAndItsAnswerReturnsToPi proves the reader
+// hands the whole request to Config.OnDialog and writes the answer back instead
+// of dismissing the dialog blindly.
+func TestDialogRequestReachesTheCallbackAndItsAnswerReturnsToPi(t *testing.T) {
+	var got []DialogRequest
+	cfg := Config{OnDialog: func(_ context.Context, req DialogRequest) (DialogResponse, error) {
+		got = append(got, req)
+		return DialogResponse{Confirmed: true}, nil
+	}}
+
+	line := dialogRecord(t, "ui-1", "confirm", map[string]any{
+		"title":   "¿Ejecutar bash?",
+		"message": "rm -rf /tmp/prueba",
+	})
+	resp, err := answerDialog(t, cfg, context.Background(), line)
+	if err != nil {
+		t.Fatalf("handleLine: %v", err)
+	}
+
+	want := DialogRequest{ID: "ui-1", Method: "confirm", Title: "¿Ejecutar bash?", Message: "rm -rf /tmp/prueba"}
+	if len(got) != 1 {
+		t.Fatalf("OnDialog calls = %d, want exactly one", len(got))
+	}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Errorf("OnDialog got %+v, want %+v", got[0], want)
+	}
+
+	if resp["type"] != "extension_ui_response" || resp["id"] != "ui-1" {
+		t.Errorf("response = %v, want an extension_ui_response for ui-1", resp)
+	}
+	if resp["confirmed"] != true {
+		t.Errorf("response = %v, want confirmed:true", resp)
+	}
+	if _, cancelled := resp["cancelled"]; cancelled {
+		t.Errorf("response = %v, want the real answer, not a cancellation", resp)
+	}
+}
+
+// TestDialogSelectAnswerReturnsTheChosenValue pins the select shape: the value
+// Pi expects instead of a boolean, and the options carried through untouched.
+func TestDialogSelectAnswerReturnsTheChosenValue(t *testing.T) {
+	var got []DialogRequest
+	cfg := Config{OnDialog: func(_ context.Context, req DialogRequest) (DialogResponse, error) {
+		got = append(got, req)
+		return DialogResponse{Value: "segunda"}, nil
+	}}
+
+	line := dialogRecord(t, "ui-2", "select", map[string]any{
+		"title":   "¿Cuál?",
+		"options": []string{"primera", "segunda"},
+	})
+	resp, err := answerDialog(t, cfg, context.Background(), line)
+	if err != nil {
+		t.Fatalf("handleLine: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("OnDialog calls = %d, want exactly one", len(got))
+	}
+	if !reflect.DeepEqual(got[0].Options, []string{"primera", "segunda"}) {
+		t.Errorf("options = %v, want the two Pi offered", got[0].Options)
+	}
+	if resp["value"] != "segunda" {
+		t.Errorf("response = %v, want value \"segunda\"", resp)
+	}
+	if _, cancelled := resp["cancelled"]; cancelled {
+		t.Errorf("response = %v, want the chosen value, not a cancellation", resp)
+	}
+}
+
+// TestDialogFailsClosed covers every path that must end in cancelled:true. None
+// of them may write a value or a confirmation: an unanswered dialog is a denial.
+func TestDialogFailsClosed(t *testing.T) {
+	errHandler := errors.New("approval: no answer")
+	line := dialogRecord(t, "ui-3", "confirm", map[string]any{
+		"title":   "¿Ejecutar bash?",
+		"message": "rm -rf /tmp/prueba",
+	})
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		ctx  context.Context
+	}{
+		{
+			name: "callback error",
+			cfg: Config{OnDialog: func(context.Context, DialogRequest) (DialogResponse, error) {
+				return DialogResponse{}, errHandler
+			}},
+			ctx: context.Background(),
+		},
+		{
+			name: "expired turn",
+			// The callback claims approval, but the turn is over: a late yes
+			// must never authorise anything.
+			cfg: Config{OnDialog: func(context.Context, DialogRequest) (DialogResponse, error) {
+				return DialogResponse{Confirmed: true}, nil
+			}},
+			ctx: expired,
+		},
+		{
+			name: "callback cancels",
+			cfg: Config{OnDialog: func(context.Context, DialogRequest) (DialogResponse, error) {
+				return DialogResponse{Cancelled: true}, nil
+			}},
+			ctx: context.Background(),
+		},
+		{
+			name: "no callback configured",
+			cfg:  Config{},
+			ctx:  context.Background(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := answerDialog(t, tc.cfg, tc.ctx, line)
+			if err != nil {
+				t.Fatalf("handleLine: %v, want a cancelled answer instead of a hard failure", err)
+			}
+			if resp["cancelled"] != true {
+				t.Errorf("response = %v, want cancelled:true", resp)
+			}
+			if _, ok := resp["confirmed"]; ok {
+				t.Errorf("response = %v, want no confirmed field on a cancellation", resp)
+			}
+			if _, ok := resp["value"]; ok {
+				t.Errorf("response = %v, want no value field on a cancellation", resp)
+			}
+			if resp["id"] != "ui-3" {
+				t.Errorf("response = %v, want the request id echoed", resp)
+			}
+		})
+	}
+}
+
+// TestDialogIgnoresFireAndForgetRequests keeps the reader quiet for the methods
+// that expect no answer: writing a response would be a protocol error.
+func TestDialogIgnoresFireAndForgetRequests(t *testing.T) {
+	for _, method := range []string{"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"} {
+		t.Run(method, func(t *testing.T) {
+			s := NewSession(Config{OnDialog: func(context.Context, DialogRequest) (DialogResponse, error) {
+				t.Errorf("OnDialog was called for the fire-and-forget method %q", method)
+				return DialogResponse{}, nil
+			}})
+			defer s.Close()
+
+			out := &bytes.Buffer{}
+			line := dialogRecord(t, "ui-4", method, map[string]any{"message": "trabajando"})
+			if _, err := s.handleLine(context.Background(), line, &runState{}, out); err != nil {
+				t.Fatalf("handleLine: %v", err)
+			}
+			if out.Len() != 0 {
+				t.Errorf("bridge wrote %q for %q, want nothing: fire-and-forget requests take no answer", out.String(), method)
+			}
+		})
+	}
+}
+
+// TestDialogAnswerReachesTheChildProcess proves the write-back end to end: the
+// fake pi only settles after it receives the response, and it reports the record
+// it got, so a silently dropped answer fails the test.
+func TestDialogAnswerReachesTheChildProcess(t *testing.T) {
+	s := newTestSession(t, Config{OnDialog: func(_ context.Context, req DialogRequest) (DialogResponse, error) {
+		if req.ID != "ui-1" || req.Method != "confirm" {
+			t.Errorf("OnDialog got %+v, want the confirm request ui-1", req)
+		}
+		return DialogResponse{Confirmed: true}, nil
+	}}, nil, "", "dialog")
+	defer s.Close()
+
+	text, err := s.Prompt(context.Background(), "aprueba")
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("final text = %q, want the dialog record the child received: %v", text, err)
+	}
+	if resp["type"] != "extension_ui_response" || resp["id"] != "ui-1" {
+		t.Errorf("child received %v, want an extension_ui_response for ui-1", resp)
+	}
+	if resp["confirmed"] != true {
+		t.Errorf("child received %v, want confirmed:true", resp)
+	}
+}
+
 func TestEmptyToolsOmitsTheToolsFlag(t *testing.T) {
 	spawns := &fakeSpawns{}
 	s := newTestSession(t, Config{WorkDir: t.TempDir()}, spawns, "", "echo")

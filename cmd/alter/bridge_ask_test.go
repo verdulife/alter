@@ -108,6 +108,36 @@ type askOutcome struct {
 	err    error
 }
 
+// approvalOutcome is what one Approve call returned.
+type approvalOutcome struct {
+	approved bool
+	err      error
+}
+
+// startApprove runs one approval in the background so the test can press a
+// button while the broker waits.
+func startApprove(ctx context.Context, broker *bridgeAskBroker, question string) chan approvalOutcome {
+	out := make(chan approvalOutcome, 1)
+	go func() {
+		approved, err := broker.Approve(ctx, question)
+		out <- approvalOutcome{approved: approved, err: err}
+	}()
+	return out
+}
+
+// waitApprove returns the approval outcome, failing the test when it never
+// settles.
+func waitApprove(t *testing.T, out chan approvalOutcome) approvalOutcome {
+	t.Helper()
+	select {
+	case got := <-out:
+		return got
+	case <-time.After(20 * time.Second):
+		t.Fatal("Approve never returned")
+		return approvalOutcome{}
+	}
+}
+
 // startAsk runs one ask in the background so the test can press a button while
 // the broker waits.
 func startAsk(ctx context.Context, broker *bridgeAskBroker, question string, options []string) chan askOutcome {
@@ -162,6 +192,175 @@ func randomAskID(t *testing.T) string {
 		t.Fatalf("random id: %v", err)
 	}
 	return hex.EncodeToString(buf)
+}
+
+// TestApprovePostsTwoButtonsAndResolvesThePress pins the approval prompt: one
+// message, exactly two buttons, an opaque payload and a boolean outcome that
+// only the press decides.
+func TestApprovePostsTwoButtonsAndResolvesThePress(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		press     int
+		approved  bool
+		wantLabel string
+	}{
+		{name: "aprobar", press: 0, approved: true, wantLabel: "Aprobar"},
+		{name: "rechazar", press: 1, approved: false, wantLabel: "Rechazar"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newRecordingAskTransport()
+			broker := newTestAskBroker(t, tr)
+
+			out := startApprove(context.Background(), broker, "¿Ejecutar bash? rm -rf /tmp/x")
+			messages := tr.waitMessages(t, 1)
+			if len(messages) != 1 {
+				t.Fatalf("prompts posted = %d, want exactly one", len(messages))
+			}
+			markdown := messages[0]
+			if !strings.Contains(markdown, "¿Ejecutar bash?") {
+				t.Errorf("prompt %q does not carry the question", markdown)
+			}
+			if !strings.Contains(markdown, ">Aprobar<") || !strings.Contains(markdown, ">Rechazar<") {
+				t.Errorf("prompt %q does not carry the two approval buttons", markdown)
+			}
+
+			datas := askButtonData(t, markdown)
+			if len(datas) != 2 {
+				t.Fatalf("buttons = %d (%v), want exactly two", len(datas), datas)
+			}
+			var questionID string
+			for i, data := range datas {
+				id, index, ok := parseAskCallback(data)
+				if !ok {
+					t.Fatalf("button %d payload %q is not a callback this bridge can read", i, data)
+				}
+				if index != i {
+					t.Errorf("button %d payload %q carries index %d", i, data, index)
+				}
+				if questionID == "" {
+					questionID = id
+				} else if id != questionID {
+					t.Errorf("button %d payload %q belongs to another question", i, data)
+				}
+				if len(data) > askMaxCallbackBytes {
+					t.Errorf("payload %q is %d bytes, over Telegram's %d limit", data, len(data), askMaxCallbackBytes)
+				}
+				// The payload stays opaque: no question text, no command, no path.
+				for _, secret := range []string{"Aprobar", "Rechazar", "bash", "/tmp"} {
+					if strings.Contains(data, secret) {
+						t.Errorf("payload %q leaks %q", data, secret)
+					}
+				}
+			}
+
+			broker.Resolve(context.Background(), callbackEvent("cb-app", datas[tc.press]))
+			got := waitApprove(t, out)
+			if got.err != nil {
+				t.Fatalf("Approve returned %v, want the press to decide", got.err)
+			}
+			if got.approved != tc.approved {
+				t.Errorf("approved = %v after pressing %q, want %v", got.approved, tc.wantLabel, tc.approved)
+			}
+			if acks := tr.acknowledgements(); len(acks) != 1 || acks[0] != "cb-app" {
+				t.Errorf("acknowledged = %v, want [cb-app] so the button spinner stops", acks)
+			}
+		})
+	}
+}
+
+// TestApproveTimeoutFailsClosed proves an unanswered approval is never a silent
+// yes: it returns an error and frees the slot so the next question can be asked.
+func TestApproveTimeoutFailsClosed(t *testing.T) {
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	approved, err := broker.Approve(ctx, "¿Ejecutar write?")
+	if err == nil {
+		t.Fatal("Approve returned no error after the deadline: an unanswered approval must fail closed")
+	}
+	if !errors.Is(err, errApprovalNoAnswer) {
+		t.Errorf("Approve error = %v, want errApprovalNoAnswer", err)
+	}
+	if approved {
+		t.Error("approved = true with no press: fail-closed forbids it")
+	}
+
+	// The slot is free again: the next approval reaches its own deadline instead
+	// of failing with the busy error.
+	short, cancelShort := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancelShort()
+	if _, err := broker.Approve(short, "¿Ejecutar otra vez?"); !errors.Is(err, errApprovalNoAnswer) {
+		t.Errorf("second Approve error = %v, want errApprovalNoAnswer: the slot must be free", err)
+	}
+}
+
+// TestApproveSharesTheSinglePendingSlot documents the chosen design: approvals
+// and ask_options questions share one slot, because the limits doc allows the
+// owner exactly one pending question. A second caller fails closed instead of
+// queueing behind a question the owner may never answer.
+func TestApproveSharesTheSinglePendingSlot(t *testing.T) {
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	approval := startApprove(context.Background(), broker, "¿Ejecutar bash?")
+	datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+	if _, err := broker.AskOptions(context.Background(), "¿Otra cosa?", []string{"sí", "no"}); !errors.Is(err, errAskBusy) {
+		t.Errorf("AskOptions error = %v, want errAskBusy while an approval waits", err)
+	}
+	if approved, err := broker.Approve(context.Background(), "¿Otra aprobación?"); err == nil || approved {
+		t.Errorf("Approve = (%v, %v), want a fail-closed error while an approval waits", approved, err)
+	}
+	if n := len(tr.messages()); n != 1 {
+		t.Errorf("prompts posted = %d, want only the first: a refused prompt must not reach the chat", n)
+	}
+
+	// The press still decides the live approval, and the slot is free afterwards.
+	broker.Resolve(context.Background(), callbackEvent("cb-1", datas[1]))
+	if got := waitApprove(t, approval); got.err != nil || got.approved {
+		t.Errorf("Approve = (%v, %v), want a rejection", got.approved, got.err)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if _, err := broker.AskOptions(short, "¿Ahora sí?", []string{"sí", "no"}); !errors.Is(err, tools.ErrNoAnswer) {
+		t.Errorf("AskOptions error = %v, want tools.ErrNoAnswer: the slot must be free again", err)
+	}
+}
+
+// TestApproveUndeliverablePromptFailsClosed proves an approval that cannot reach
+// the chat never becomes an approval: no buttons means no yes.
+func TestApproveUndeliverablePromptFailsClosed(t *testing.T) {
+	tr := newRecordingAskTransport()
+	tr.sendErr = errors.New("telegram: sendRichMessage failed: too many requests")
+	broker := newTestAskBroker(t, tr)
+
+	approved, err := broker.Approve(context.Background(), "¿Ejecutar edit?")
+	if err == nil {
+		t.Fatal("Approve returned no error for an undeliverable prompt")
+	}
+	if approved {
+		t.Error("approved = true although the prompt never reached the chat")
+	}
+	if acks := tr.acknowledgements(); len(acks) != 0 {
+		t.Errorf("acknowledged = %v, want none: no press happened", acks)
+	}
+}
+
+// TestApproveNeedsAQuestion keeps an empty prompt from posting a button pair with
+// nothing to explain.
+func TestApproveNeedsAQuestion(t *testing.T) {
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	if _, err := broker.Approve(context.Background(), "   "); err == nil {
+		t.Fatal("Approve accepted an empty question")
+	}
+	if n := len(tr.messages()); n != 0 {
+		t.Errorf("prompts posted = %d, want none", n)
+	}
 }
 
 // TestAskOptionsPostsOneMessageWithOneButtonPerOption pins the shape of the
@@ -654,6 +853,40 @@ func TestAskOptionsSendFailureIsReported(t *testing.T) {
 	}
 	if acks := tr.acknowledgements(); len(acks) != 0 {
 		t.Errorf("acknowledged = %v, want none: no press happened", acks)
+	}
+}
+
+// TestAskOptionsKeepsItsErrorText pins the ask_options errors that T13 refactored
+// into the shared ask helper. The text the model already received must not change
+// just because an approval now shares the code.
+func TestAskOptionsKeepsItsErrorText(t *testing.T) {
+	tr := newRecordingAskTransport()
+	tr.sendErr = errors.New("telegram: sendRichMessage failed")
+	broker := newTestAskBroker(t, tr)
+
+	_, err := broker.AskOptions(context.Background(), "¿Cuál?", []string{"uno", "dos"})
+	if err == nil {
+		t.Fatal("AskOptions returned no error for an undeliverable question")
+	}
+	if !strings.HasPrefix(err.Error(), "ask_options: send question: ") {
+		t.Errorf("AskOptions error = %q, want the ask_options send-failure text", err)
+	}
+	if !strings.Contains(err.Error(), "telegram: sendRichMessage failed") {
+		t.Errorf("error %q does not carry the cause", err)
+	}
+
+	// The two outcomes the tools server distinguishes keep their identity.
+	tr.mu.Lock()
+	tr.sendErr = nil
+	tr.mu.Unlock()
+	busy := startAsk(context.Background(), broker, "¿Primera?", []string{"uno", "dos"})
+	tr.waitMessages(t, 1)
+	if _, err := broker.AskOptions(context.Background(), "¿Segunda?", []string{"tres", "cuatro"}); !errors.Is(err, errAskBusy) {
+		t.Errorf("second ask error = %q, want errAskBusy itself, not a wrapped error", err)
+	}
+	broker.Resolve(context.Background(), callbackEvent("cb-1", askButtonData(t, tr.messages()[0])[1]))
+	if got := waitAsk(t, busy); got.err != nil || got.answer != "dos" {
+		t.Errorf("answer = %q (err %v), want dos", got.answer, got.err)
 	}
 }
 

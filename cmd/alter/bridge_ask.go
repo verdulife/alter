@@ -47,6 +47,19 @@ const (
 // clear error it can explain instead.
 var errAskBusy = errors.New("another question is already waiting for the owner")
 
+// errApprovalNoAnswer reports that an approval prompt expired without a press.
+// It is returned as an error on purpose: an approval has no "sin respuesta"
+// result, because silence must block the action instead of being reported as a
+// normal outcome the model can talk its way around.
+var errApprovalNoAnswer = errors.New("approval: the owner did not answer, so the action is blocked")
+
+// approvalOptions are the only two answers to an approval prompt, in index
+// order: Aprobar is 0 and Rechazar is 1.
+var approvalOptions = []string{"Aprobar", "Rechazar"}
+
+// approvalIndexAllow is the button index that approves.
+const approvalIndexAllow = 0
+
 // bridgeAskTransport is the Bot API surface the broker needs: one rich message
 // to carry the buttons and one acknowledgement to stop the client spinner.
 type bridgeAskTransport interface {
@@ -55,9 +68,10 @@ type bridgeAskTransport interface {
 }
 
 // bridgeAskBroker implements tools.OptionAsker over the owner chat. It holds at
-// most one pending question: AskOptions posts it and waits, Resolve settles it
-// when the poller reports a button press, and every other exit (deadline,
-// cancellation) removes the entry so a later question can never inherit it.
+// most one pending question — an ask_options question or an approval, never
+// both: AskOptions and Approve post it and wait, Resolve settles it when the
+// poller reports a button press, and every other exit (deadline, cancellation)
+// removes the entry so a later question can never inherit it.
 type bridgeAskBroker struct {
 	client bridgeAskTransport
 	chatID int64
@@ -95,16 +109,58 @@ func (b *bridgeAskBroker) AskOptions(ctx context.Context, question string, optio
 		return "", fmt.Errorf("ask_options needs between 2 and 4 options, got %d", len(options))
 	}
 
+	index, err := b.ask(ctx, question, options)
+	if err != nil {
+		if errors.Is(err, errAskBusy) || errors.Is(err, tools.ErrNoAnswer) {
+			return "", err
+		}
+		return "", fmt.Errorf("ask_options: %w", err)
+	}
+	return options[index], nil
+}
+
+// Approve asks the owner to approve one destructive action and reports whether it
+// may run. It is the fail-closed counterpart of AskOptions: a deadline, a
+// cancelled turn, an undeliverable prompt or a busy slot all return an error and
+// never a false "approved".
+//
+// It deliberately shares the one pending-question slot with ask_options instead
+// of adding a parallel one: the product limit is exactly one pending question
+// (docs/alter-limites.md), and two live prompts would make the owner's press
+// ambiguous. A second caller therefore fails closed with errAskBusy.
+func (b *bridgeAskBroker) Approve(ctx context.Context, question string) (bool, error) {
+	if strings.TrimSpace(question) == "" {
+		return false, errors.New("approve needs a question")
+	}
+
+	index, err := b.ask(ctx, question, approvalOptions)
+	if err != nil {
+		switch {
+		case errors.Is(err, tools.ErrNoAnswer):
+			return false, errApprovalNoAnswer
+		case errors.Is(err, errAskBusy):
+			return false, err
+		default:
+			return false, fmt.Errorf("approval: %w", err)
+		}
+	}
+	return index == approvalIndexAllow, nil
+}
+
+// ask posts one question with one button per option and waits for the press. It
+// owns the single pending slot: whoever ends the wait — press, deadline or
+// cancellation — the slot is free again, so a later question can never inherit it.
+func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []string) (int, error) {
 	id, err := newAskID()
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	p := &bridgePendingAsk{id: id, options: len(options), reply: make(chan int, 1)}
 
 	b.mu.Lock()
 	if b.pending != nil {
 		b.mu.Unlock()
-		return "", errAskBusy
+		return 0, errAskBusy
 	}
 	b.pending = p
 	b.mu.Unlock()
@@ -114,19 +170,19 @@ func (b *bridgeAskBroker) AskOptions(ctx context.Context, question string, optio
 	defer b.release(p)
 
 	if _, err := b.client.SendRich(ctx, b.chatID, askMarkdown(question, options, id)); err != nil {
-		// No buttons means no press: fail loudly so the model can tell the owner
-		// instead of silently waiting for an answer that cannot come.
-		return "", fmt.Errorf("ask_options: send question: %w", err)
+		// No buttons means no press: fail loudly so the caller can block the action
+		// instead of waiting for an answer that cannot come.
+		return 0, fmt.Errorf("send question: %w", err)
 	}
 
 	select {
 	case index := <-p.reply:
 		if index < 0 || index >= len(options) {
-			return "", fmt.Errorf("ask_options: chosen index %d is out of range", index)
+			return 0, fmt.Errorf("chosen index %d is out of range", index)
 		}
-		return options[index], nil
+		return index, nil
 	case <-ctx.Done():
-		return "", tools.ErrNoAnswer
+		return 0, tools.ErrNoAnswer
 	}
 }
 
@@ -181,7 +237,7 @@ func (b *bridgeAskBroker) release(p *bridgePendingAsk) {
 func newAskID() (string, error) {
 	buf := make([]byte, askIDBytes)
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("ask_options: generate question id: %w", err)
+		return "", fmt.Errorf("generate question id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
 }
@@ -233,4 +289,32 @@ func parseAskCallback(data string) (string, int, bool) {
 func escapeAskLabel(label string) string {
 	label = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(strings.TrimSpace(label))
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(label)
+}
+
+// escapeAskText keeps the question text inside the rich message. The renderer
+// reads markup, so the three special characters are escaped; control characters
+// are flattened but line breaks are kept, because a question may span lines. Tool
+// arguments are model-controlled, so this is what stops a command from opening a
+// button tag of its own.
+func escapeAskText(text string) string {
+	text = strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, text)
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(text)
+}
+
+// truncateAskText caps text at limit runes and marks the cut, so the owner knows
+// the question shows only part of what may run.
+func truncateAskText(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
 }

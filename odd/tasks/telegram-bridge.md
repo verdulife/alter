@@ -228,7 +228,7 @@ Tareas nuevas:
 |---|---|---|---|
 | T11 | Permisos y ámbito: allowlist completa, cwd `$HOME`, carga global, timeout configurable | S1,S6,L9 | inline | este commit |
 | T12 | Identidad: persona con disciplina Gentleman y prompt efectivo verificado | L11,L13,L14 | este commit |
-| T13 | Aprobaciones por botones: `tool_call` + `confirm` vía bridge, fail-closed | L10 | pendiente |
+| T13 | Aprobaciones por botones: `tool_call` + `confirm` vía bridge, fail-closed | L10,L15 | este commit |
 | T14 | Desplegar: parar el servicio viejo, compilar, configurar y probar "hola" real | L12 | pendiente |
 
 **L13** (identidad, T12). Medido antes de diseñar, no supuesto:
@@ -254,3 +254,16 @@ como cadena literal. Ningún test lo detectaba porque el fake no resolvía rutas
 Se corrigen absolutizando ambos y pasando `ALTER_PERSONA_FILE` al hijo. La
 lección: un cambio de entorno de ejecución necesita una aserción sobre la forma
 de los argumentos, no solo sobre su presencia.
+
+**L15** (aprobaciones, T13). El bucle de polling bloqueaba dentro de cada turno:
+un botón pulsado mientras Pi trabajaba **no se podía recibir**, porque el mismo
+bucle que debe leer el callback estaba esperando la respuesta del turno. Esto
+afectaba ya a `ask_options`, no solo a las aprobaciones. Los turnos pasan a
+ejecutarse fuera del bucle con `turnMu` (siguen serializados) y `Run` los espera
+antes de cerrar. Es el cambio más ancho de la tarea y el que más merece revisión.
+
+`--no-approve` se retira: las confirmaciones ya tienen a quién responder.
+Política del gate: `bash`, `write` y `edit` siempre piden confirmación; `read`,
+`grep`, `find`, `ls`, `save_note`, `append_note`, `send_file` y `ask_options`
+nunca; cualquier otra herramienta (incluidas las de paquetes) también pregunta,
+para que nada se cuele por no estar en la lista.

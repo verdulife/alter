@@ -80,6 +80,41 @@ type Config struct {
 	// and token this way (ALTER_TOOLS_URL / ALTER_TOOLS_TOKEN). Keys are applied
 	// in sorted order so the child environment is deterministic.
 	Env map[string]string
+	// OnDialog answers the blocking UI dialogs Pi sends (confirm, select, input,
+	// editor). When nil every dialog is answered with `cancelled:true`, which Pi
+	// turns into false/undefined: a headless session must never imply consent it
+	// did not receive. An error or an expired context also cancels, so a handler
+	// that cannot answer is indistinguishable from a refusal (T13, fail-closed).
+	OnDialog func(ctx context.Context, req DialogRequest) (DialogResponse, error)
+}
+
+// DialogRequest is one blocking `extension_ui_request` Pi emitted. Only the dialog
+// methods reach OnDialog: the fire-and-forget ones (notify, setStatus, setWidget,
+// setTitle, set_editor_text) take no answer and are ignored.
+type DialogRequest struct {
+	// ID must be echoed back in the response; Pi matches the two.
+	ID string
+	// Method is "confirm", "select", "input" or "editor".
+	Method string
+	// Title and Message are the text Pi wants the user to read.
+	Title   string
+	Message string
+	// Options are the choices of a "select" dialog, in the order Pi offered them.
+	Options []string
+	// Placeholder and Prefill belong to "input" and "editor".
+	Placeholder string
+	Prefill     string
+}
+
+// DialogResponse is the answer written back to Pi. Pi expects `confirmed` for
+// confirm and `value` for select/input/editor; Cancelled dismisses any of them.
+type DialogResponse struct {
+	// Confirmed answers a "confirm" dialog.
+	Confirmed bool
+	// Value answers "select" (one of the offered options), "input" or "editor".
+	Value string
+	// Cancelled dismisses the dialog, so the extension receives false/undefined.
+	Cancelled bool
 }
 
 // Option configures a Session. It exists mainly as the test seam.
@@ -331,9 +366,10 @@ func (s *Session) args() []string {
 	if s.cfg.Model != "" {
 		args = append(args, "--model", s.cfg.Model)
 	}
-	// --no-approve stays until the bridge handles approvals itself (T13).
+	// --no-approve is NOT passed: it disables project-file trust, which has
+	// nothing to do with per-command permission. Destructive tool calls are gated
+	// by the tools extension through Config.OnDialog instead (T13).
 	// Session persistence stays ON: --no-session is never passed.
-	args = append(args, "--no-approve")
 	for _, ext := range s.cfg.Extensions {
 		args = append(args, "-e", ext)
 	}
@@ -375,7 +411,7 @@ func (s *Session) roundTrip(ctx context.Context, text string, onDelta func(strin
 		defer close(readerDone)
 		st := runState{delta: onDelta}
 		for sc.Scan() {
-			settled, err := s.handleLine(sc.Bytes(), &st, stdin)
+			settled, err := s.handleLine(ctx, sc.Bytes(), &st, stdin)
 			if err != nil {
 				ch <- result{err: err}
 				return
@@ -421,8 +457,10 @@ type runState struct {
 }
 
 // handleLine processes one RPC record. It returns done = true when the outcome
-// of the run is decided, and a non-nil error on a hard protocol/IO failure.
-func (s *Session) handleLine(line []byte, st *runState, stdin io.Writer) (bool, error) {
+// of the run is decided, and a non-nil error on a hard protocol/IO failure. ctx is
+// the turn's context: a dialog answered after it expires is cancelled, never
+// accepted.
+func (s *Session) handleLine(ctx context.Context, line []byte, st *runState, stdin io.Writer) (bool, error) {
 	var ev rpcEvent
 	if err := json.Unmarshal(line, &ev); err != nil {
 		s.logger.Printf("bridge: skipping malformed RPC line: %v", err)
@@ -493,19 +531,96 @@ func (s *Session) handleLine(line []byte, st *runState, stdin io.Writer) (bool, 
 			}
 		}
 
+	case "extension_ui_request":
+		// A dialog blocks the extension until it is answered, so it must always get
+		// exactly one response: either the caller's answer or a cancellation.
+		return false, s.answerDialog(ctx, ev, stdin)
+
 	case "extension_error":
 		s.logger.Printf("bridge: extension error: %s", ev.Error)
 	}
 	return false, nil
 }
 
-// rpcEvent is the envelope shared by the RPC records this package reads.
+// answerDialog answers one extension UI request. Fire-and-forget methods are
+// ignored; every dialog path that is not a real answer writes `cancelled:true`.
+func (s *Session) answerDialog(ctx context.Context, ev rpcEvent, stdin io.Writer) error {
+	if !isDialogMethod(ev.Method) {
+		return nil
+	}
+	if s.cfg.OnDialog == nil {
+		s.logger.Printf("bridge: dialog %q (%s) with no handler configured; answering cancelled", ev.Method, ev.ID)
+		return s.writeDialogResponse(stdin, ev.Method, ev.ID, DialogResponse{Cancelled: true})
+	}
+
+	resp, err := s.cfg.OnDialog(ctx, DialogRequest{
+		ID:          ev.ID,
+		Method:      ev.Method,
+		Title:       ev.Title,
+		Message:     ev.Message,
+		Options:     ev.Options,
+		Placeholder: ev.Placeholder,
+		Prefill:     ev.Prefill,
+	})
+	// Fail closed: a failed handler, an expired turn or an explicit cancellation
+	// all become cancelled. A late "yes" after the turn is over must never
+	// authorise anything.
+	switch {
+	case err != nil:
+		s.logger.Printf("bridge: dialog %q (%s) failed: %v; answering cancelled", ev.Method, ev.ID, err)
+		resp = DialogResponse{Cancelled: true}
+	case ctx.Err() != nil:
+		s.logger.Printf("bridge: dialog %q (%s) outlived the turn (%v); answering cancelled", ev.Method, ev.ID, ctx.Err())
+		resp = DialogResponse{Cancelled: true}
+	}
+	return s.writeDialogResponse(stdin, ev.Method, ev.ID, resp)
+}
+
+// writeDialogResponse writes the one record Pi is waiting for. confirm carries a
+// boolean, the other dialog methods carry a value, and a cancellation carries
+// neither.
+func (s *Session) writeDialogResponse(stdin io.Writer, method, id string, resp DialogResponse) error {
+	record := map[string]any{"type": "extension_ui_response", "id": id}
+	switch {
+	case resp.Cancelled:
+		record["cancelled"] = true
+	case method == "confirm":
+		record["confirmed"] = resp.Confirmed
+	default:
+		// select, input and editor all answer with a value.
+		record["value"] = resp.Value
+	}
+	if err := writeJSON(stdin, record); err != nil {
+		return fmt.Errorf("bridge: pi: write extension_ui_response: %w", err)
+	}
+	return nil
+}
+
+// isDialogMethod reports whether the method blocks until the client answers.
+func isDialogMethod(method string) bool {
+	switch method {
+	case "confirm", "select", "input", "editor":
+		return true
+	}
+	return false
+}
+
+// rpcEvent is the envelope shared by the RPC records this package reads. The UI
+// fields are only set for extension_ui_request records.
 type rpcEvent struct {
 	Type    string          `json:"type"`
 	Command string          `json:"command"`
 	Success *bool           `json:"success"`
 	Error   string          `json:"error"`
 	Data    json.RawMessage `json:"data"`
+
+	ID          string   `json:"id"`
+	Method      string   `json:"method"`
+	Title       string   `json:"title"`
+	Message     string   `json:"message"`
+	Options     []string `json:"options"`
+	Placeholder string   `json:"placeholder"`
+	Prefill     string   `json:"prefill"`
 }
 
 // success reports ev.Success, defaulting to true when absent.

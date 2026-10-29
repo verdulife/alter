@@ -1,6 +1,12 @@
 /**
- * Pi extension: Alter's identity block and the four deterministic Alter tools
- * (S7 and T12 of the phase-1 Telegram bridge).
+ * Pi extension: Alter's identity block, the approval gate for destructive tools
+ * and the four deterministic Alter tools (S7, T12 and T13 of the phase-1 Telegram
+ * bridge).
+ *
+ * The gate intercepts `tool_call`: `bash`, `write` and `edit` ask the owner before
+ * they run, the read-only tools and the four Alter tools never do, and everything
+ * else is asked about too. The question is `ctx.ui.confirm()`, which in RPC mode
+ * the bridge turns into two Telegram buttons; no answer means blocked.
  *
  * The four tools forward every vault mutation and every message to the owner to
  * the bridge's loopback tools server:
@@ -121,6 +127,47 @@ const ASK_OPTIONS_PARAMETERS: any = {
 /** Successful tool result carrying the model-facing text. */
 function ok(text: string, details: Json = {}): ToolResult {
 	return { content: [{ type: "text", text }], details, isError: false };
+}
+
+/**
+ * Tools that always need the owner's approval before they run (T13). `bash` can
+ * touch anything under `$HOME`, and `write`/`edit` change files in place: with no
+ * terminal in front of Pi, the button is the only real approval that exists.
+ */
+const APPROVAL_REQUIRED = new Set(["bash", "write", "edit"]);
+
+/**
+ * Tools that never need approval: the read-only built-ins, which cannot change
+ * anything, and the four deterministic Alter tools, which the bridge validates
+ * against the vault and the owner chat on its own.
+ */
+const APPROVAL_FREE = new Set([
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"save_note",
+	"append_note",
+	"send_file",
+	"ask_options",
+]);
+
+/** Longest argument preview the approval prompt carries, matching the bridge cap. */
+const APPROVAL_ARG_LIMIT = 240;
+
+/**
+ * Renders the arguments of a tool call as one short line for the approval prompt.
+ * The bridge escapes and truncates it again, so this only keeps the request small.
+ */
+function previewArguments(input: unknown): string {
+	let rendered: string;
+	try {
+		rendered = typeof input === "object" && input !== null ? JSON.stringify(input) : String(input);
+	} catch {
+		rendered = "[argumentos no representables]";
+	}
+	rendered = (rendered ?? "").replace(/\s+/g, " ").trim();
+	return rendered.length > APPROVAL_ARG_LIMIT ? `${rendered.slice(0, APPROVAL_ARG_LIMIT)}…` : rendered;
 }
 
 /** Failed tool result: the model sees the reason and must not retry blindly. */
@@ -261,6 +308,48 @@ export default function alterTools(pi: ExtensionAPI): void {
 		const current = event.systemPrompt;
 		if (event.systemPromptOptions.forceSystemPrompt !== undefined && !current.includes(IDENTITY)) {
 			return { systemPrompt: `${current}\n\n${IDENTITY}` };
+		}
+		return undefined;
+	});
+
+	// T13: approve every destructive tool call through the owner's buttons.
+	//
+	// The gate runs on `tool_call`, which Pi awaits before executing anything and
+	// which can stop the call with `{ block: true, reason }`. The question travels
+	// through `ctx.ui.confirm()`; in RPC mode that becomes an
+	// `extension_ui_request`, and the bridge answers it with the two Telegram
+	// buttons (or with `cancelled`).
+	//
+	// Fail-closed on every axis: a denial, a cancellation (RPC delivers both as
+	// `false`), a thrown error and anything the bridge cannot ask about all block
+	// the call. A tool that is neither explicitly exempted nor destructive is
+	// still confirmed, so a tool added by a loaded package can never slip past the
+	// gate unnoticed.
+	pi.on("tool_call", async (event, ctx) => {
+		const name = event.toolName;
+		if (APPROVAL_FREE.has(name)) {
+			return undefined;
+		}
+
+		const destructive = APPROVAL_REQUIRED.has(name);
+		const title = destructive ? `¿Ejecutar ${name}?` : `¿Permitir la herramienta ${name}?`;
+		const message = previewArguments(event.input);
+
+		let approved: boolean;
+		try {
+			approved = await ctx.ui.confirm(title, message);
+		} catch (error) {
+			return {
+				block: true,
+				reason: `No pude pedir aprobación para ${name} (${describe(error)}). No se ejecutó.`,
+			};
+		}
+
+		if (!approved) {
+			return {
+				block: true,
+				reason: `El dueño no aprobó ${name}, así que no se ejecutó. No lo reintentes igual: propone otra cosa o pregúntale qué prefiere.`,
+			};
 		}
 		return undefined;
 	});
