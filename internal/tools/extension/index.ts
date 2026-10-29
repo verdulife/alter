@@ -7,8 +7,11 @@
  * undone: `edit` never asks, `write` asks when the target already exists or sits
  * outside `$HOME`, and `bash` asks only when the command can destroy, publish or
  * escalate. The read-only tools and the two Alter tools never ask, and a tool the
- * gate has no rule for still asks. The question is `ctx.ui.confirm()`, which in
- * RPC mode the bridge turns into two Telegram buttons; no answer means blocked.
+ * gate has no rule for asks only when its own name says it destroys something
+ * (`delete_file`, `reset_session`): Pi loads the global configuration (S7), so a
+ * button per package tool would rebuild the toll booth one layer out. The question
+ * is `ctx.ui.confirm()`, which in RPC mode the bridge turns into two Telegram
+ * buttons; no answer means blocked.
  *
  * The two tools exist for what Pi's own toolset cannot reach, not as a second way
  * to do what it already does: they deliver a vault file to the owner's chat and
@@ -889,13 +892,79 @@ function classifyWrite(input: unknown, cwd: string): Verdict {
 	return allow();
 }
 
+/**
+ * Words that name a destruction when they are one whole component of a tool name
+ * (T23). A tool the gate has no rule for is not asked by default: Pi loads the
+ * global configuration, so the model carries whatever the packages register
+ * (`web_search`, `fetch_content`, `memory_save`, the subagent tools…), and a
+ * button per package tool is the same toll booth one layer out. The ask is kept
+ * for the names that say by themselves that something is destroyed.
+ */
+const DESTRUCTIVE_WORDS = ["delete", "remove", "drop", "destroy", "purge", "wipe", "truncate", "reset", "kill", "unlink", "rm"];
+
+/** Suffixes a name component may carry on top of a stem: plurals and verb forms. */
+const COMPONENT_SUFFIXES = ["ing", "ed", "es", "ers", "er", "s", "d"];
+
+/**
+ * Stem of one component, so `remove`, `removing` and `removed` land on the same
+ * string. Only `ing`/`ed`/`es`/`er`/`s`/`d` are stripped, and only when a stem of
+ * at least two letters is left (`rm` is short on purpose, not a suffix away from
+ * nothing). A trailing `e` goes too, which merges `delete`/`deleted` and
+ * `purge`/`purged`.
+ */
+function stemOf(component: string): string {
+	const lower = component.toLowerCase();
+	let stem = lower;
+	for (const suffix of COMPONENT_SUFFIXES) {
+		if (lower.endsWith(suffix) && lower.length - suffix.length >= 2) {
+			stem = lower.slice(0, lower.length - suffix.length);
+			break;
+		}
+	}
+	return stem.endsWith("e") ? stem.slice(0, -1) : stem;
+}
+
+/** Stems of the vocabulary, compared against the stem of each name component. */
+const DESTRUCTIVE_STEMS = new Set(DESTRUCTIVE_WORDS.map((word) => stemOf(word)));
+
+/**
+ * Components of a tool name: `delete_file`, `removeRepo`, `resetHTTPSession` and
+ * `DELETE_FILE` all split into the words a reader sees. Only whole components are
+ * compared, so `address_lookup` never matches `rm`.
+ */
+function nameComponents(name: string): string[] {
+	const components: string[] = [];
+	for (const chunk of name.split(/[^A-Za-z0-9]+/)) {
+		if (chunk.length === 0) continue;
+		// A capital starts a component (`removeRepo`), a lower-to-upper run starts one
+		// (`HTTPSession` → `HTTP`, `Session`) and so does a digit boundary. A chunk that
+		// is all capitals (`DELETE`) stays whole instead of splitting per letter.
+		for (const part of chunk.split(
+			/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])/,
+		)) {
+			if (part.length > 0) components.push(part);
+		}
+	}
+	return components;
+}
+
+/** True when a tool name says, by itself, that it destroys something. */
+function namesDestruction(name: string): boolean {
+	return nameComponents(name).some((component) => DESTRUCTIVE_STEMS.has(stemOf(component)));
+}
+
 /** Verdict for one tool call, before anything runs. */
 function classifyCall(name: string, input: unknown, cwd: string): Verdict {
 	if (APPROVAL_FREE.has(name)) return allow();
 	if (name === "bash") return classifyBash(input, cwd);
 	if (name === "write") return classifyWrite(input, cwd);
-	// A tool this gate has no rule for is a decision it cannot make: it asks.
-	return ask(`no tengo una regla para la herramienta ${name}`);
+	// A tool with no rule of its own is not a decision the owner must answer on a
+	// phone: the packages he loaded are part of the agent he asked for. Only the
+	// names that say they destroy keep their button, and the match never fails open.
+	if (namesDestruction(name)) {
+		return ask(`el nombre de la herramienta ${name} indica que borra o destruye`);
+	}
+	return allow();
 }
 
 /**

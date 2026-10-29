@@ -62,7 +62,21 @@ deshacer**, y la extensión decide caso por caso en `tool_call`:
 | `write` | cuando el archivo ya existe, o cuando la ruta cae fuera de `$HOME` |
 | `bash` | cuando el comando puede destruir, publicar o escalar |
 | `read`, `grep`, `find`, `ls`, `send_file`, `ask_options` | nunca |
-| cualquier otra (paquetes, MCP) | siempre: sin regla no hay decisión |
+| cualquier otra (paquetes, MCP) | solo si su nombre dice que destruye: `delete_file`, `removeRepo`, `reset_session`, `truncate_table` |
+
+Una herramienta sin regla propia **no pregunta por defecto**. Pi carga la
+configuración global, así que el modelo lleva encima `web_search`,
+`fetch_content`, la memoria y los subagentes: un botón por cada una era el mismo
+peaje, una capa más afuera. La señal que queda es el nombre, y basta para lo que
+importa: si contiene `delete`, `remove`, `drop`, `destroy`, `purge`, `wipe`,
+`truncate`, `reset`, `kill`, `unlink` o `rm` como palabra o como pieza del nombre
+(`delete_file`, `removeRepo`, `reset_session`), pregunta, y de ahí no se escapa:
+el nombre no cambia y la regla no falla abierta. La comparación es por piezas y
+no por subcadenas, así que `address_lookup` no casa con `rm`. Todo lo demás se
+permite y queda en el diario, que es donde se revisa.
+
+Un nombre que destruye sin decirlo (`clear`, `erase`, `forget`, `discard`) pasa
+sin botón: la lista es cerrada y se amplía aquí cuando aparezca uno.
 
 La ruta se resuelve como la resuelve Pi: `~` y `~/x` contra `$HOME`, el resto
 contra el directorio de trabajo de la sesión. `~usuario` no se expande (Pi

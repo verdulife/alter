@@ -224,10 +224,27 @@ const cases = [
 	{ label: "edit sobre un archivo existente", tool: "edit", input: { path: join(home, "existente.txt"), oldText: "contenido", newText: "otro" }, expect: "allow" },
 	{ label: "edit fuera de home", tool: "edit", input: { path: join(outside, "otro.md"), oldText: "a", newText: "b" }, expect: "allow" },
 
-	// --- read-only tools and unknown tools -----------------------------
+	// --- read-only tools -----------------------------------------------
 	{ label: "read", tool: "read", input: { path: join(home, "existente.txt") }, expect: "allow" },
 	{ label: "grep herramienta", tool: "grep", input: { pattern: "x", path: "." }, expect: "allow" },
-	{ label: "herramienta desconocida", tool: "memory_save", input: { title: "x" }, expect: "ask" },
+
+	// --- tools de paquete: sin regla, sin destrucción en el nombre ------
+	// La carga global de Pi trae estas herramientas; pedir botón por ellas
+	// era el mismo peaje, una capa más afuera.
+	{ label: "web_search", tool: "web_search", input: { query: "x" }, expect: "allow" },
+	{ label: "fetch_content", tool: "fetch_content", input: { url: "https://x" }, expect: "allow" },
+	{ label: "memory_save", tool: "memory_save", input: { title: "x" }, expect: "allow" },
+	{ label: "mem_search", tool: "mem_search", input: { query: "x" }, expect: "allow" },
+	{ label: "subagent_run", tool: "subagent_run", input: { prompt: "x" }, expect: "allow" },
+	{ label: "address_lookup no casa con rm", tool: "address_lookup", input: { address: "x" }, expect: "allow" },
+
+	// --- un nombre que dice que destruye pregunta, aunque no haya regla --
+	{ label: "delete_file", tool: "delete_file", input: { path: "x" }, expect: "ask" },
+	{ label: "removeRepo (camelCase)", tool: "removeRepo", input: { repo: "x" }, expect: "ask" },
+	{ label: "reset_session", tool: "reset_session", input: { id: "x" }, expect: "ask" },
+	{ label: "truncate_table", tool: "truncate_table", input: { table: "x" }, expect: "ask" },
+	{ label: "rm_home (rm como componente)", tool: "rm_home", input: { path: "x" }, expect: "ask" },
+	{ label: "DELETE_FILE en mayúsculas", tool: "DELETE_FILE", input: { path: "x" }, expect: "ask" },
 ];
 
 // --- run ------------------------------------------------------------------
