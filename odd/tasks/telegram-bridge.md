@@ -192,3 +192,39 @@ bloqueante y tres advertencias:
 Decisión: se corrige en `internal/tools/server.go` (resolver sobre el ancestro
 existente más cercano) y, por defensa en profundidad, en `internal/vault`
 (`resolve` con la misma comprobación), porque el store es quien escribe.
+
+## Límites y fase 1.5 (decisión de producto, 2026-10-29)
+
+Ver `docs/alter-limites.md`. Alter es tu gentle-shell por Telegram: mismas
+herramientas, mismo directorio (`$HOME`), misma configuración global de Pi, con
+identidad Alter. Lo de solo lectura era una restricción heredada de
+`origin/bridge` (D9) que contradecía el requisito original.
+
+Correcciones al plan original:
+
+**L9** — Retirada de la restricción de solo lectura. La allowlist de solo
+lectura y la "carga limpia" (`--no-skills`, `--no-extensions`,
+`--no-context-files`, `--no-themes`, `--no-prompt-templates`) se eliminan: no
+son el canal que se pidió y dejan a Pi sin `bash`, `edit` ni `write`.
+
+**L10** — Las aprobaciones no existen de serie en Pi. `-a/--approve` es confianza
+en archivos de proyecto, no permiso por comando. Se implementan con el hook
+`tool_call` (puede bloquear con `{block:true}`), `ctx.ui.confirm()` (llega como
+`extension_ui_request` en RPC) y el bridge respondiendo con botones. Fail-closed.
+
+**L11** — La identidad se impone por prompt. `before_agent_start` permite
+reemplazar el prompt de sistema (`forceSystemPrompt`), así que cargar todo y ser
+Alter es compatible; el orden exacto de inyección debe verificarse en ejecución.
+
+**L12** — El fallo de "hola" no es del bridge: `alter.service` ejecuta
+`/home/balneario/alter/bin/alter` compilado el 2026-10-16, cuyo texto de error
+está compilado dentro (`strings` lo confirma). El bridge nunca se ha desplegado.
+
+Tareas nuevas:
+
+| ID | Tarea | Specs | Estado |
+|---|---|---|---|
+| T11 | Permisos y ámbito: allowlist completa, cwd `$HOME`, carga global, timeout configurable | L9 | pendiente |
+| T12 | Identidad: reescribir persona con disciplina Gentleman y verificar el prompt efectivo | L11 | pendiente |
+| T13 | Aprobaciones por botones: `tool_call` + `confirm` vía bridge, fail-closed | L10 | pendiente |
+| T14 | Desplegar: parar el servicio viejo, compilar, configurar y probar "hola" real | L12 | pendiente |
