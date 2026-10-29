@@ -9,8 +9,10 @@
  *
  * What it proves: the classifier's verdict for each command and each `write`
  * target, the denial path of the handler, and — for every case that asks — the
- * text the owner reads: one short human title, the consequence as the first line,
- * and the command in a code block with its line breaks, never cut mid-line.
+ * text the owner reads: one short human title, the consequence first, and the
+ * command whole after the separator the bridge splits on. The extension emits
+ * data, not markup, so this table never asserts a code fence: the bridge owns
+ * the rendering.
  * What it cannot prove: Pi's runtime. It never spawns `pi`, never answers an
  * `extension_ui_request` over RPC, and never executes a command. A `bash` case
  * asserts the decision, not the effect.
@@ -122,8 +124,14 @@ async function decide(tool, input) {
 // he could judge on a phone, so the consequence is the first line of the message.
 const APPROVAL_TITLE = "¿Lo permito?";
 
+// The unit separator the extension puts between the reason and the command. The
+// bridge splits on it and renders the command as a code block, so the extension
+// itself carries no markup at all.
+const APPROVAL_SEPARATOR = "\u001f";
+
 // A typical multi-line script. The approval must show it whole and with its line
-// breaks, inside the fenced block; `shows` below asserts exactly that.
+// breaks, after the separator and without a fence; `shows` below asserts exactly
+// that.
 const multiLineCommand = [
 	"cd ~/alter",
 	"export TMPDIR=/tmp",
@@ -142,23 +150,32 @@ const multiLineCommand = [
 
 /**
  * Problems with the approval text of one asking case, or null when it reads right.
- * It checks the three things the owner judges: the title, the consequence as the
- * first line, and — when the case says so — the whole command inside the fence.
- * Every problem is reported, not only the first, so a run shows all the wording
- * that still has to change.
+ * It checks the three things the owner judges: the title, the consequence first,
+ * and — when the case says so — the whole command after the separator, in the
+ * wire format the bridge splits on. Every problem is reported, not only the first,
+ * so a run shows all the wording that still has to change.
  */
 function textProblems(testCase, question) {
 	const problems = [];
 	if (question.title !== APPROVAL_TITLE) {
 		problems.push(`título ${JSON.stringify(question.title)}, esperaba ${JSON.stringify(APPROVAL_TITLE)}`);
 	}
-	if (testCase.reason !== undefined && !question.message.startsWith(`${testCase.reason}\n`)) {
-		problems.push(`mensaje ${JSON.stringify(question.message.split("\n")[0])}, esperaba ${JSON.stringify(testCase.reason)}`);
+	if (testCase.reason !== undefined && !question.message.startsWith(`${testCase.reason}${APPROVAL_SEPARATOR}`)) {
+		problems.push(`mensaje ${JSON.stringify(firstPart(question.message))}, esperaba ${JSON.stringify(testCase.reason)} seguido del separador`);
 	}
-	if (testCase.shows !== undefined && !question.message.includes(`\`\`\`\n${testCase.shows}\n\`\`\``)) {
-		problems.push("el mensaje no muestra el comando entero dentro del bloque de código");
+	if (testCase.shows !== undefined) {
+		const want = `${testCase.reason}${APPROVAL_SEPARATOR}${testCase.shows}`;
+		if (question.message !== want) {
+			problems.push("el mensaje no lleva la razón, el separador y el comando entero, sin bloques de código");
+		}
 	}
 	return problems.length > 0 ? problems.join("; ") : null;
+}
+
+/** Text before the separator: the part the owner reads as the consequence. */
+function firstPart(message) {
+	const cut = message.indexOf(APPROVAL_SEPARATOR);
+	return cut < 0 ? message : message.slice(0, cut);
 }
 
 // --- cases ----------------------------------------------------------------
@@ -258,10 +275,11 @@ const cases = [
 	{ label: "heredoc que clasifica su cuerpo", ...bash("cat <<'EOF' > notas.md\napt install x es lo que dice la guía\nEOF"), expect: "ask", reason: "Va a instalar software en el sistema." },
 	{ label: "heredoc con texto inofensivo", ...bash("cat <<'EOF' > notas2.md\nnotas normales\nEOF"), expect: "allow" },
 
-	// --- el comando se muestra entero, en un bloque de código -------------
-	// Lo que el dueño juzga es la pregunta: dice la consecuencia en la primera
-	// línea y debajo enseña el comando con sus saltos de línea, no una línea
-	// cortada por la mitad. Cada caso que pregunta lleva también el título humano.
+	// --- el comando se muestra entero, tras el separador -------------------
+	// Lo que el dueño juzga es la pregunta: dice la consecuencia primero y debajo
+	// enseña el comando con sus saltos de línea, no una línea cortada por la mitad.
+	// La extensión manda datos y el puente los renderiza, así que aquí se afirma el
+	// formato de envío: razón, separador, comando entero, sin bloques de código.
 	{
 		label: "comando de varias líneas se muestra entero",
 		...bash(multiLineCommand),
@@ -338,7 +356,7 @@ for (const testCase of cases) {
 		if (problem !== null) detail = problem;
 		else if (approvedRun.result !== undefined) detail = "bloqueó una llamada aprobada";
 		else if (!blocked) detail = "no bloqueó al denegar";
-		else detail = `preguntó: ${approvedRun.question.message.split("\n")[0]}`;
+		else detail = `preguntó: ${firstPart(approvedRun.question.message)}`;
 		if (problem !== null) passed = false;
 	}
 

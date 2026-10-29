@@ -53,6 +53,14 @@ const (
 	// bridgeDialogEllipsis marks the elided middle of a clipped dialog text.
 	bridgeDialogEllipsis = "…"
 
+	// bridgeDialogSeparator is the unit separator the Pi extension puts between
+	// the reason and the command of an approval message. The extension sends data,
+	// not markup, so the bridge renders both parts here: inside a markdown fence
+	// this renderer keeps HTML entities literal, which turned a `>` in a command
+	// into `&gt;` on the phone and let three backticks close the fence early. No
+	// shell command carries the character, so it never appears inside a command.
+	bridgeDialogSeparator = "\x1f"
+
 	// bridgeDialogHeadShare is the fraction of a clipped text given to the head;
 	// the rest goes to the tail. It is the same split the Pi extension applies to
 	// the argument preview, so the two caps agree instead of fighting.
@@ -451,9 +459,34 @@ func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
 	out.WriteString(escapeAskText(clipDialogText(title, bridgeDialogTitleLimit)))
 	if message := strings.TrimSpace(req.Message); message != "" {
 		out.WriteString("\n\n")
-		out.WriteString(escapeAskText(clipDialogText(message, bridgeDialogMessageLimit)))
+		out.WriteString(dialogMessage(message))
 	}
 	return out.String()
+}
+
+// dialogMessage renders the message of a dialog as markup. The Pi extension sends
+// the reason and the command separated by bridgeDialogSeparator, and the bridge
+// owns the rendering: both parts are escaped as text before they enter the markup,
+// and the command goes inside a <pre> block, where `>`, `<`, `&` and backticks
+// reach the owner literally and a `<tg-button>` in a command stays text.
+//
+// A message without the separator (any other UI source) has no command to show,
+// so it keeps the behaviour it always had: escaped and clipped as plain text.
+func dialogMessage(message string) string {
+	reason, command, ok := strings.Cut(message, bridgeDialogSeparator)
+	if !ok {
+		return escapeAskText(clipDialogText(message, bridgeDialogMessageLimit))
+	}
+
+	// The clip runs on the command text, never on the markup: the head and the tail
+	// are what the owner decides on, and cutting the escaped block could break a
+	// tag in half.
+	block := escapeAskText(clipDialogText(strings.TrimSpace(command), bridgeDialogMessageLimit))
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "<pre>" + block + "</pre>"
+	}
+	return escapeAskText(clipDialogText(reason, bridgeDialogMessageLimit)) + "\n\n<pre>" + block + "</pre>"
 }
 
 // clipDialogText caps text at limit runes while keeping BOTH its head and its

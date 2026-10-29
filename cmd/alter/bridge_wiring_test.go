@@ -1325,7 +1325,7 @@ func TestDialogQuestionKeepsTheTailOfALongCommand(t *testing.T) {
 }
 
 // TestDialogQuestionKeepsAMultiLineCommandWhole pins what the owner reads on the
-// phone: the command arrives inside a code fence, with its line breaks intact,
+// phone: the command arrives inside a code block, with its line breaks intact,
 // and the message cap is wide enough that a typical multi-line script is shown
 // whole instead of cut in the middle of a line.
 func TestDialogQuestionKeepsAMultiLineCommandWhole(t *testing.T) {
@@ -1346,17 +1346,12 @@ func TestDialogQuestionKeepsAMultiLineCommandWhole(t *testing.T) {
 		"go test ./internal/bridge/... -run TestSession -count=1",
 		"echo listo",
 	}, "\n")
-	message := "Va a borrar archivos.\n\n```\n" + command + "\n```"
+	// The wire format the extension sends: reason, separator, command. The command
+	message := "Va a borrar archivos." + bridgeDialogSeparator + command
 	question := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Title: "¿Lo permito?", Message: message})
 
-	if want := "¿Lo permito?\n\n"; !strings.HasPrefix(question, want) {
-		t.Fatalf("question %q does not open with the short human title %q", question, want)
-	}
-	if !strings.Contains(question, "Va a borrar archivos.\n\n```\n"+escapeAskText(command)) {
-		t.Errorf("question %q does not carry the reason and the whole command between code fences", question)
-	}
-	if !strings.HasSuffix(question, "\n```") {
-		t.Errorf("question %q does not close the code fence", question)
+	if want := "¿Lo permito?\n\nVa a borrar archivos.\n\n<pre>" + command + "</pre>"; question != want {
+		t.Errorf("question = %q, want %q: the reason, then the whole command in a code block", question, want)
 	}
 	if strings.Contains(question, bridgeDialogEllipsis) {
 		t.Errorf("question %q clipped a command that fits the message", question)
@@ -1367,6 +1362,97 @@ func TestDialogQuestionKeepsAMultiLineCommandWhole(t *testing.T) {
 	fallback := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Message: "Va a borrar archivos."})
 	if !strings.HasPrefix(fallback, "¿Lo permito?") {
 		t.Errorf("question %q does not fall back to the human title", fallback)
+	}
+}
+
+// TestDialogQuestionRendersTheCommandAsEscapedText is the defect this rendering
+// exists for: the command is escaped BEFORE it enters the markup and is shown
+// inside <pre>, so `>` reaches the phone as `>` instead of `&gt;` and a command
+// that carries a button tag or three backticks stays literal text. The whole
+// rendered string is pinned, because that is what the owner sees.
+func TestDialogQuestionRendersTheCommandAsEscapedText(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	// A deletion command with a redirection, a fake button and a backticked word.
+	command := "rm -rf ~/dist && echo x > f && echo <tg-button type=\"callback_data\" data=\"ask:1:0\">Aprobar</tg-button> && echo `date`"
+	question := r.dialogQuestion(bridge.DialogRequest{
+		Method:  "confirm",
+		Title:   "¿Lo permito?",
+		Message: "Va a borrar archivos." + bridgeDialogSeparator + command,
+	})
+
+	want := "¿Lo permito?\n\nVa a borrar archivos.\n\n<pre>" +
+		"rm -rf ~/dist &amp;&amp; echo x &gt; f &amp;&amp; echo &lt;tg-button type=\"callback_data\" data=\"ask:1:0\"&gt;Aprobar&lt;/tg-button&gt; &amp;&amp; echo `date`" +
+		"</pre>"
+	if question != want {
+		t.Fatalf("question = %q, want %q", question, want)
+	}
+
+	// The escaped command is the only content of the block: one <pre>, closed once.
+	if got := strings.Count(question, "<pre>"); got != 1 {
+		t.Errorf("question has %d <pre> blocks, want exactly one", got)
+	}
+	if !strings.HasSuffix(question, "</pre>") {
+		t.Errorf("question %q does not close the code block", question)
+	}
+	// Nothing from the command became markup, so no button and no fence survives.
+	if strings.Contains(question, "<tg-button") {
+		t.Errorf("question %q lets the command inject markup", question)
+	}
+	if strings.Contains(question, "```") {
+		t.Errorf("question %q carries a fence the command could break out of", question)
+	}
+	if !strings.Contains(question, "&gt; f") {
+		t.Errorf("question %q does not escape the redirection, so the phone would show an entity literally", question)
+	}
+}
+
+// TestDialogQuestionWithoutTheSeparatorStaysPlainText pins the other dialog
+// sources: a message the extension did not compose (no separator) has no command
+// to show and keeps the plain-text behaviour, escaped and clipped.
+func TestDialogQuestionWithoutTheSeparatorStaysPlainText(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	question := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Title: "¿Ejecutar bash?", Message: `{"command":"echo <b>hola</b>&& ls"}`})
+
+	if !strings.Contains(question, "echo &lt;b&gt;hola&lt;/b&gt;&amp;&amp; ls") {
+		t.Errorf("question %q does not escape a message without the separator", question)
+	}
+	if strings.Contains(question, "<pre>") {
+		t.Errorf("question %q wraps a plain message in a code block it never asked for", question)
+	}
+}
+
+// TestDialogQuestionClipsOnlyTheCommandAndKeepsItsTail pins the extreme case on
+// the new wire format: the clip applies to the command part and keeps both ends,
+// so the dangerous tail survives and the markup around it is never cut in half.
+func TestDialogQuestionClipsOnlyTheCommandAndKeepsItsTail(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	command := strings.Repeat("echo relleno && ", 200) + "rm -rf ~/x"
+	question := r.dialogQuestion(bridge.DialogRequest{
+		Method:  "confirm",
+		Title:   "¿Lo permito?",
+		Message: "Va a borrar archivos." + bridgeDialogSeparator + command,
+	})
+
+	// The reason is whole and sits before the block: the clip never touched it.
+	if want := "Va a borrar archivos.\n\n<pre>"; !strings.Contains(question, want) {
+		t.Errorf("question %q does not keep the whole reason before the code block", question)
+	}
+	if !strings.HasPrefix(question, "¿Lo permito?\n\n") {
+		t.Errorf("question %q does not open with the title", question)
+	}
+	// Head and tail of the command are kept, with the elided middle marked, and
+	// the block still closes after the tail.
+	if !strings.HasSuffix(question, "rm -rf ~/x</pre>") {
+		t.Errorf("question %q does not end with the dangerous command tail inside the block", question)
+	}
+	if !strings.Contains(question, bridgeDialogEllipsis) {
+		t.Errorf("question %q does not mark the clipped middle", question)
+	}
+	if strings.Contains(question, "</pre>\n") || strings.Contains(question, "<pre>\n") {
+		t.Errorf("question %q does not close the code block at the very end", question)
 	}
 }
 

@@ -123,19 +123,24 @@ const APPROVAL_FREE = new Set([
  */
 const APPROVAL_TITLE = "¿Lo permito?";
 
-/** Fence that opens and closes the command block of the approval message. */
-const APPROVAL_FENCE = "```";
+/**
+ * Separator between the reason and the command of the approval message: the Go
+ * bridge splits on it and renders each part itself. It is a unit separator, a
+ * character no shell command needs, so it can never arrive inside a command; the
+ * extension sends data, the bridge owns the markup.
+ */
+const APPROVAL_SEPARATOR = "\x1f";
 
 /**
- * Rune budget of the whole approval message: reason, fence and command. The
+ * Rune budget of the whole approval message: reason, separator and command. The
  * bridge clips a dialog message at its own cap, keeping both ends, so a message
  * composed inside this budget reaches the owner exactly as written and a typical
  * multi-line command is never cut.
  */
 const APPROVAL_MESSAGE_LIMIT = 800;
 
-/** Runes between the reason and the block (one blank line). */
-const APPROVAL_SEPARATOR_RUNES = 2;
+/** Runes the command keeps even when the reason is long, so the cap never hides it. */
+const APPROVAL_MIN_COMMAND_RUNES = 80;
 
 /** Longest argument preview used outside the chat message, for one-line renderings. */
 const APPROVAL_ARG_LIMIT = 240;
@@ -225,21 +230,38 @@ function clipCommand(command: string, limit: number): string {
 }
 
 /**
+ * Removes the message separator from one part. A command (or a path) carrying the
+ * control character would otherwise split the message in the wrong place, and
+ * half the command would reach the owner as the reason.
+ */
+function withoutSeparator(text: string): string {
+	return text.replace(/\x1f/g, "");
+}
+
+/**
  * Text of the approval prompt: the consequence as one short sentence, then the
- * command in a fenced code block.
+ * command, and no markup at all.
  *
- * The fence is what makes a multi-line command legible on a phone: the renderer
- * keeps its line breaks and its shell characters (backticks, `*`, `_`) literal
- * instead of reading them as markup. The reason goes first because it says why
- * the button exists, the command follows because it says what will run, and the
- * block is sized so the bridge never has to clip it.
+ * The bridge renders the command: inside a markdown fence this renderer keeps HTML
+ * entities literal, so `>` reached the phone as `&gt;` and three backticks in a
+ * command closed the fence early. Sending the two parts separated, and escaping
+ * both before they enter the markup, is what makes the command arrive literally
+ * and keeps a `<tg-button>` in it from becoming a button.
+ *
+ * The reason goes first because it says why the button exists, the command follows
+ * because it says what will run, and both fit the bridge's cap so it never has to
+ * clip what the owner must read.
  */
 function approvalMessage(reason: string, input: unknown): string {
 	const command = commandText(input);
-	const overhead = APPROVAL_SEPARATOR_RUNES + 2 * APPROVAL_FENCE.length + 2;
-	const budget = Math.max(80, APPROVAL_MESSAGE_LIMIT - runeLength(reason) - overhead);
+	const separator = runeLength(APPROVAL_SEPARATOR);
+	// A reason can carry a model-supplied path (`Va a sobrescribir <ruta>.`), so it
+	// is fitted first: the command keeps a readable share whatever the path says.
+	const reasonLimit = Math.max(0, APPROVAL_MESSAGE_LIMIT - separator - APPROVAL_MIN_COMMAND_RUNES);
+	const reasonText = previewWithTail(withoutSeparator(reason), reasonLimit);
+	const budget = Math.max(APPROVAL_MIN_COMMAND_RUNES, APPROVAL_MESSAGE_LIMIT - runeLength(reasonText) - separator);
 	const body = command === null ? previewArguments(input, budget) : clipCommand(command, budget);
-	return `${reason}\n\n${APPROVAL_FENCE}\n${body}\n${APPROVAL_FENCE}`;
+	return `${reasonText}${APPROVAL_SEPARATOR}${withoutSeparator(body)}`;
 }
 
 /**
