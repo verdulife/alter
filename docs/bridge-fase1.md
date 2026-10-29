@@ -187,7 +187,7 @@ chat ID.
 - **`pi` real y LLM real.** Todo el protocolo RPC se probó contra un proceso falso
   reejecutando el binario de test. No hay evidencia de que el Pi instalado acepte
   exactamente esta combinación de flags (`-e ... --session-id ...
-  --append-system-prompt ...`, sin ningún `--no-*` salvo `--no-approve`), ni de
+  --append-system-prompt ...`, sin ningún `--no-*`), ni de
   que cargue la configuración global descubierta sin degradar el arranque.
 - **Pulsación física de un botón.** El callback se simula como `update` del fake.
 - **Carga de la extensión TypeScript por Pi** y el contrato exacto de
