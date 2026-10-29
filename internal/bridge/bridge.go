@@ -557,7 +557,7 @@ func (s *Session) answerDialog(ctx context.Context, ev rpcEvent, stdin io.Writer
 		ID:          ev.ID,
 		Method:      ev.Method,
 		Title:       ev.Title,
-		Message:     ev.Message,
+		Message:     ev.dialogText(),
 		Options:     ev.Options,
 		Placeholder: ev.Placeholder,
 		Prefill:     ev.Prefill,
@@ -614,13 +614,28 @@ type rpcEvent struct {
 	Error   string          `json:"error"`
 	Data    json.RawMessage `json:"data"`
 
-	ID          string   `json:"id"`
-	Method      string   `json:"method"`
-	Title       string   `json:"title"`
-	Message     string   `json:"message"`
-	Options     []string `json:"options"`
-	Placeholder string   `json:"placeholder"`
-	Prefill     string   `json:"prefill"`
+	ID          string          `json:"id"`
+	Method      string          `json:"method"`
+	Title       string          `json:"title"`
+	Message     json.RawMessage `json:"message"`
+	Options     []string        `json:"options"`
+	Placeholder string          `json:"placeholder"`
+	Prefill     string          `json:"prefill"`
+}
+
+// dialogText decodes the message field of a dialog request. extension_ui_request
+// carries a plain string there, while model events such as message_end and
+// turn_end carry an object. Decoding into a string field made the whole record
+// fail to unmarshal, so those events were dropped and logged as malformed.
+func (ev rpcEvent) dialogText() string {
+	if len(ev.Message) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(ev.Message, &text); err != nil {
+		return ""
+	}
+	return text
 }
 
 // success reports ev.Success, defaulting to true when absent.
