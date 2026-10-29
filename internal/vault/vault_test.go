@@ -140,6 +140,38 @@ func TestSaveNoteRejectsEscapingFolder(t *testing.T) {
 	}
 }
 
+func TestSaveNoteRejectsAFolderThatEscapesThroughASymlink(t *testing.T) {
+	root := t.TempDir()
+	s := New(root, 0)
+	s.now = fixedNow
+
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "enlace")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// The leaf below the link does not exist yet, which is the case that used to
+	// slip past the lexical check: the store writes, so it must reject on its own.
+	if _, err := s.SaveNote(Note{Folder: "enlace/sub", Title: "Escapa", Body: "cuerpo"}); err == nil {
+		t.Error("SaveNote(folder through a symlinked directory) = nil error, want rejection")
+	}
+	if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {
+		t.Errorf("SaveNote wrote %v outside the vault root (err %v)", entries, err)
+	}
+
+	// A normal note is still written, so the rejection is scoped to the escape.
+	path, err := s.SaveNote(Note{Folder: "notas", Title: "Normal", Body: "cuerpo"})
+	if err != nil {
+		t.Fatalf("SaveNote(normal folder): %v", err)
+	}
+	if want := filepath.Join(root, "notas", "normal.md"); path != want {
+		t.Errorf("path = %q, want %q", path, want)
+	}
+	if data, err := os.ReadFile(path); err != nil || !strings.Contains(string(data), "cuerpo") {
+		t.Errorf("normal note content = %q (err %v), want the body", data, err)
+	}
+}
+
 func TestAppendLineKeepsContentAndAddsSeparator(t *testing.T) {
 	s := newTestStore(t, 0)
 	path, err := s.SaveNote(Note{Title: "IA utiles", Body: "intro"})

@@ -59,6 +59,9 @@ var (
 	errEscapes = errors.New("path escapes the vault")
 	// errMissing marks a path that does not exist inside the vault.
 	errMissing = errors.New("file not found in the vault")
+	// errNotFile marks an existing path that is a directory where a file is
+	// required: a model mistake, not a server failure.
+	errNotFile = errors.New("path is a directory, not a file")
 )
 
 // FileSender delivers a local vault file to the owner's chat. Implementations
@@ -380,6 +383,8 @@ func writePathError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errEscapes):
 		writeError(w, http.StatusBadRequest, "%v", err)
+	case errors.Is(err, errNotFile):
+		writeError(w, http.StatusBadRequest, "%v", err)
 	case errors.Is(err, errMissing):
 		writeError(w, http.StatusNotFound, "%v", err)
 	default:
@@ -398,10 +403,12 @@ func (s *Server) relative(path string) string {
 }
 
 // resolvePath turns a vault-relative path into an absolute one, refusing
-// anything that leaves the root. It checks the lexical form and, when the target
-// exists, the resolved symlink target too: a link inside the vault that points
-// outside is an escape like any other. With requireFile the path must be an
-// existing non-directory file.
+// anything that leaves the root. Containment is checked against the
+// symlink-resolved form of the nearest existing ancestor, with the components
+// that do not exist yet appended and verified to stay inside: a link inside the
+// vault that points outside is an escape like any other, even when the leaf
+// below it is still missing. With requireFile the path must be an existing
+// non-directory file.
 func (s *Server) resolvePath(rel string, requireFile bool) (string, error) {
 	// A leading separator is read as "vault-relative", matching how models write
 	// paths; the containment check below still rejects a real escape.
@@ -422,11 +429,22 @@ func (s *Server) resolvePath(rel string, requireFile bool) (string, error) {
 		return "", fmt.Errorf("%w: %q", errEscapes, rel)
 	}
 
-	realRoot := root
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		realRoot = resolved
+	// Resolve both sides the same way: the root and the target through their
+	// nearest existing ancestors. A path that cannot be resolved is a path that
+	// cannot be proven contained, so it is rejected rather than accepted.
+	realRoot, err := resolvedForm(root)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %v", errEscapes, rel, err)
 	}
-	resolved, err := filepath.EvalSymlinks(full)
+	resolved, err := resolvedForm(full)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q: %v", errEscapes, rel, err)
+	}
+	if !within(realRoot, resolved) {
+		return "", fmt.Errorf("%w: %q", errEscapes, rel)
+	}
+
+	info, err := os.Stat(resolved)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return "", err
@@ -434,28 +452,37 @@ func (s *Server) resolvePath(rel string, requireFile bool) (string, error) {
 		if requireFile {
 			return "", fmt.Errorf("%w: %q", errMissing, rel)
 		}
-		// The folder does not exist yet: SaveNote creates it, and the lexical
-		// containment check above already proved it stays in the vault.
-		return full, nil
-	}
-	if !within(realRoot, resolved) {
-		return "", fmt.Errorf("%w: %q", errEscapes, rel)
-	}
-	if !requireFile {
+		// The leaf does not exist yet: SaveNote creates it, and the resolved form
+		// above already proved it stays in the vault.
 		return resolved, nil
 	}
-
-	info, err := os.Stat(resolved)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%w: %q", errMissing, rel)
-		}
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("path %q is a directory, not a file", rel)
+	if requireFile && info.IsDir() {
+		return "", fmt.Errorf("%w: %q", errNotFile, rel)
 	}
 	return resolved, nil
+}
+
+// resolvedForm returns the symlink-resolved form of path. When parts of it do not
+// exist yet, the nearest existing ancestor is resolved and the missing
+// components are appended, so a missing leaf still carries the resolution of its
+// parent instead of falling back to the unresolved path.
+func resolvedForm(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	dir, base := filepath.Split(filepath.Clean(path))
+	if base == "" || dir == "" || filepath.Clean(dir) == filepath.Clean(path) {
+		return "", fmt.Errorf("no existing ancestor of %q", path)
+	}
+	parent, err := resolvedForm(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, base), nil
 }
 
 // within reports whether path is base or lives under it.

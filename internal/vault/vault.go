@@ -148,7 +148,8 @@ func (s *Store) AppendLine(relPath, line string) error {
 }
 
 // resolve joins a vault-relative path and guarantees the result stays inside the
-// root, rejecting absolute paths and any ".." escape.
+// root, rejecting absolute paths, any ".." escape and any existing ancestor
+// that reaches outside the root through a symlink.
 func (s *Store) resolve(relPath string) (string, error) {
 	clean := filepath.Clean(strings.TrimPrefix(relPath, string(filepath.Separator)))
 	if clean == "." || strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
@@ -158,7 +159,68 @@ func (s *Store) resolve(relPath string) (string, error) {
 	if rel, err := filepath.Rel(s.root, full); err != nil || strings.HasPrefix(rel, "..") {
 		return "", fmt.Errorf("vault: path %q escapes the vault", relPath)
 	}
+	// The store is what writes, so the symlink check lives here too: a directory
+	// inside the vault that links outside must not become a write path, not even
+	// when the leaf below it does not exist yet.
+	if err := s.checkResolved(full); err != nil {
+		return "", err
+	}
 	return full, nil
+}
+
+// checkResolved proves that path stays inside the root once symlinks are
+// resolved. It resolves the nearest existing ancestor and re-appends the
+// components that do not exist yet, because the unresolved form of a missing
+// leaf cannot be proven contained.
+func (s *Store) checkResolved(path string) error {
+	root, err := filepath.Abs(s.root)
+	if err != nil {
+		return err
+	}
+	realRoot, err := resolvedForm(root)
+	if err != nil {
+		return fmt.Errorf("vault: path %q escapes the vault: %w", path, err)
+	}
+	resolved, err := resolvedForm(path)
+	if err != nil {
+		return fmt.Errorf("vault: path %q escapes the vault: %w", path, err)
+	}
+	if !within(realRoot, resolved) {
+		return fmt.Errorf("vault: path %q escapes the vault", path)
+	}
+	return nil
+}
+
+// resolvedForm returns the symlink-resolved form of path. When parts of it do not
+// exist yet, the nearest existing ancestor is resolved and the missing
+// components are appended, so a missing leaf still carries the resolution of its
+// parent instead of falling back to the unresolved path.
+func resolvedForm(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	dir, base := filepath.Split(filepath.Clean(path))
+	if base == "" || dir == "" || filepath.Clean(dir) == filepath.Clean(path) {
+		return "", fmt.Errorf("no existing ancestor of %q", path)
+	}
+	parent, err := resolvedForm(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, base), nil
+}
+
+// within reports whether path is base or lives under it.
+func within(base, path string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *Store) resolveDir(folder string) (string, error) {
