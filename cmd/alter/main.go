@@ -5,6 +5,11 @@
 // store. There is no database and no scheduler: tasks and reminders will live in
 // the vault as markdown notes in a later slice, not in a runtime this binary
 // owns.
+//
+// The binary also answers `alter vault check [dir]`, a validator that checks the
+// vault's markdown entries against the alter-vault contract and exits. It is not
+// a second entry path: it takes no message, starts no bridge and leaves the
+// runtime untouched when no subcommand is given.
 package main
 
 import (
@@ -26,6 +31,13 @@ import (
 const ignoredBridgeSwitch = "ALTER_BRIDGE_ENABLED"
 
 func main() {
+	// The vault validator is a subcommand, not a second runtime: it validates and
+	// exits before the bridge is composed. With no subcommand the process behaves
+	// exactly as before.
+	if handled, code := runVaultCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+
 	logger := log.New(os.Stderr, "alter: ", log.LstdFlags)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

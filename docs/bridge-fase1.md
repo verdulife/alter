@@ -106,6 +106,22 @@ las resuelve contra el `cwd` del propio bridge (el repositorio), **nunca** contr
 `ALTER_BRIDGE_WORKDIR`: los ficheros pertenecen al repositorio y una configuración
 explícita del directorio de trabajo no debe romper el arranque.
 
+## Validación del vault
+
+El contrato de las entradas vive en la skill `alter-vault`, pero el esquema no se
+protege solo: Pi escribe esos ficheros con `write` y `edit`, y un frontmatter mal
+formado solo aparecería como un fallo silencioso del futuro cron. `alter vault
+check [dir]` recorre `tasks/`, `reminders/`, `events/` y `notes/` e ignora el
+resto, valida cada entrada contra el contrato (frontmatter plano delimitado,
+claves conocidas, enums, fechas RFC3339 con desfase, etiquetas en línea y campos
+obligatorios de cada tipo, incluido que un recordatorio sin `remind_at` no vale),
+imprime un problema por línea como `<ruta>:<línea>: <mensaje>` en stderr más un
+resumen en stdout, y sale con 1 si hay alguna entrada inválida y 0 si están todas
+limpias. Sin `dir` usa `ALTER_VAULT_DIR` y, si no está definido, `$HOME/vault`; un
+vault que no existe es error de uso (2), no una ejecución limpia. Es el comando
+que el daemon de la fase 3 llamará antes de fiarse de una entrada, y el mismo que
+se puede ejecutar a mano.
+
 ## Cómo arrancarlo
 
 ```bash
