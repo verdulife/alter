@@ -167,3 +167,24 @@ Reglas:
   turno. Sin respuesta, devuelve "sin respuesta" en vez de colgar el turno.
 - Las cuatro tools deben estar en `ALTER_BRIDGE_TOOLS`: `--tools` reemplaza la
   selección completa de Pi, no la amplía (hallazgo de L7).
+
+**L8** (verificación independiente de T7, commit `d0979fa`). Un `FAIL`
+bloqueante y tres advertencias:
+
+1. **`save_note` escapa del vault por un symlink.** Con un directorio enlazado
+   dentro del vault (`vault/inbox -> /mnt/data/inbox`) y un `folder` hijo que
+   todavía no existe (`inbox/sub`), `EvalSymlinks` devuelve ENOENT,
+   `resolvePath` cae al path sin resolver y `vault.SaveNote` solo comprueba
+   léxicamente: la nota se escribe fuera del root y la ruta devuelta al modelo
+   miente. Reproducido con un árbol temporal.
+2. `send_file` sobre un directorio responde 500, cuando el contrato dice que un
+   error de negocio es 4xx.
+3. El comentario de `ask_options` sobre el deadline promete más de lo que
+   garantiza: el límite depende de que el asker inyectado respete el contexto.
+4. Tests que pasarían sin el comportamiento: el de timeout no fija
+   `DefaultAskTimeout=10m`, el de token no prueba "autorización antes de
+   routing", y falta el caso de carpeta a través de un directorio enlazado.
+
+Decisión: se corrige en `internal/tools/server.go` (resolver sobre el ancestro
+existente más cercano) y, por defensa en profundidad, en `internal/vault`
+(`resolve` con la misma comprobación), porque el store es quien escribe.
