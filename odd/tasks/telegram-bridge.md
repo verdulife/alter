@@ -263,10 +263,12 @@ ejecutarse fuera del bucle con `turnMu` (siguen serializados) y `Run` los espera
 antes de cerrar. Es el cambio más ancho de la tarea y el que más merece revisión.
 
 `--no-approve` se retira: las confirmaciones ya tienen a quién responder.
-Política del gate: `bash`, `write` y `edit` siempre piden confirmación; `read`,
-`grep`, `find`, `ls`, `save_note`, `append_note`, `send_file` y `ask_options`
-nunca; cualquier otra herramienta (incluidas las de paquetes) también pregunta,
-para que nada se cuele por no estar en la lista.
+Política del gate (revisada en L20): solo pide confirmación lo destructivo o
+irreversible —`rm`, `mv` sobre destino existente, `dd`, `truncate`, `chmod`,
+`chown`, `systemctl`, `kill`, `sudo`, instaladores, `crontab`, redirecciones que
+sobrescriben, `docker rm/prune`, y git que publica o reescribe—. `edit` nunca;
+`write` solo si el fichero existe o queda fuera del home. Todo lo demás se
+ejecuta y queda en el journal.
 
 **L16** (verificación independiente de T13, commit `1da4653`). Fail-closed real,
 slot compartido sin cruces y dispatch de turnos correcto (probado: cancelar con
@@ -303,3 +305,15 @@ proyecto, que Pi descubre desde el cwd hacia arriba parando en la raíz del repo
 Solo existen para Alter, están versionadas y su contenido no entra en contexto
 hasta que el modelo las invoca. El acceso a todo el sistema no se pierde: `bash`
 trabaja con rutas absolutas y el vault sigue en `$HOME/vault`.
+
+**L20** (rediseño del gate, 2026-10-29). El primer gate pedía permiso para
+`bash`, `write` y `edit` **siempre**. En uso real eso es un peaje, no una
+protección: la primera conversación se llenó de botones por `ls` y `cat`.
+Criterio corregido: se pregunta solo por lo destructivo o irreversible y por las
+acciones de git que publican o reescriben; `edit` nunca pregunta porque el diff es
+la revisión. Lo que el clasificador no sabe decidir, pregunta igual.
+
+Verificado con `scripts/gate-check.mjs`: 86 casos sobre el clasificador real,
+61/84 correctos en la versión anterior y 86/86 en esta. Límite conocido: el gate
+es un clasificador, no un sandbox; el contenido de un script o binario que ya
+existe no se lee.

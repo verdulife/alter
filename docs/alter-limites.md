@@ -52,16 +52,59 @@ nombre y la descripción hasta que el modelo las invoca.
 
 ## Aprobaciones
 
-Ninguna herramienta se ejecuta sin control cuando es destructiva:
+Pedir permiso para cada `bash`, `write` y `edit` era un peaje, no una defensa: un
+muro de botones se aprueba sin leer. **El permiso es para lo que no se puede
+deshacer**, y la extensión decide caso por caso en `tool_call`:
 
-1. Una extensión intercepta cada llamada en `tool_call`.
-2. Si la acción es destructiva o sale del ámbito esperado, pide confirmación.
-3. Esa confirmación viaja a Telegram como dos botones.
-4. Tu pulsación responde a Pi y la herramienta se ejecuta o se bloquea.
-5. Si no respondes en el plazo, **se bloquea**. Fail-closed, nunca fail-open.
+| Herramienta | Pide confirmación |
+|---|---|
+| `edit` | nunca: es un cambio quirúrgico y el diff es la revisión |
+| `write` | cuando el archivo ya existe, o cuando la ruta cae fuera de `$HOME` |
+| `bash` | cuando el comando puede destruir, publicar o escalar |
+| `read`, `grep`, `find`, `ls`, `send_file`, `ask_options` | nunca |
+| cualquier otra (paquetes, MCP) | siempre: sin regla no hay decisión |
+
+La ruta se resuelve como la resuelve Pi: `~` y `~/x` contra `$HOME`, el resto
+contra el directorio de trabajo de la sesión. `~usuario` no se expande (Pi
+tampoco lo hace), así que se pregunta.
+
+Qué pide `bash`, sobre el comando entero y no solo sobre su primera palabra
+(`sudo rm` y `FOO=1 rm` son el mismo acto que `rm`, y `git -C x push` publica
+igual que `git push`):
+
+- borrar o truncar: `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`, `mkfs`,
+  `find -delete`/`-exec`;
+- sobrescribir por redirección: `>` sobre un archivo que ya existe, y `>` o `>>`
+  sobre una ruta sensible (`~/.ssh`, `~/.bashrc`, los arranques de shell, `/etc`,
+  `/usr`…). `>>` añade y no destruye, así que solo pregunta por esas rutas; una
+  ruta con variables (`$HOME/…`) no se puede resolver y también pregunta;
+- `mv` cuyo destino ya existe;
+- permisos y propiedad: `chmod`, `chown`, `chgrp`, `chattr`;
+- procesos y servicios: `kill`, `pkill`, `killall`, `systemctl`, `service`,
+  `shutdown`, `reboot`, `poweroff`;
+- la puerta de atrás de los privilegios: `sudo`, `doas`;
+- estado del sistema y paquetes: `apt`, `apt-get`, `dpkg`, `brew`, `snap`,
+  `npm i -g`, `pip install`, `cargo install`, `crontab`;
+- git que publica o reescribe: `push`, `reset --hard`, `clean -f`, `rebase`,
+  `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
+  `stash drop`, `filter-branch`;
+- guiones remotos: `curl` o `wget` canalizados a un intérprete;
+- contenedores: `docker rm`, `rmi`, `prune`, `compose down -v`.
+
+Lo que el clasificador no puede decidir, pregunta: comillas sin cerrar, una ruta
+que no resuelve, una línea partida en demasiadas piezas. El cuerpo de un heredoc
+se clasifica línea a línea, así que una línea que empiece por un programa
+peligroso pregunta aunque sea texto: se equivoca pidiendo permiso, nunca al
+revés.
+
+El botón recorre el mismo camino: la pregunta viaja a Telegram como dos botones
+y tu pulsación la responde; un rechazo, una cancelación o un error bloquean la
+llamada, y sin respuesta en el plazo **se bloquea**. Cada decisión deja una línea
+en el diario (`alter-gate: allow bash …`, `alter-gate: ask (git push publica en
+el remoto) bash …`), así que un turno real se puede auditar después.
 
 Sin terminal no hay nadie mirando: el botón es la única aprobación real que
-existe.
+existe, y por eso el diario es la otra mitad de la defensa.
 
 ## Límites duros
 
@@ -91,9 +134,22 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 4. **Sin aislamiento entre conversación y sistema.** Una inyección de prompt en
    un contenido que Pi lea (`fetch_content`, un PDF, un archivo del usuario)
    podría intentar dirigir sus herramientas. El gate de confirmación es la
-   defensa principal, no la única: conviene revisar qué se aprueba.
+   defensa principal, no la única: conviene revisar qué se aprueba, y ahora la
+   mayoría de las acciones no se aprueba: se revisa después, en el diario.
 5. **TOCTOU en el vault**: la contención de rutas de `send_file` se comprueba y
    luego se lee. Con `bash` disponible, esa defensa deja de ser una frontera real.
+6. **El gate es un clasificador, no un sandbox.** Reconoce programas,
+   subcomandos y redirecciones; una forma que no conozca —un script propio, un
+   binario que borra por su cuenta, un alias dentro de un archivo— pasa sin
+   botón. Y como `bash` corre sin permiso dentro de `$HOME`, un turno puede
+   borrar o cifrar archivos tuyos sin que veas nada. La red de seguridad ya no es
+   el botón: es el diario y lo que revises en él.
+7. **`write` de un archivo nuevo dentro de `$HOME` no pregunta**, tampoco en
+   rutas como `~/.ssh/authorized_keys` o `~/.bashrc` cuando aún no existen. Crear
+   un archivo no destruye nada y pedir permiso por cada archivo nuevo volvía a
+   ser el peaje; lo que queda como frontera es que ese archivo no exista todavía.
+   El `bash` equivalente (`echo … >> ~/.ssh/authorized_keys`) sí pregunta, porque
+   la redirección escribe sobre una ruta sensible.
 
 ## Lo que Alter no hace
 

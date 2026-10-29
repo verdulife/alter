@@ -200,8 +200,8 @@ responden por botones.
 
 Las consecuencias son las que declara `docs/alter-limites.md`: con `bash` y `write`
 en `$HOME`, un mensaje puede tocar cualquier cosa tuya. La frontera real es el gate
-de aprobación (todo `bash`, `write` y `edit` pide botón) más el token del bot y tu
-chat ID.
+selectivo (solo lo que destruye, publica o escala pide botón; `edit` nunca y el
+resto se revisa después en el journal) más el token del bot y tu chat ID.
 
 ## Qué está verificado y qué no
 
