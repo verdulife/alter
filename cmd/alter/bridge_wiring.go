@@ -67,6 +67,11 @@ type bridgeAsset struct {
 // path and the variable behind it. It runs before the tools server is bound and
 // before Pi can be spawned, so a misconfigured bridge never starts in a
 // half-useful state.
+//
+// Relative paths are resolved against the bridge's own working directory (the
+// repository root in a normal deployment), never against the child's WorkDir:
+// the assets belong to this repository, not to $HOME, and the child starts in
+// $HOME where they do not exist.
 func verifyBridgeAssets(cfg config.Config) error {
 	assets := make([]bridgeAsset, 0, len(cfg.BridgePromptFiles)+len(cfg.BridgeExtensions))
 	for _, path := range cfg.BridgePromptFiles {
@@ -165,7 +170,7 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	}
 
 	// S6: every note and attachment write goes through the vault store rooted at
-	// the configured vault, which is also Pi's working directory.
+	// the configured vault. The vault is only the store: Pi's cwd is WorkDir.
 	store := vault.New(cfg.VaultDir, r.inboundMax)
 
 	client := telegram.NewClientWithBase(cfg.TelegramToken, cfg.TelegramAPIBase)
@@ -203,7 +208,8 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		Tools:       cfg.BridgeTools,
 		Extensions:  cfg.BridgeExtensions,
 		PromptFiles: cfg.BridgePromptFiles,
-		VaultDir:    cfg.VaultDir,
+		// cwd = the owner's directory ($HOME by default), never the vault.
+		WorkDir: cfg.WorkDir,
 		// The extension discovers the bridge tools through these two variables.
 		Env: map[string]string{
 			"ALTER_TOOLS_URL":   toolsURL,

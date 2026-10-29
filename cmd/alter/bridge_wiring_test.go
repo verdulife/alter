@@ -333,7 +333,10 @@ type bridgeHarness struct {
 	stages   *stageRecorder
 	report   string
 	vaultDir string
-	cancel   context.CancelFunc
+	// workDir is the cwd the bridge must hand Pi: the owner's directory, not the
+	// vault.
+	workDir string
+	cancel  context.CancelFunc
 	// finish is closed once Run has returned; runErr is written before it, so a
 	// reader that observed the close sees the error without a second wait.
 	finish chan struct{}
@@ -344,12 +347,20 @@ type bridgeHarness struct {
 // runs it.
 func startBridge(t *testing.T, scenario string, failPolls int, updates ...telegram.Update) *bridgeHarness {
 	t.Helper()
+	return startBridgeWith(t, nil, scenario, failPolls, updates...)
+}
+
+// startBridgeWith is startBridge with a hook that adjusts the configuration of
+// the case under test before the runtime is composed.
+func startBridgeWith(t *testing.T, mutate func(*config.Config), scenario string, failPolls int, updates ...telegram.Update) *bridgeHarness {
+	t.Helper()
 
 	bot, srv := newFakeBot(t, failPolls, updates...)
 	spawns := &argsRecorder{}
 	stages := &stageRecorder{}
 	report := filepath.Join(t.TempDir(), "pi-report.json")
 	vaultDir := t.TempDir()
+	workDir := t.TempDir()
 
 	t.Setenv(envFakePiScenario, scenario)
 	t.Setenv(envFakePiReport, report)
@@ -359,10 +370,14 @@ func startBridge(t *testing.T, scenario string, failPolls int, updates ...telegr
 		TelegramChatID:  testOwnerID,
 		TelegramAPIBase: srv.URL,
 		VaultDir:        vaultDir,
+		WorkDir:         workDir,
 		BridgeSessionID: "test-session",
 		BridgeTools:     "read,grep,find,ls,save_note,append_note,send_file,ask_options",
 		BridgeTimeout:   20 * time.Second,
 		PiBin:           "pi",
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 
 	rt, err := newBridgeRuntime(cfg, log.New(io.Discard, "", 0),
@@ -381,6 +396,7 @@ func startBridge(t *testing.T, scenario string, failPolls int, updates ...telegr
 		stages:   stages,
 		report:   report,
 		vaultDir: vaultDir,
+		workDir:  workDir,
 		cancel:   cancel,
 		finish:   make(chan struct{}),
 	}
@@ -464,11 +480,15 @@ func TestBridgeTextTurnStreamsDraftAndDeliversFinal(t *testing.T) {
 	if !strings.HasPrefix(report.ToolsURL, "http://127.0.0.1:") {
 		t.Errorf("ALTER_TOOLS_URL = %q, want a loopback tools server", report.ToolsURL)
 	}
-	if !samePath(report.Cwd, h.vaultDir) {
-		t.Errorf("pi working directory = %q, want the vault %q", report.Cwd, h.vaultDir)
+	if !samePath(report.Cwd, h.workDir) {
+		t.Errorf("pi working directory = %q, want the configured work dir %q", report.Cwd, h.workDir)
+	}
+	if samePath(report.Cwd, h.vaultDir) {
+		t.Errorf("pi working directory = %q: the vault must no longer be Pi's cwd", report.Cwd)
 	}
 
-	// Pi must only ever receive the configured allowlist (S7): no bash/edit/write.
+	// An explicitly configured allowlist must still reach Pi verbatim: narrowing is
+	// opt-in, and the bridge never adds or drops a tool on its own (T11).
 	args := h.spawns.first()
 	if got := flagValue(args, "--tools"); got != "read,grep,find,ls,save_note,append_note,send_file,ask_options" {
 		t.Errorf("--tools = %q, want the configured allowlist", got)
@@ -483,6 +503,41 @@ func TestBridgeTextTurnStreamsDraftAndDeliversFinal(t *testing.T) {
 	// ask_options stub reports "sin respuesta" instead of hanging the turn.
 	if err := h.stop(t); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run returned %v, want context.Canceled after cancellation", err)
+	}
+}
+
+// TestBridgeWithoutAllowlistRestrictsNoTools proves T11 at the composition level:
+// with no BridgeTools configured (the new default) the bridge passes no --tools at
+// all, so Pi runs with its own full selection from the global configuration. Pi
+// still starts in the configured work dir, and the vault stays only the store.
+func TestBridgeWithoutAllowlistRestrictsNoTools(t *testing.T) {
+	h := startBridgeWith(t, func(cfg *config.Config) { cfg.BridgeTools = "" }, "stream", 0, telegram.Update{
+		ID: 1,
+		Message: &telegram.Message{
+			MessageID: 13,
+			Chat:      telegram.Chat{ID: testOwnerID},
+			Text:      "hola Pi",
+		},
+	})
+
+	h.bot.waitDelivery(t)
+
+	args := h.spawns.first()
+	for _, arg := range args {
+		if arg == "--tools" {
+			t.Errorf("args contain --tools with no configured allowlist: %v", args)
+		}
+	}
+	// The removed read-only allowlist must not come back as a bare value either.
+	for _, arg := range args {
+		if arg == "read,grep,find,ls" || arg == "read,grep,find,ls,save_note,append_note,send_file,ask_options" {
+			t.Errorf("args carry the tool allowlist %q without being asked: %v", arg, args)
+		}
+	}
+
+	report := h.readReport(t)
+	if !samePath(report.Cwd, h.workDir) {
+		t.Errorf("pi working directory = %q, want the work dir %q", report.Cwd, h.workDir)
 	}
 }
 

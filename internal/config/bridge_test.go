@@ -15,6 +15,7 @@ func clearBridgeEnv(t *testing.T) {
 		"ALTER_TELEGRAM_API_BASE",
 		"ALTER_VAULT_DIR",
 		"ALTER_BRIDGE_ENABLED",
+		"ALTER_BRIDGE_WORKDIR",
 		"ALTER_BRIDGE_SESSION_ID",
 		"ALTER_BRIDGE_TOOLS",
 		"ALTER_BRIDGE_PROMPT_FILES",
@@ -39,14 +40,18 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	if cfg.VaultDir != wantVault {
 		t.Errorf("VaultDir = %q, want %q", cfg.VaultDir, wantVault)
 	}
+	// Pi works in $HOME, not in the vault: the bridge is the owner's shell.
+	if cfg.WorkDir != home {
+		t.Errorf("WorkDir = %q, want $HOME %q", cfg.WorkDir, home)
+	}
 	if cfg.BridgeEnabled {
 		t.Error("BridgeEnabled = true, want false by default")
 	}
 	if cfg.BridgeSessionID != "telegram" {
 		t.Errorf("BridgeSessionID = %q, want telegram", cfg.BridgeSessionID)
 	}
-	if cfg.BridgeTools != "read,grep,find,ls,save_note,append_note,send_file,ask_options" {
-		t.Errorf("BridgeTools = %q, want the read-only tools plus the deterministic ones", cfg.BridgeTools)
+	if cfg.BridgeTools != "" {
+		t.Errorf("BridgeTools = %q, want empty so Pi keeps its own tool selection", cfg.BridgeTools)
 	}
 	// A run from the repository root must work with no extra configuration, so
 	// both lists default to the repository-relative assets Pi needs.
@@ -56,8 +61,8 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	if len(cfg.BridgeExtensions) != 1 || cfg.BridgeExtensions[0] != "internal/tools/extension/index.ts" {
 		t.Errorf("BridgeExtensions = %v, want [internal/tools/extension/index.ts]", cfg.BridgeExtensions)
 	}
-	if cfg.BridgeTimeout != 120*time.Second {
-		t.Errorf("BridgeTimeout = %v, want 120s", cfg.BridgeTimeout)
+	if cfg.BridgeTimeout != 300*time.Second {
+		t.Errorf("BridgeTimeout = %v, want 300s", cfg.BridgeTimeout)
 	}
 }
 
@@ -125,8 +130,8 @@ func TestLoadBridgeMalformedFallsBack(t *testing.T) {
 	if cfg.BridgeEnabled {
 		t.Error("BridgeEnabled = true, want false on malformed env")
 	}
-	if cfg.BridgeTimeout != 120*time.Second {
-		t.Errorf("BridgeTimeout = %v, want 120s on malformed env", cfg.BridgeTimeout)
+	if cfg.BridgeTimeout != 300*time.Second {
+		t.Errorf("BridgeTimeout = %v, want 300s on malformed env", cfg.BridgeTimeout)
 	}
 	if len(cfg.BridgePromptFiles) != 1 || cfg.BridgePromptFiles[0] != "/b.md" {
 		t.Errorf("BridgePromptFiles = %v, want [/b.md] (empty entries dropped)", cfg.BridgePromptFiles)

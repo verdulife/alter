@@ -23,12 +23,26 @@ entrada de texto libre; Pi es el motor.
 - **Preguntas con opciones (S3, S7).** La tool `ask_options` publica una pregunta
   con botones `callback_data`. La pulsación llega por el poller, resuelve la
   espera y **nunca** se convierte en un prompt para Pi.
-- **Tools deterministas (S7).** Pi no tiene `bash`, `edit` ni `write`. Lee el vault
-  con `read`, `grep`, `find` y `ls` (con `cwd` = vault) y solo escribe a través de
-  `save_note`, `append_note`, `send_file` y `ask_options`, servidas por un servidor
-  HTTP en `127.0.0.1:0` con token efímero por proceso.
+- **Tools deterministas (S7).** Pi tiene la **misma caja de herramientas que en
+  una sesión de terminal** (T11): `bash`, `edit`, `write`, `read`, `grep`, `find`,
+  `ls`, más las cuatro deterministas de Alter (`save_note`, `append_note`,
+  `send_file`, `ask_options`), servidas por un servidor HTTP en `127.0.0.1:0` con
+  token efímero por proceso, más todo lo que aporten los paquetes cargados
+  (memoria, web, subagentes). Ya no hay allowlist forzada ni restricción de solo
+  lectura: la contención es la identidad y, más adelante, las aprobaciones (T13).
+- **Carga global de Pi (T11).** El bridge **no** desactiva el descubrimiento: no se
+  pasan `--no-extensions`, `--no-skills`, `--no-prompt-templates`, `--no-themes`
+  ni `--no-context-files`, así que Pi carga la misma configuración global que en
+  una terminal (gentle-pi, gentle-engram, pi-btw, pi-web-access, sus skills y los
+  ficheros de contexto). Las rutas `-e` y los `--append-system-prompt` del bridge
+  son **aditivos** a lo descubierto, no un reemplazo.
+- **Directorio de trabajo (T11).** Pi arranca con `cwd` = `ALTER_BRIDGE_WORKDIR`,
+  que por defecto es `$HOME`. Ve todo lo que ves tú. El vault ya **no** es el `cwd`:
+  es solo el almacén en el que escriben las tools deterministas.
 - **Sesión persistente.** Un único proceso `pi --mode rpc` con sesión nombrada, así
   que la conversación conserva el hilo entre mensajes.
+- **Timeout amplio.** El tope por turno son 300 s por defecto
+  (`ALTER_BRIDGE_TIMEOUT`), porque un turno con `bash` puede tardar.
 - **Un solo chat.** Solo se atiende el chat del dueño (`TELEGRAM_CHAT_ID`); el
   resto de chats y de tipos de evento se ignoran.
 
@@ -43,11 +57,12 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `TELEGRAM_CHAT_ID` | — (obligatorio) | Chat del dueño: único destinatario y única fuente aceptada. |
 | `ALTER_BRIDGE_ENABLED` | `false` | `true` activa el bridge como **única** ruta de texto libre. |
 | `ALTER_BRIDGE_SESSION_ID` | `telegram` | Sesión de Pi que se reanuda entre mensajes. |
-| `ALTER_BRIDGE_TOOLS` | `read,grep,find,ls,save_note,append_note,send_file,ask_options` | Allowlist de `--tools`. **Reemplaza** la selección completa de Pi: si quitas las cuatro últimas, Pi no puede escribir ni preguntar nada. |
+| `ALTER_BRIDGE_TOOLS` | vacío (sin `--tools`) | Allowlist **opcional** de `--tools`. Vacío no pasa el flag, así que Pi conserva su selección completa por defecto. Si lo rellenas, **reemplaza** la selección entera: nombra también `save_note`, `append_note`, `send_file` y `ask_options` o Pi no podrá usarlas. |
 | `ALTER_BRIDGE_PROMPT_FILES` | `alter-persona.md` | Ficheros markdown para `--append-system-prompt`, en orden. Separador `;`. |
 | `ALTER_BRIDGE_EXTENSIONS` | `internal/tools/extension/index.ts` | Extensiones cargadas con `-e`. Separador `;`. |
-| `ALTER_BRIDGE_TIMEOUT` | `120s` | Tope de un turno completo (spawn + modelo + tools + respuesta). |
-| `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault; también es el `cwd` de Pi. |
+| `ALTER_BRIDGE_TIMEOUT` | `300s` | Tope de un turno completo (spawn + modelo + tools + respuesta). |
+| `ALTER_BRIDGE_WORKDIR` | `$HOME` | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. |
+| `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: solo el almacén que usan las tools y los archivos entrantes. No es el `cwd` de Pi. |
 | `ALTER_TELEGRAM_API_BASE` | `https://api.telegram.org` | Base URL del Bot API (S8). |
 | `ALTER_PI_BIN` | `pi` | Binario de Pi. Un servicio (systemd/cron) casi siempre necesita ruta absoluta porque su `PATH` no incluye fnm. |
 | `ALTER_PI_PROVIDER` | vacío | `--provider`; vacío deja que Pi use su configuración. |
@@ -56,7 +71,10 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 
 Las rutas de `ALTER_BRIDGE_PROMPT_FILES` y `ALTER_BRIDGE_EXTENSIONS` son
 **relativas al repositorio**, así que arrancar desde la raíz del repositorio
-funciona sin configurar nada. Se admiten rutas absolutas.
+funciona sin configurar nada. Se admiten rutas absolutas. La guardia de arranque
+las resuelve contra el `cwd` del propio bridge (el repositorio), **nunca** contra
+`ALTER_BRIDGE_WORKDIR`: los ficheros pertenecen al repositorio, y el hijo arranca
+en `$HOME`, donde no existen.
 
 ## Cómo arrancarlo
 
@@ -106,12 +124,24 @@ comprueba nada: el camino antiguo no tiene ficheros que cargar.
 2. **`internal/tools/extension/index.ts`** — la extensión que registra
    `save_note`, `append_note`, `send_file` y `ask_options` contra el servidor de
    tools del bridge (`ALTER_TOOLS_URL` + `ALTER_TOOLS_TOKEN`, inyectados por el
-   bridge en el entorno de Pi, nunca por el modelo). Sin ella Pi se queda con las
-   tools nativas de solo lectura: puede leer el vault y responder, pero no guardar,
-   no mandar ficheros y no preguntar con botones.
+   bridge en el entorno de Pi, nunca por el modelo). Sin ella Pi conserva sus
+   tools nativas, pero no guarda notas, no manda ficheros y no pregunta con
+   botones.
 
-Ambos se cargan siempre de forma explícita: `--no-extensions` desactiva el
-descubrimiento, pero las rutas `-e` siguen cargando.
+Ambos se cargan siempre de forma explícita con `-e` y `--append-system-prompt`,
+**además** de lo que Pi descubra por su cuenta en tu configuración global.
+
+## Permisos y ámbito (T11)
+
+El bridge **no** recorta a Pi. Arranca con `--mode rpc`, `--no-approve` (las
+aprobaciones por botones llegan en T13), las rutas `-e` del bridge, la sesión
+nombrada y los `--append-system-prompt`; todo lo demás lo decide Pi con tu
+configuración global. `--tools` solo aparece si configuras `ALTER_BRIDGE_TOOLS` a
+mano.
+
+Las consecuencias son las que declara `docs/alter-limites.md`: con `bash` y `write`
+en `$HOME`, un mensaje puede tocar cualquier cosa tuya. Mientras T13 no exista, la
+frontera es el token del bot y tu chat ID, no una allowlist.
 
 ## Qué está verificado y qué no
 
@@ -126,6 +156,10 @@ descubrimiento, pero las rutas `-e` siguen cargando.
 - Bridge completo contra un RPC falso: drafts, entrega final, línea humana cuando
   Pi no devuelve texto, reintento tras un `getUpdates` fallido, y orden de
   apagado (poller → tools → sesión).
+- Ámbito del bridge (T11): los argumentos no llevan ningún `--no-*` salvo
+  `--no-approve`, un `ALTER_BRIDGE_TOOLS` vacío **no** emite `--tools`, el `cwd`
+  del hijo es `ALTER_BRIDGE_WORKDIR` (nunca el vault) y el defecto de timeout es
+  300 s.
 - Archivos entrantes: descarga única, guardado en `inbox/`, rechazo por tamaño
   declarado (sin descargar) y por tamaño real (durante el stream), y que un fallo
   de descarga no tumba el canal.
@@ -146,8 +180,9 @@ descubrimiento, pero las rutas `-e` siguen cargando.
   prueba de verdad.
 - **`pi` real y LLM real.** Todo el protocolo RPC se probó contra un proceso falso
   reejecutando el binario de test. No hay evidencia de que el Pi instalado acepte
-  exactamente esta combinación de flags (`--no-extensions -e ... --tools ...
-  --append-system-prompt ... --session-id ...`).
+  exactamente esta combinación de flags (`-e ... --session-id ...
+  --append-system-prompt ...`, sin ningún `--no-*` salvo `--no-approve`), ni de
+  que cargue la configuración global descubierta sin degradar el arranque.
 - **Pulsación física de un botón.** El callback se simula como `update` del fake.
 - **Carga de la extensión TypeScript por Pi** y el contrato exacto de
   `pi.registerTool` en la versión desplegada.

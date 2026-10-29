@@ -193,7 +193,7 @@ func TestVerifyArgCardinality(t *testing.T) {
 		Tools:       "read,grep,find,ls",
 		Extensions:  []string{"/ext/a.ts", "/ext/b.ts"},
 		PromptFiles: []string{"/p.md", "/f.md"},
-		VaultDir:    t.TempDir(),
+		WorkDir:     t.TempDir(),
 	}, sp, "echo")
 	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
 		t.Fatalf("prompt: %v", err)

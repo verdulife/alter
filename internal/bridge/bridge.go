@@ -3,13 +3,19 @@
 // writes prompts to stdin and reads protocol records from stdout.
 //
 // The process is spawned ONCE and reused across prompts with session
-// persistence ON (no `--no-session`), so Pi remembers the conversation. The load
-// is clean (discovery off); only explicitly configured extensions, the tool
-// allowlist and the system-prompt files are pulled in.
+// persistence ON (no `--no-session`), so Pi remembers the conversation.
 //
-// Pi does not write (S7): it runs with cwd = vault root and the read-only tool
-// set (read, grep, find, ls). Every mutation belongs to deterministic tools
-// owned by the bridge, never to the model.
+// Pi is a full gentle-shell, not a trimmed assistant (T11): its discovery stays
+// enabled, so it loads the same global configuration as a terminal session
+// (packages, extensions, skills, prompt templates, themes, context files). The
+// bridge only ADDS: explicit `-e` extensions, persona files appended to the
+// system prompt, and — when configured — a tool allowlist. With no allowlist
+// configured Pi keeps its own default selection, which includes modifying tools
+// (`bash`, `edit`, `write`).
+//
+// Pi works in Config.WorkDir ($HOME in production), so it sees the same tree the
+// owner sees in a terminal. The vault is only the store the deterministic bridge
+// tools write through, never the cwd.
 package bridge
 
 import (
@@ -51,18 +57,24 @@ type Config struct {
 	Timeout time.Duration
 	// SessionID names the persistent session (--session-id).
 	SessionID string
-	// Tools is the pi tool allowlist (--tools). Empty falls back to
-	// defaultReadOnlyTools: Pi must never receive its default tool set, which
-	// includes write tools (S7).
+	// Tools is the optional pi tool allowlist (--tools). Empty, the default,
+	// means "no restriction": the flag is not passed at all, so Pi uses its own
+	// default selection from the global configuration, including modifying tools.
+	// --tools REPLACES that selection, so setting this narrows the bridge on
+	// purpose and is never a silent fallback.
 	Tools string
-	// Extensions are loaded explicitly with -e, one flag per path. Explicit
-	// paths still load while --no-extensions keeps discovery disabled.
+	// Extensions are loaded explicitly with -e, one flag per path. They are
+	// additive: extension discovery is NOT disabled, so the owner's global
+	// packages load alongside these paths.
 	Extensions []string
 	// PromptFiles are appended with --append-system-prompt, one flag per file.
 	PromptFiles []string
-	// VaultDir is the working directory of the process: cwd = vault root is how
-	// Pi reads the vault while staying read-only.
-	VaultDir string
+	// WorkDir is the working directory of the child process (cwd). Empty inherits
+	// the bridge's own working directory. Production passes the configured
+	// ALTER_BRIDGE_WORKDIR, which defaults to $HOME, so Pi sees the same tree a
+	// terminal session sees. The vault path is not part of this struct: it belongs
+	// to the tools server config, never to the child's cwd.
+	WorkDir string
 	// Env holds extra environment variables for the child process, applied on
 	// top of the inherited environment. The bridge tools server hands Pi its URL
 	// and token this way (ALTER_TOOLS_URL / ALTER_TOOLS_TOKEN). Keys are applied
@@ -114,20 +126,12 @@ func (w errWriter) Write(p []byte) (int, error) {
 }
 
 // NewSession builds a Session with production defaults for Bin and Timeout.
-// defaultReadOnlyTools is the allowlist applied when Config.Tools is empty. Pi
-// reads the vault with these four and mutates nothing directly; writes go
-// through the deterministic extension tools.
-const defaultReadOnlyTools = "read,grep,find,ls"
-
 func NewSession(cfg Config, opts ...Option) *Session {
 	if cfg.Bin == "" {
 		cfg.Bin = "pi"
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 60 * time.Second
-	}
-	if cfg.Tools == "" {
-		cfg.Tools = defaultReadOnlyTools
 	}
 	s := &Session{
 		cfg:    cfg,
@@ -206,9 +210,10 @@ func (s *Session) ensureStarted() error {
 // with exec.CommandContext) so the process is not bound to one prompt's context.
 func (s *Session) start() error {
 	cmd := s.newCmd(s.cfg.Bin, s.args()...)
-	// cwd = vault root (S7): Pi reads the vault through its read-only tools.
-	if s.cfg.VaultDir != "" {
-		cmd.Dir = s.cfg.VaultDir
+	// cwd = the configured work dir ($HOME in production): Pi sees the owner's
+	// tree, exactly as a terminal session does.
+	if s.cfg.WorkDir != "" {
+		cmd.Dir = s.cfg.WorkDir
 	}
 	if env := s.childEnv(cmd.Env); env != nil {
 		cmd.Env = env
@@ -310,8 +315,14 @@ func (s *Session) killProcess() {
 	s.readerDone = nil
 }
 
-// args builds the pi CLI arguments: clean load, explicit extensions, the tool
-// allowlist, the named persistent session and the persona files.
+// args builds the pi CLI arguments: RPC mode, the pinned provider/model, the
+// explicitly configured extensions, persona files and session, and — only when
+// configured — a tool allowlist.
+//
+// Nothing disables discovery: Pi loads the same global configuration it loads in
+// a terminal (packages, extensions, skills, prompt templates, themes, context
+// files), so the bridge is a full gentle-shell. The -e and
+// --append-system-prompt entries are additive on top of it.
 func (s *Session) args() []string {
 	args := []string{"--mode", "rpc"}
 	if s.cfg.Provider != "" {
@@ -320,20 +331,17 @@ func (s *Session) args() []string {
 	if s.cfg.Model != "" {
 		args = append(args, "--model", s.cfg.Model)
 	}
-	// Clean load. Session persistence stays ON: --no-session is never passed.
-	args = append(args,
-		"--no-extensions",
-		"--no-skills",
-		"--no-prompt-templates",
-		"--no-themes",
-		"--no-context-files",
-		"--no-approve",
-	)
+	// --no-approve stays until the bridge handles approvals itself (T13).
+	// Session persistence stays ON: --no-session is never passed.
+	args = append(args, "--no-approve")
 	for _, ext := range s.cfg.Extensions {
 		args = append(args, "-e", ext)
 	}
-	// NewSession always resolves an allowlist, so this is never empty.
-	args = append(args, "--tools", s.cfg.Tools)
+	// Empty Tools means "no restriction": omitting the flag keeps Pi's own
+	// selection instead of replacing it with an allowlist.
+	if s.cfg.Tools != "" {
+		args = append(args, "--tools", s.cfg.Tools)
+	}
 	if s.cfg.SessionID != "" {
 		args = append(args, "--session-id", s.cfg.SessionID)
 	}

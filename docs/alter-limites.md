@@ -58,7 +58,7 @@ existe.
 | Usuarios | Solo tu chat ID | Un dueño, un flujo |
 | Turnos | Uno a la vez | La sesión es un hilo único |
 | Preguntas pendientes | Una | Evita respuestas cruzadas |
-| Timeout de turno | Configurable, 120 s por defecto | Un `bash` largo necesita más |
+| Timeout de turno | Configurable, 300 s por defecto | Un `bash` largo necesita margen |
 | Archivos entrantes | 20 MB con la API cloud; sin límite con Bot API server propio | Techo de descarga de Telegram |
 | Directorio de trabajo | `$HOME` | Es tu gentle-shell |
 

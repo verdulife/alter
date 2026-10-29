@@ -208,14 +208,18 @@ func TestPromptStreamAccumulatesDeltasAndReturnsAuthoritativeText(t *testing.T) 
 	}
 }
 
-func TestArgsUseCleanLoadToolsExtensionsAndPromptFiles(t *testing.T) {
+// TestArgsLoadGlobalConfigWithExplicitAssets pins T11: Pi starts with the same
+// global configuration it loads in a terminal. Discovery stays enabled (no
+// --no-* switch except --no-approve, which T13 replaces), while the bridge assets
+// stay additive through -e and --append-system-prompt.
+func TestArgsLoadGlobalConfigWithExplicitAssets(t *testing.T) {
 	spawns := &fakeSpawns{}
 	s := newTestSession(t, Config{
 		Tools:       "read,grep,find,ls",
 		Extensions:  []string{"/ext/tools.ts", "/ext/extra.ts"},
 		PromptFiles: []string{"/persona.md", "/formato.md"},
 		SessionID:   "alter-telegram",
-		VaultDir:    t.TempDir(),
+		WorkDir:     t.TempDir(),
 	}, spawns, "", "echo")
 	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
 		t.Fatalf("Prompt: %v", err)
@@ -237,13 +241,14 @@ func TestArgsUseCleanLoadToolsExtensionsAndPromptFiles(t *testing.T) {
 		{"--append-system-prompt", 2},
 		{"--tools", 1},
 		{"--session-id", 1},
-		{"--no-extensions", 1},
-		{"--no-skills", 1},
-		{"--no-prompt-templates", 1},
-		{"--no-themes", 1},
-		{"--no-context-files", 1},
 		{"--no-approve", 1},
 		{"--no-session", 0},
+		// The global load must stay on: each of these disables a piece of it.
+		{"--no-extensions", 0},
+		{"--no-skills", 0},
+		{"--no-prompt-templates", 0},
+		{"--no-themes", 0},
+		{"--no-context-files", 0},
 	} {
 		if got := countFlag(args, tc.flag); got != tc.want {
 			t.Errorf("%s appears %d times, want %d: %v", tc.flag, got, tc.want, args)
@@ -271,10 +276,13 @@ func TestArgsUseCleanLoadToolsExtensionsAndPromptFiles(t *testing.T) {
 	}
 }
 
-func TestProcessWorkingDirectoryIsTheVault(t *testing.T) {
-	vault := t.TempDir()
+// TestProcessWorkingDirectoryIsTheWorkDir pins cwd = Config.WorkDir. Pi works in
+// the owner's directory, not in the notes vault: the vault is only data the tools
+// server writes through.
+func TestProcessWorkingDirectoryIsTheWorkDir(t *testing.T) {
+	workDir := t.TempDir()
 	cwdFile := filepath.Join(t.TempDir(), "cwd.txt")
-	s := newTestSession(t, Config{VaultDir: vault}, nil, cwdFile, "echo")
+	s := newTestSession(t, Config{WorkDir: workDir}, nil, cwdFile, "echo")
 	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
 		t.Fatalf("Prompt: %v", err)
 	}
@@ -288,12 +296,12 @@ func TestProcessWorkingDirectoryIsTheVault(t *testing.T) {
 	if resolved, err := filepath.EvalSymlinks(got); err == nil {
 		got = resolved
 	}
-	want := vault
-	if resolved, err := filepath.EvalSymlinks(vault); err == nil {
+	want := workDir
+	if resolved, err := filepath.EvalSymlinks(workDir); err == nil {
 		want = resolved
 	}
 	if got != want {
-		t.Errorf("pi working directory = %q, want the vault root %q", got, want)
+		t.Errorf("pi working directory = %q, want the configured work dir %q", got, want)
 	}
 }
 
@@ -545,19 +553,31 @@ func TestConcurrentPromptsAreSerialized(t *testing.T) {
 	}
 }
 
-// TestEmptyToolsFallsBackToReadOnlyAllowlist pins the safety default: leaving
-// Config.Tools empty must never hand Pi its default tool set, which includes
-// write tools. S7 depends on the process being read-only.
-func TestEmptyToolsFallsBackToReadOnlyAllowlist(t *testing.T) {
+// TestEmptyToolsOmitsTheToolsFlag pins T11: an empty Config.Tools means "no
+// restriction", so --tools is not passed at all and Pi keeps its own full
+// selection. A silent read-only fallback is exactly what T11 removes.
+func TestEmptyToolsOmitsTheToolsFlag(t *testing.T) {
 	spawns := &fakeSpawns{}
-	s := newTestSession(t, Config{VaultDir: t.TempDir()}, spawns, "", "echo")
+	s := newTestSession(t, Config{WorkDir: t.TempDir()}, spawns, "", "echo")
 	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
 		t.Fatalf("Prompt: %v", err)
 	}
 	s.Close()
 
-	joined := strings.Join(spawns.argsAt(0), " ")
-	if !strings.Contains(joined, "--tools read,grep,find,ls") {
-		t.Errorf("empty Tools must fall back to the read-only allowlist, got %v", spawns.argsAt(0))
+	args := spawns.argsAt(0)
+	if got := countFlag(args, "--tools"); got != 0 {
+		t.Errorf("--tools appears %d times with empty Tools, want 0: %v", got, args)
+	}
+	// A value without its flag would be worse than the flag: Pi would take it as
+	// a prompt or as the value of another option.
+	for _, allowlist := range []string{
+		"read,grep,find,ls",
+		"read,grep,find,ls,save_note,append_note,send_file,ask_options",
+	} {
+		for _, arg := range args {
+			if arg == allowlist {
+				t.Errorf("args carry the tool allowlist %q with empty Tools: %v", allowlist, args)
+			}
+		}
 	}
 }

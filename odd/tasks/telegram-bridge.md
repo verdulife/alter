@@ -40,10 +40,12 @@ Convención existente a respetar (ya usada por `vault/scripts/save-ia-url.sh`):
 frontmatter YAML (`title`, `description`, `tags`, `date`) + `# H1` + secciones,
 y entradas de enlace como `- [título](url) — metadata`.
 
-**S7 — Pi no escribe.** Pi sigue sin `bash`, `edit` ni `write`: lee el vault con
-las tools nativas de solo lectura (`read`, `grep`, `find`, `ls`) ejecutando con
-`cwd` = vault, y **toda escritura pasa por tools deterministas** expuestas por el
-bridge (`save_note`, `append_note`, `send_file`, `ask_options`).
+**S7 — Pi opera con sus herramientas completas.** Sin allowlist impuesta y con
+la configuración global de Pi cargada: `bash`, `edit`, `write`, `read`, `grep`,
+`find`, `ls` y las herramientas de los paquetes instalados. Las cuatro tools
+deterministas (`save_note`, `append_note`, `send_file`, `ask_options`) siguen
+existiendo como vía preferente para el vault, no como la única vía. Retirado por
+L9: la versión anterior de este spec exigía solo lectura y cwd = vault.
 **S8 — Bot API server propio diferido.** La base URL de Telegram es
 configurable (`ALTER_TELEGRAM_API_BASE`, default `https://api.telegram.org`) para
 poder migrar al Bot API server local (`--local`: subida 2000 MB, descarga sin
@@ -224,7 +226,7 @@ Tareas nuevas:
 
 | ID | Tarea | Specs | Estado |
 |---|---|---|---|
-| T11 | Permisos y ámbito: allowlist completa, cwd `$HOME`, carga global, timeout configurable | L9 | pendiente |
+| T11 | Permisos y ámbito: allowlist completa, cwd `$HOME`, carga global, timeout configurable | S1,S6,L9 | inline | este commit |
 | T12 | Identidad: reescribir persona con disciplina Gentleman y verificar el prompt efectivo | L11 | pendiente |
 | T13 | Aprobaciones por botones: `tool_call` + `confirm` vía bridge, fail-closed | L10 | pendiente |
 | T14 | Desplegar: parar el servicio viejo, compilar, configurar y probar "hola" real | L12 | pendiente |

@@ -1,7 +1,7 @@
 package config
 
 import (
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -177,21 +177,59 @@ func TestLoadSearchMalformedFallsBack(t *testing.T) {
 	}
 }
 
-// TestBridgeToolsDefaultIncludesDeterministicTools pins the allowlist Pi
-// receives when ALTER_BRIDGE_TOOLS is unset. --tools REPLACES Pi's whole tool
-// selection instead of extending it, so a default listing only the read-only
-// tools would silently disable every deterministic vault write (S7).
-func TestBridgeToolsDefaultIncludesDeterministicTools(t *testing.T) {
+// TestBridgeToolsDefaultIsNoAllowlist pins T11: the bridge no longer forces a
+// tool selection. An unset ALTER_BRIDGE_TOOLS yields "", and the bridge then
+// omits --tools entirely so Pi keeps its own full selection from the global
+// configuration.
+func TestBridgeToolsDefaultIsNoAllowlist(t *testing.T) {
 	clearBridgeEnv(t)
 
-	got := Load().BridgeTools
-	want := "read,grep,find,ls,save_note,append_note,send_file,ask_options"
-	if got != want {
-		t.Fatalf("BridgeTools = %q, want %q", got, want)
+	if got := Load().BridgeTools; got != "" {
+		t.Fatalf("BridgeTools = %q, want empty so --tools is never passed", got)
 	}
-	for _, forbidden := range []string{"bash", "edit", "write"} {
-		if strings.Contains(got, forbidden) {
-			t.Errorf("BridgeTools = %q must never contain %q (S7)", got, forbidden)
-		}
+}
+
+// TestBridgeToolsExplicitStillWins proves the escape hatch survived: an explicit
+// ALTER_BRIDGE_TOOLS is passed through untouched, and nothing adds to it.
+func TestBridgeToolsExplicitStillWins(t *testing.T) {
+	clearBridgeEnv(t)
+	t.Setenv("ALTER_BRIDGE_TOOLS", "read,grep,find,ls")
+
+	if got := Load().BridgeTools; got != "read,grep,find,ls" {
+		t.Errorf("BridgeTools = %q, want the explicit allowlist", got)
+	}
+}
+
+// TestWorkDirDefaultsToHome pins the working directory of the bridge's Pi: $HOME,
+// so it sees the same tree a terminal session sees. It stays independent of the
+// vault, which is only where notes live.
+func TestWorkDirDefaultsToHome(t *testing.T) {
+	clearBridgeEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg := Load()
+	if cfg.WorkDir != home {
+		t.Errorf("WorkDir = %q, want $HOME %q", cfg.WorkDir, home)
+	}
+	if want := filepath.Join(home, "vault"); cfg.VaultDir != want {
+		t.Errorf("VaultDir = %q, want %q: the vault keeps its own value", cfg.VaultDir, want)
+	}
+}
+
+// TestWorkDirFromEnvWins proves ALTER_BRIDGE_WORKDIR overrides $HOME without
+// touching the vault path.
+func TestWorkDirFromEnvWins(t *testing.T) {
+	clearBridgeEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ALTER_BRIDGE_WORKDIR", "/srv/work")
+	t.Setenv("ALTER_VAULT_DIR", "/srv/vault")
+
+	cfg := Load()
+	if cfg.WorkDir != "/srv/work" {
+		t.Errorf("WorkDir = %q, want /srv/work", cfg.WorkDir)
+	}
+	if cfg.VaultDir != "/srv/vault" {
+		t.Errorf("VaultDir = %q, want /srv/vault", cfg.VaultDir)
 	}
 }

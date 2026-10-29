@@ -53,10 +53,15 @@ type Config struct {
 	// 2000 MB, downloads without a limit and file:// uploads, with no code change.
 	TelegramAPIBase string
 
-	// VaultDir is the global notes vault served to Pi as its working directory.
-	// Defaults to $HOME/vault. It is data, never a boot dependency: a missing
-	// directory is created lazily on first write.
+	// VaultDir is the global notes vault: the store the deterministic bridge tools
+	// (and this server) write through. Defaults to $HOME/vault. It is data, never a
+	// boot dependency: a missing directory is created lazily on first write. It is
+	// NOT the working directory of Pi; that is WorkDir.
 	VaultDir string
+	// WorkDir is the working directory of the bridge's Pi process (cwd). Defaults
+	// to $HOME, so Pi sees the same tree a terminal session sees: the bridge is the
+	// owner's gentle-shell, not a sandbox with a smaller view.
+	WorkDir string
 
 	// BridgeEnabled opts the runtime into the Telegram <-> Pi bridge as the only
 	// free-text entry path.
@@ -64,17 +69,19 @@ type Config struct {
 	// BridgeSessionID is the Pi session resumed across messages, so the
 	// conversation keeps its thread. Defaults to "telegram".
 	BridgeSessionID string
-	// BridgeTools is the Pi tool allowlist passed via --tools. Pi never gets
-	// bash/edit/write: the vault is read with read/grep/find/ls and mutated only
-	// through deterministic extension tools.
+	// BridgeTools is the optional Pi tool allowlist passed via --tools. Empty, the
+	// default, means no restriction: the flag is not passed and Pi keeps its own
+	// full selection from the global configuration, so `bash`, `edit` and `write`
+	// are available like in a terminal session (T11). Setting it narrows the
+	// selection on purpose; it never extends Pi's defaults.
 	BridgeTools string
 	// BridgePromptFiles are markdown files appended to the system prompt via
 	// --append-system-prompt, in order. Defaults to the repository-relative
 	// alter-persona.md, so a bridge started from the repository root needs no
 	// extra configuration.
 	BridgePromptFiles []string
-	// BridgeExtensions are explicit extension entry points loaded with -e. They
-	// coexist with --no-extensions (discovery off, explicit paths still load).
+	// BridgeExtensions are explicit extension entry points loaded with -e. They are
+	// additive: extension discovery stays enabled, so the global packages load too.
 	// Defaults to the repository-relative tools extension, which is the only
 	// thing that gives Pi its deterministic write tools.
 	BridgeExtensions []string
@@ -106,12 +113,13 @@ const (
 
 	defaultTelegramAPIBase = "https://api.telegram.org"
 	defaultBridgeSessionID = "telegram"
-	// defaultBridgeTools is the Pi tool allowlist used when ALTER_BRIDGE_TOOLS is
-	// unset. --tools REPLACES Pi's whole selection instead of extending it, so the
-	// deterministic bridge tools must be listed here explicitly: a default with
-	// only the read-only tools would silently disable every vault write (S7).
-	defaultBridgeTools   = "read,grep,find,ls,save_note,append_note,send_file,ask_options"
-	defaultBridgeTimeout = 120 * time.Second
+	// defaultBridgeTools is deliberately empty: the bridge passes no --tools when
+	// ALTER_BRIDGE_TOOLS is unset, so Pi keeps its own full tool selection from the
+	// global configuration instead of a forced allowlist (T11).
+	defaultBridgeTools = ""
+	// defaultBridgeTimeout bounds one turn. Bash turns are long, so the ceiling is
+	// generous; ALTER_BRIDGE_TIMEOUT lowers or raises it.
+	defaultBridgeTimeout = 300 * time.Second
 
 	// defaultBridgePromptFiles and defaultBridgeExtensions are the assets the
 	// phase-1 bridge needs from Pi, both repository-relative so that running the
@@ -144,6 +152,7 @@ func Load() Config {
 
 		TelegramAPIBase: normalizeBaseURL(envOr("ALTER_TELEGRAM_API_BASE", defaultTelegramAPIBase)),
 		VaultDir:        envOr("ALTER_VAULT_DIR", defaultVaultDir()),
+		WorkDir:         envOr("ALTER_BRIDGE_WORKDIR", defaultWorkDir()),
 
 		BridgeEnabled:     parseBoolEnv("ALTER_BRIDGE_ENABLED", false),
 		BridgeSessionID:   envOr("ALTER_BRIDGE_SESSION_ID", defaultBridgeSessionID),
@@ -182,6 +191,18 @@ func defaultVaultDir() string {
 		return "vault"
 	}
 	return filepath.Join(home, "vault")
+}
+
+// defaultWorkDir returns $HOME, the directory Pi works in: the bridge is the
+// owner's shell, so it must see what a terminal session sees. ALTER_BRIDGE_WORKDIR
+// always wins; without a resolvable home the bridge inherits its own working
+// directory instead of inventing a path.
+func defaultWorkDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
 }
 
 // splitListEnv parses a semicolon-separated list, trimming whitespace and
