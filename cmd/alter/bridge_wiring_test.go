@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -232,6 +231,7 @@ func (b *fakeBot) handle(w http.ResponseWriter, r *http.Request) {
 
 	case "sendRichMessage":
 		var payload struct {
+			ChatID      int64 `json:"chat_id"`
 			RichMessage struct {
 				Markdown string `json:"markdown"`
 			} `json:"rich_message"`
@@ -240,6 +240,12 @@ func (b *fakeBot) handle(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
 		b.finals = append(b.finals, payload.RichMessage.Markdown)
 		b.mu.Unlock()
+		// A real Bot API returns the sent Message; the client decodes it, so the
+		// fake must answer with an envelope instead of an empty body.
+		writeBotJSON(w, map[string]any{"ok": true, "result": map[string]any{
+			"message_id": 1,
+			"chat":       map[string]any{"id": payload.ChatID},
+		}})
 		b.signal()
 
 	case "sendMessage":
@@ -475,8 +481,6 @@ func TestBridgeTextTurnStreamsDraftAndDeliversFinal(t *testing.T) {
 
 	// The tools server the bridge started must answer the contract: the T9a
 	// ask_options stub reports "sin respuesta" instead of hanging the turn.
-	assertAskOptionsStub(t, report)
-
 	if err := h.stop(t); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run returned %v, want context.Canceled after cancellation", err)
 	}
@@ -607,40 +611,6 @@ func TestFileSenderPicksPhotoOrDocument(t *testing.T) {
 		if got := isImagePath(tc.path); got != tc.image {
 			t.Errorf("isImagePath(%q) = %v, want %v", tc.path, got, tc.image)
 		}
-	}
-}
-
-// assertAskOptionsStub drives the ask_options route the bridge started with the
-// placeholder asker and checks the "sin respuesta" result.
-func assertAskOptionsStub(t *testing.T, report piReport) {
-	t.Helper()
-	body := bytes.NewBufferString(`{"question":"¿Cuál?","options":["uno","dos"]}`)
-	req, err := http.NewRequest(http.MethodPost, report.ToolsURL+"/tools/ask_options", body)
-	if err != nil {
-		t.Fatalf("build ask_options request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Alter-Token", report.ToolsToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("ask_options request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("ask_options status = %d (%s), want 200", resp.StatusCode, raw)
-	}
-	var out struct {
-		Answer   string `json:"answer"`
-		TimedOut bool   `json:"timed_out"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("decode ask_options response %s: %v", raw, err)
-	}
-	if out.Answer != "sin respuesta" || !out.TimedOut {
-		t.Errorf("ask_options answer = %+v, want the \"sin respuesta\" stub result", out)
 	}
 }
 

@@ -57,6 +57,10 @@ type bridgeRuntime struct {
 	// check and the store so both enforce the same number.
 	inboundMax int64
 
+	// asks is the single pending ask_options question. Button presses reach it
+	// through handleEvent and never reach Pi as text.
+	asks *bridgeAskBroker
+
 	chatID   int64
 	toolsURL string
 	logger   *log.Logger
@@ -106,11 +110,16 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 
 	client := telegram.NewClientWithBase(cfg.TelegramToken, cfg.TelegramAPIBase)
 
+	// The asker is built before the tools server, which needs it, and before the
+	// poller, which feeds its button presses back in through Resolve.
+	asks := newBridgeAskBroker(client, cfg.TelegramChatID, logger)
+
 	server, err := tools.New(tools.Config{
-		Vault:  store,
-		Files:  bridgeFileSender{client: client, chatID: cfg.TelegramChatID},
-		Asker:  bridgeOptionAsker{},
-		Logger: logger,
+		Vault:      store,
+		Files:      bridgeFileSender{client: client, chatID: cfg.TelegramChatID},
+		Asker:      asks,
+		Logger:     logger,
+		AskTimeout: bridgeAskTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bridge: tools server: %w", err)
@@ -144,6 +153,7 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 
 	r.client = client
 	r.store = store
+	r.asks = asks
 	r.tools = server
 	r.toolsURL = toolsURL
 	r.sess = session
@@ -180,8 +190,9 @@ func (r *bridgeRuntime) teardown(stage string) {
 }
 
 // handleEvent dispatches one inbound event. Text and inbound files (S4) run the
-// same turn pipeline; callback presses arrive in a later slice and are ignored
-// here, which must never stop the loop.
+// same turn pipeline; a button press only settles the pending ask_options
+// question, so it is answered here and deliberately never handed to Pi: a
+// press is not free text and must not become a prompt (S1).
 func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) error {
 	chatID := ev.ChatID
 	if chatID == 0 {
@@ -192,6 +203,9 @@ func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) erro
 		return r.handleText(ctx, chatID, ev.Text)
 	case telegram.EventDocument, telegram.EventPhoto:
 		return r.handleMedia(ctx, chatID, ev)
+	case telegram.EventCallback:
+		r.asks.Resolve(ctx, ev)
+		return nil
 	}
 	r.logger.Printf("bridge: ignoring %s event (not in this slice)", ev.Kind)
 	return nil
@@ -286,14 +300,4 @@ func isImagePath(path string) bool {
 		return true
 	}
 	return false
-}
-
-// bridgeOptionAsker is the T9a placeholder for ask_options. The button
-// callbacks that resolve the question arrive with T9b, so for now the asker
-// reports "sin respuesta" immediately instead of holding the turn open.
-type bridgeOptionAsker struct{}
-
-// AskOptions implements tools.OptionAsker by answering "nobody chose yet".
-func (bridgeOptionAsker) AskOptions(context.Context, string, []string) (string, error) {
-	return "", tools.ErrNoAnswer
 }

@@ -68,7 +68,8 @@ acumulación. Slices cerrados:
 | 7 | T6 (sesión Pi persistente) | `d8f7e0a` + `1c23a36` |
 | 8 | T7 (tools deterministas + fix de contención) | `d0979fa` + `186ac4c` |
 | 9 | T9a (wiring de texto) | `9bb4659` |
-| 10 | T9c (archivos entrantes) | siguiente |
+| 10 | T9c (archivos entrantes) | `ee25faa` |
+| 11 | T9b (ask_options) | siguiente |
 
 Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 
