@@ -1,3 +1,5 @@
+> OBSOLETO: describe el runtime anterior a la fase 1.5, que ya no existe en el repositorio. Se conserva como registro histórico.
+
 # Scheduler — Diseño (V1, one-shot)
 
 > Estado: **implementado (V1 one-shot)**. El Scheduler vive en `internal/scheduler/` y está

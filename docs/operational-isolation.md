@@ -9,7 +9,7 @@
 | Aspecto | Valor |
 |---|---|
 | unit systemd | `~/.config/systemd/user/alter.service` (`systemctl --user`) |
-| binario canónico | `/home/balneario/alter/alter` (nunca `/tmp`) |
+| binario canónico | `/home/balneario/alter/bin/alter` (el que ejecuta la unit; nunca `/tmp`) |
 | WorkingDirectory | `/home/balneario/alter` |
 | configuración | `/home/balneario/alter/.env` (EXCLUSIVA de ALTER) |
 | bot Telegram | `AlterYouBot` (verificado con `getMe`) |

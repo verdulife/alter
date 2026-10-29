@@ -1,3 +1,5 @@
+> OBSOLETO: describe el runtime anterior a la fase 1.5, que ya no existe en el repositorio. Se conserva como registro histórico.
+
 # Pi Agent — protocolo RPC del adapter `internal/adapter/agent/pi.go`
 
 > Estado: **implementado (V1, one-shot)**. El runtime usa el Agent real de Pi cuando

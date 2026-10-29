@@ -75,9 +75,9 @@ segunda ruta de entrada, ni SQLite, ni scheduler, ni búsqueda semántica; el
 registro de capacidades y el camino antiguo de comandos se han eliminado, no
 desactivado.
 
-- **Sin base de datos.** No se abre ningún fichero SQLite y `ALTER_DB_PATH` ya no
-existe: al arrancar no se crea nada en disco. `go.mod` no tiene dependencias
-externas.
+- **Sin base de datos.** No se abre ningún fichero SQLite y al arrancar no se crea
+nada en disco: no hay ruta ni variable de base de datos que configurar. `go.mod`
+no tiene dependencias externas.
 - **Sin trabajo programado.** El scheduler y sus servicios desaparecen con la base
 de datos. Tareas, recordatorios y eventos viven como notas markdown con
 frontmatter **en el vault**; el contrato está en la skill de proyecto
@@ -108,9 +108,7 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `ALTER_BRIDGE_WORKDIR` | directorio de trabajo del proceso (el repositorio) | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. De ahí para arriba se descubren las skills del proyecto; si no se puede resolver, cae a `$HOME`. |
 | `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: el almacén que Pi escribe con `write`/`edit` y donde caen los archivos entrantes. No es el `cwd` de Pi. |
 | `ALTER_TELEGRAM_API_BASE` | `https://api.telegram.org` | Base URL del Bot API (S8). |
-| `ALTER_PI_BIN` | `pi` | Binario de Pi. Un servicio (systemd/cron) casi siempre necesita ruta absoluta porque su `PATH` no incluye fnm. |
-| `ALTER_PI_PROVIDER` | vacío | `--provider`; vacío deja que Pi use su configuración. |
-| `ALTER_PI_MODEL` | vacío | `--model` (`provider/id[:thinking]`). |
+| Pi: `ALTER_PI_*` (`BIN`, `PROVIDER`, `MODEL`) | `pi` en el `PATH`, sin overrides | Binario de Pi, `--provider` y `--model`. Un servicio (systemd/cron) casi siempre necesita ruta absoluta en `BIN` porque su `PATH` no incluye fnm; `PROVIDER` y `MODEL` vacíos dejan que Pi use su configuración. |
 
 Las rutas de `ALTER_BRIDGE_PROMPT_FILES` y `ALTER_BRIDGE_EXTENSIONS` son
 **relativas al repositorio**, así que arrancar desde la raíz del repositorio
@@ -140,7 +138,7 @@ se puede ejecutar a mano.
 ```bash
 cd /ruta/al/alter
 # .env con TELEGRAM_TOKEN y TELEGRAM_CHAT_ID, o exportados en la shell
-ALTER_PI_BIN="$HOME/.local/opt/fnm/.../bin/pi" \
+PATH="$HOME/.local/opt/fnm/.../bin:$PATH" \
 ALTER_PI_PROVIDER=anthropic \
 ALTER_PI_MODEL='claude-sonnet-4-5' \
 go run ./cmd/alter
@@ -262,10 +260,9 @@ resto se revisa después en el journal) más el token del bot y tu chat ID.
 
 ## Limitaciones conocidas
 
-- **Un solo comando con barra: `/reset`.** El resto del adaptador de comandos
-  (`/recordar`, `/tareas`, ayuda…) se eliminó junto con el runtime de base de
-  datos: cualquier otro texto, `/reset algo` incluido, va a Pi como prompt y no hay
-  forma de volver atrás.
+- **Un solo comando con barra: `/reset`.** El resto del adaptador de comandos se
+  eliminó junto con el runtime de base de datos: cualquier otro texto, `/reset
+  algo` incluido, va a Pi como prompt y no hay forma de volver atrás.
 - **Una sola pregunta pendiente.** Solo puede haber un `ask_options` en vuelo; una
   segunda pregunta simultánea devuelve error en vez de encolarse, porque el dueño
   solo puede contestar la que está mirando. Sin respuesta en 10 minutos, la tool

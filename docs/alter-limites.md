@@ -185,8 +185,8 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 
 - No atiende a nadie que no seas tú.
 - No mantiene varias conversaciones en paralelo ni reparte turnos.
-- No conserva los comandos de barra del bot antiguo (`/nueva`, `/recordar`,
-  `/listar`…): en modo bridge, todo texto va a Pi.
+- No conserva los comandos de barra del bot anterior (salvo `/reset`): en modo
+  bridge, todo lo demás va a Pi.
 - No expone nada a Internet: Telegram es la única entrada, con conexión saliente.
 - No ejecuta trabajo programado. Eso es la fase 3, con cron o daemon despertando
   a Pi.
@@ -194,13 +194,13 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 existen en las sesiones que arrancan desde el repositorio. La fase 2 añadirá más;
 la primera es el contrato del vault.
 
-## Qué cambia respecto a lo construido
+## Qué cambió respecto a lo construido
 
 Lo entregado en la fase 1 se hizo con la restricción heredada de solo lectura.
-Quedan tres cambios, en este orden:
+Estos son los cambios que la retiraron, en este orden:
 
 1. **T11 — Permisos y ámbito**: allowlist completa, carga global de Pi, timeout
-   configurable. Se retira `--no-skills`, `--no-extensions`, `--no-context-files`
+   configurable. Se retiró `--no-skills`, `--no-extensions`, `--no-context-files`
    y la allowlist de solo lectura.
 2. **T12 — Identidad**: reescribir `alter-persona.md` con la disciplina de
    Gentleman y una identidad Alter explícita; imponerla por `tool_call`/
@@ -211,14 +211,14 @@ Quedan tres cambios, en este orden:
    `extension_ui_request` de tipo `confirm`/`select` en botones y responde con la
    pulsación o con `cancelled`.
 
-Y una corrección de alcance, **T17**: con `bash`, `write` y `edit` disponibles,
-`save_note` y `append_note` eran una segunda forma de escribir los mismos
-archivos. Se retiran. Quedan dos tools deterministas, `send_file` y
+Y una corrección de alcance, **T17**: con `bash`, `write` y `edit` disponibles, las
+dos tools de escritura de notas eran una segunda forma de escribir los mismos
+archivos. Se retiraron. Quedan dos tools deterministas, `send_file` y
 `ask_options`, porque son lo único que Pi no puede hacer por sí mismo. El vault
 sigue siendo el almacén: lo escribe Pi, y la contención de rutas sigue viva donde
 importa, en la única tool que lee del vault por nombre.
 
-Y uno que no es diseño, sino despliegue: **T14 — Sustituir el servicio**. El
-`alter.service` actual ejecuta un binario del 16 de octubre. Mientras siga vivo,
-el bridge no puede recibir mensajes (mismo token, `409 Conflict`) y todo lo que
-responda será del bot antiguo.
+Y uno que no es diseño, sino despliegue: **T14 — Sustituir el servicio**, hecho.
+`alter.service` ejecuta el binario del bridge (`bin/alter`) con el repositorio como
+`WorkingDirectory`, así que no queda un bot antiguo ocupando el mismo token ni
+provocando `409 Conflict`.
