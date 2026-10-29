@@ -121,7 +121,8 @@ marcando el hueco con `…` y conservando el principio y el final, que es donde
 suele estar lo peligroso.
 
 El botón recorre el mismo camino: la pregunta viaja a Telegram como dos botones
-y tu pulsación la responde; un rechazo, una cancelación o un error bloquean la
+—cada uno en su fila, a todo el ancho, y el de aprobar con estilo `success`— y tu
+pulsación la responde; un rechazo, una cancelación o un error bloquean la
 llamada, y sin respuesta en el plazo **se bloquea**. Cada decisión deja una línea
 en el diario (`alter-gate: allow bash …`, `alter-gate: ask (git push publica en
 el remoto) bash …`), así que un turno real se puede auditar después. Esa línea

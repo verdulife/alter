@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -440,6 +441,136 @@ func TestAskOptionsPostsOneMessageWithOneButtonPerOption(t *testing.T) {
 				t.Errorf("questions posted = %d after the press, want still one", n)
 			}
 		})
+	}
+}
+
+// approvalButtonMarkup is the exact markup the bridge must render for one button:
+// its own row, the style only when there is one, and the label as given.
+func approvalButtonMarkup(id string, index int, style, label string) string {
+	attrs := ""
+	if style != "" {
+		attrs = ` style="` + style + `"`
+	}
+	return `<tg-button-row><tg-button type="callback_data"` + attrs + ` data="` +
+		askCallbackData(id, index) + `">` + label + `</tg-button></tg-button-row>`
+}
+
+// optionsButtonMarkup is the same shape for a neutral ask_options choice, which
+// carries no style attribute at all.
+func optionsButtonMarkup(id string, index int, label string) string {
+	return approvalButtonMarkup(id, index, "", label)
+}
+
+// TestAskMarkdownRendersApprovalButtonsStyledAndFullWidth pins the exact markup
+// of an approval prompt: one row per button, so each takes the whole width of the
+// message on a phone instead of sharing it as a smaller button; the success style
+// on the affirmative alone; and the plain labels, unchanged.
+func TestAskMarkdownRendersApprovalButtonsStyledAndFullWidth(t *testing.T) {
+	id := randomAskID(t)
+
+	got := askMarkdown("¿Ejecutar bash?", approvalOptions, id, askKindApproval)
+	want := "¿Ejecutar bash?\n\n" +
+		approvalButtonMarkup(id, 0, "success", "Aprobar") + "\n" +
+		approvalButtonMarkup(id, 1, "", "Rechazar")
+	if got != want {
+		t.Fatalf("approval markdown =\n%s\nwant\n%s", got, want)
+	}
+	if rows := strings.Count(got, "<tg-button-row>"); rows != len(approvalOptions) {
+		t.Errorf("rows = %d in %q, want one per approval button (%d)", rows, got, len(approvalOptions))
+	}
+	// Exactly one style, on the affirmative: the negative keeps the default look.
+	if styles := strings.Count(got, `style="`); styles != 1 {
+		t.Errorf("styled buttons = %d in %q, want only the affirmative", styles, got)
+	}
+	if !strings.Contains(got, `<tg-button type="callback_data" data="`+askCallbackData(id, 1)+`">Rechazar</tg-button>`) {
+		t.Errorf("markdown %q does not render Rechazar with no style attribute", got)
+	}
+	for _, unwanted := range []string{"danger", "primary", "✅", "❌"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("approval markdown %q carries %q", got, unwanted)
+		}
+	}
+}
+
+// TestAskMarkdownRendersOptionsButtonsStyledAndFullWidth pins the exact markup of
+// an ask_options question: one row per option, no style attribute anywhere, and
+// the option labels exactly as the model wrote them.
+func TestAskMarkdownRendersOptionsButtonsStyledAndFullWidth(t *testing.T) {
+	id := randomAskID(t)
+
+	for _, options := range [][]string{
+		{"guardar", "resumir"},
+		{"opción 1", "opción 2", "opción 3"},
+		{"uno", "dos", "tres", "cuatro"},
+	} {
+		t.Run(fmt.Sprintf("%d options", len(options)), func(t *testing.T) {
+			var want strings.Builder
+			want.WriteString("¿Qué hago con el enlace?\n\n")
+			for i, option := range options {
+				if i > 0 {
+					want.WriteString("\n")
+				}
+				want.WriteString(optionsButtonMarkup(id, i, option))
+			}
+
+			got := askMarkdown("¿Qué hago con el enlace?", options, id, askKindOptions)
+			if got != want.String() {
+				t.Fatalf("options markdown =\n%s\nwant\n%s", got, want.String())
+			}
+			if rows := strings.Count(got, "<tg-button-row>"); rows != len(options) {
+				t.Errorf("rows = %d in %q, want one per option (%d)", rows, got, len(options))
+			}
+			if strings.Contains(got, `style="`) {
+				t.Errorf("options markdown %q styles a neutral choice", got)
+			}
+		})
+	}
+}
+
+// TestAskMarkdownStyledButtonsKeepTheCallbackPayload proves the restyling is
+// presentation only: every rendered payload is byte-identical to the format the
+// bridge produced before, so the unchanged parse/resolve/acknowledge path still
+// resolves the press.
+func TestAskMarkdownStyledButtonsKeepTheCallbackPayload(t *testing.T) {
+	// The payload is the question id and the option index, and nothing else: no
+	// style, no label, no mark.
+	format := regexp.MustCompile(`^ask:[0-9a-f]{16}:[0-9]$`)
+
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	out := startApprove(context.Background(), broker, "¿Ejecutar bash?")
+	markdown := tr.waitMessages(t, 1)[0]
+
+	datas := askButtonData(t, markdown)
+	if len(datas) != len(approvalOptions) {
+		t.Fatalf("buttons = %d (%v), want %d", len(datas), datas, len(approvalOptions))
+	}
+	for i, data := range datas {
+		if !format.MatchString(data) {
+			t.Fatalf("payload %q is not the ask:<id>:<index> shape the bridge always produced", data)
+		}
+		id, index, ok := parseAskCallback(data)
+		if !ok || index != i {
+			t.Fatalf("payload %q parses to (%q, %d, %v), want index %d", data, id, index, ok, i)
+		}
+		if want := askCallbackData(id, i); data != want {
+			t.Errorf("payload = %q, want %q byte for byte", data, want)
+		}
+		if want := "ask:" + id + ":" + strconv.Itoa(i); data != want {
+			t.Errorf("payload = %q, want the unchanged %q", data, want)
+		}
+	}
+
+	// The styled button's payload is the one that resolves the approval, and the
+	// press is still acknowledged.
+	broker.Resolve(context.Background(), callbackEvent("cb-styled", datas[approvalIndexAllow]))
+	got := waitApprove(t, out)
+	if got.err != nil || !got.approved {
+		t.Errorf("Approve = (%v, %v), want the styled button to approve", got.approved, got.err)
+	}
+	if acks := tr.acknowledgements(); len(acks) != 1 || acks[0] != "cb-styled" {
+		t.Errorf("acknowledged = %v, want [cb-styled] so the button spinner stops", acks)
 	}
 }
 

@@ -53,9 +53,28 @@ var errAskBusy = errors.New("another question is already waiting for the owner")
 // normal outcome the model can talk its way around.
 var errApprovalNoAnswer = errors.New("approval: the owner did not answer, so the action is blocked")
 
+// askKind selects how one question's buttons are rendered. It is presentation
+// only: the callback payload, the pending slot and the acknowledgement path are
+// identical for both kinds, so a restyle can never change what a press means.
+type askKind int
+
+const (
+	// askKindOptions is an ask_options question: two to four neutral choices.
+	askKindOptions askKind = iota
+	// askKindApproval is an approval prompt: approve or reject one action.
+	askKindApproval
+)
+
 // approvalOptions are the only two answers to an approval prompt, in index
 // order: Aprobar is 0 and Rechazar is 1.
 var approvalOptions = []string{"Aprobar", "Rechazar"}
+
+// askApprovalAllowStyle is the only style the bridge sets: the affirmative button
+// of an approval, so the safe answer stands out. Every other button — the
+// negative one and every ask_options choice — carries no style attribute and
+// keeps the client default, because inventing a colour there added contrast the
+// owner did not ask for.
+const askApprovalAllowStyle = "success"
 
 // approvalIndexAllow is the button index that approves.
 const approvalIndexAllow = 0
@@ -109,7 +128,7 @@ func (b *bridgeAskBroker) AskOptions(ctx context.Context, question string, optio
 		return "", fmt.Errorf("ask_options needs between 2 and 4 options, got %d", len(options))
 	}
 
-	index, err := b.ask(ctx, question, options)
+	index, err := b.ask(ctx, question, options, askKindOptions)
 	if err != nil {
 		if errors.Is(err, errAskBusy) || errors.Is(err, tools.ErrNoAnswer) {
 			return "", err
@@ -133,7 +152,7 @@ func (b *bridgeAskBroker) Approve(ctx context.Context, question string) (bool, e
 		return false, errors.New("approve needs a question")
 	}
 
-	index, err := b.ask(ctx, question, approvalOptions)
+	index, err := b.ask(ctx, question, approvalOptions, askKindApproval)
 	if err != nil {
 		switch {
 		case errors.Is(err, tools.ErrNoAnswer):
@@ -150,7 +169,7 @@ func (b *bridgeAskBroker) Approve(ctx context.Context, question string) (bool, e
 // ask posts one question with one button per option and waits for the press. It
 // owns the single pending slot: whoever ends the wait — press, deadline or
 // cancellation — the slot is free again, so a later question can never inherit it.
-func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []string) (int, error) {
+func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []string, kind askKind) (int, error) {
 	id, err := newAskID()
 	if err != nil {
 		return 0, err
@@ -169,7 +188,7 @@ func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []st
 	// free again, or the next question would never be posted.
 	defer b.release(p)
 
-	if _, err := b.client.SendRich(ctx, b.chatID, askMarkdown(question, options, id)); err != nil {
+	if _, err := b.client.SendRich(ctx, b.chatID, askMarkdown(question, options, id, kind)); err != nil {
 		// No buttons means no press: fail loudly so the caller can block the action
 		// instead of waiting for an answer that cannot come.
 		return 0, fmt.Errorf("send question: %w", err)
@@ -246,16 +265,29 @@ func newAskID() (string, error) {
 // messages are the only representation that carries callback buttons, so the
 // bridge does not fall back to classic HTML here: a question without buttons
 // would be a question the owner cannot answer.
-func askMarkdown(question string, options []string, id string) string {
+//
+// Every button gets its own row, because a button that shares a row is half as
+// wide and on a phone these are the words the owner has to hit. kind only decides
+// whether the affirmative button is styled success; the label is always the
+// option text and the payload inside each button is the same for both kinds.
+func askMarkdown(question string, options []string, id string, kind askKind) string {
 	var out strings.Builder
 	out.WriteString(strings.TrimSpace(question))
 	out.WriteString("\n\n")
 	for i, option := range options {
-		out.WriteString(`<tg-button type="callback_data" data="`)
+		out.WriteString("<tg-button-row>")
+		out.WriteString(`<tg-button type="callback_data"`)
+		if kind == askKindApproval && i == approvalIndexAllow {
+			out.WriteString(` style="`)
+			out.WriteString(askApprovalAllowStyle)
+			out.WriteString(`"`)
+		}
+		out.WriteString(` data="`)
 		out.WriteString(askCallbackData(id, i))
 		out.WriteString(`">`)
 		out.WriteString(escapeAskLabel(option))
-		out.WriteString("</tg-button>\n")
+		out.WriteString("</tg-button>")
+		out.WriteString("</tg-button-row>\n")
 	}
 	return strings.TrimRight(out.String(), "\n")
 }
