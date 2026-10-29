@@ -41,13 +41,21 @@ const (
 	bridgeErrorReply = "No pude terminar la respuesta. Inténtalo de nuevo en un momento."
 )
 
-// bridgeRuntime is the composed runtime of one bridge process: the loopback
-// tools server Pi calls, the persistent Pi session and the Telegram poller.
+// bridgeRuntime is the composed runtime of one bridge process: the vault store,
+// the loopback tools server Pi calls, the persistent Pi session and the Telegram
+// poller.
 type bridgeRuntime struct {
 	client *telegram.Client
 	poller *telegram.Poller
 	tools  *tools.Server
 	sess   *bridge.Session
+	// store is the vault both Pi and the tools server write through. Inbound
+	// attachments land in it, so it is the only place that decides a stored
+	// name or a size limit.
+	store *vault.Store
+	// inboundMax is the inbound attachment ceiling, shared by the pre-download
+	// check and the store so both enforce the same number.
+	inboundMax int64
 
 	chatID   int64
 	toolsURL string
@@ -75,19 +83,26 @@ func withBridgeTeardownHook(hook func(stage string)) bridgeRuntimeOption {
 	return func(r *bridgeRuntime) { r.onTeardown = hook }
 }
 
+// withInboundFileLimit overrides the inbound attachment ceiling (test seam). It
+// reaches both the vault store and the pre-download size check, because a limit
+// the two disagree on would either waste a download or drop a legal file.
+func withInboundFileLimit(max int64) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.inboundMax = max }
+}
+
 // newBridgeRuntime composes the bridge: vault store → tools server → Pi session
 // (carrying the tools URL and token in its environment) → poller for the owner
 // chat. Nothing is spawned until the first prompt, and the tools server is bound
 // before Pi can be started, so the extension always has a live endpoint.
 func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRuntimeOption) (*bridgeRuntime, error) {
-	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger}
+	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes}
 	for _, opt := range opts {
 		opt(r)
 	}
 
-	// S6: every note write goes through the vault store rooted at the configured
-	// vault, which is also Pi's working directory.
-	store := vault.New(cfg.VaultDir, 0)
+	// S6: every note and attachment write goes through the vault store rooted at
+	// the configured vault, which is also Pi's working directory.
+	store := vault.New(cfg.VaultDir, r.inboundMax)
 
 	client := telegram.NewClientWithBase(cfg.TelegramToken, cfg.TelegramAPIBase)
 
@@ -128,6 +143,7 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	}, sessionOpts...)
 
 	r.client = client
+	r.store = store
 	r.tools = server
 	r.toolsURL = toolsURL
 	r.sess = session
@@ -163,32 +179,40 @@ func (r *bridgeRuntime) teardown(stage string) {
 	}
 }
 
-// handleEvent dispatches one inbound event. This slice answers text; documents,
-// photos and callback presses arrive in later slices and are ignored here, which
-// must never stop the loop.
+// handleEvent dispatches one inbound event. Text and inbound files (S4) run the
+// same turn pipeline; callback presses arrive in a later slice and are ignored
+// here, which must never stop the loop.
 func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) error {
-	if ev.Kind != telegram.EventText {
-		r.logger.Printf("bridge: ignoring %s event (not in this slice)", ev.Kind)
-		return nil
-	}
 	chatID := ev.ChatID
 	if chatID == 0 {
 		chatID = r.chatID
 	}
-	return r.handleText(ctx, chatID, ev.Text)
+	switch ev.Kind {
+	case telegram.EventText:
+		return r.handleText(ctx, chatID, ev.Text)
+	case telegram.EventDocument, telegram.EventPhoto:
+		return r.handleMedia(ctx, chatID, ev)
+	}
+	r.logger.Printf("bridge: ignoring %s event (not in this slice)", ev.Kind)
+	return nil
 }
 
-// handleText runs one turn: typing feedback, throttled streamed drafts, then the
+// handleText runs one text turn through the shared turn pipeline.
+func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text string) error {
+	return r.runTurn(ctx, chatID, text)
+}
+
+// runTurn runs one prompt: typing feedback, throttled streamed drafts, then the
 // final markdown. A failed or empty turn still answers the chat with a short
 // human line, never an empty message and never silence.
-func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text string) error {
+func (r *bridgeRuntime) runTurn(ctx context.Context, chatID int64, prompt string) error {
 	if err := r.client.SendChatAction(ctx, chatID, bridgeTypingAction); err != nil {
 		// Cosmetic only: the typing indicator must never fail a turn.
 		r.logger.Printf("bridge: chat action: %v", err)
 	}
 
 	throttle := &draftThrottle{min: bridgeDraftInterval, now: time.Now}
-	final, err := r.sess.PromptStream(ctx, text, func(accumulated string) {
+	final, err := r.sess.PromptStream(ctx, prompt, func(accumulated string) {
 		if !throttle.allow() {
 			return
 		}
