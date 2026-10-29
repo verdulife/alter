@@ -42,6 +42,10 @@ var errProcessEnded = errors.New("bridge: pi process ended before settling")
 // errEmptyResponse reports a settled run that produced no assistant text.
 var errEmptyResponse = errors.New("bridge: pi returned an empty response")
 
+// ErrTurnInFlight reports that Reset found a prompt owning the session, so the
+// reset was refused instead of interrupting it.
+var ErrTurnInFlight = errors.New("bridge: a prompt is in flight; the session was not reset")
+
 // piMaxLine bounds a single RPC line read from stdout.
 const piMaxLine = 8 * 1024 * 1024
 
@@ -232,6 +236,37 @@ func (s *Session) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.killProcess()
+}
+
+// Reset starts a fresh conversation: it stops the current child process (reaped
+// exactly as Close reaps it), forgets the session state and sets the session id
+// the next spawn uses, so the next prompt begins a new transcript instead of
+// resuming the old one.
+//
+// It is safe before any start and safe to call repeatedly. A reset never
+// interrupts a prompt: while one owns the session Reset refuses at once with
+// ErrTurnInFlight and changes nothing, so the state is never left half-reset and
+// the run whose answer the caller is still waiting for is not killed. Refusing
+// instead of queueing is deliberate: the queued command would wait for the whole
+// turn, which may run for Config.Timeout. The caller retries once it has settled.
+//
+// ctx bounds the caller's own patience only: an already cancelled context is
+// reported before anything is touched.
+func (s *Session) Reset(ctx context.Context, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// TryLock is the whole in-flight check: PromptStream holds mu for the entire
+	// turn, so a failed TryLock means a turn (or another reset) owns the session
+	// right now. Nothing is touched in that case.
+	if !s.mu.TryLock() {
+		return ErrTurnInFlight
+	}
+	defer s.mu.Unlock()
+
+	s.killProcess()
+	s.cfg.SessionID = sessionID
+	return nil
 }
 
 // ensureStarted starts the process only when none is running.

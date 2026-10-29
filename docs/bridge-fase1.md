@@ -55,6 +55,19 @@ descubre desde su directorio de trabajo hacia arriba, así que solo existen para
 - **Un solo chat.** Solo se atiende el chat del dueño (`TELEGRAM_CHAT_ID`); el
   resto de chats y de tipos de evento se ignoran.
 
+## Reiniciar la conversación: `/reset`
+
+Escribir `/reset` (solo, sin nada más) en el chat empieza una conversación nueva
+sin reiniciar el servicio: el bridge termina el proceso `pi` actual, lo cose igual
+que al apagar y lanza el siguiente turno con un id de sesión nuevo
+(`<ALTER_BRIDGE_SESSION_ID>-AAAAMMDD-HHMMSS`, por ejemplo
+`telegram-20260102-150405`), que es el que la confirmación dice y el que queda en
+el log junto al id configurado. **No** toca el vault, **no** reinicia el poller ni
+el servidor de tools, y **no** cancela un turno en curso: si Pi está trabajando,
+`/reset` contesta que hay un turno en marcha y no cambia nada, así que hay que
+repetirlo cuando termine. Cualquier mensaje que no sea exactamente `/reset`
+(`/reset algo`, por ejemplo) sigue siendo un prompt normal para Pi.
+
 ## Un solo runtime, sin base de datos
 
 El binario `alter` es una sola cosa: el puente Telegram ↔ Pi más el vault. No hay
@@ -217,6 +230,11 @@ chat ID.
 - Archivos entrantes: descarga única, guardado en `inbox/`, rechazo por tamaño
   declarado (sin descargar) y por tamaño real (durante el stream), y que un fallo
   de descarga no tumba el canal.
+- `/reset`: no lanza ningún proceso de Pi (nunca llega como prompt), entrega una
+  sola confirmación con el id nuevo, el mensaje siguiente usa ese `--session-id`,
+  `/reset algo` sigue siendo un turno normal, un reset con un turno en vuelo se
+  rechaza sin tocar nada y el turno termina igual, un fallo contesta su línea de
+  error y el reset no deja zombis ni descriptores abiertos.
 - `ask_options` de punta a punta: una pregunta, un botón por opción, payload
   opaco, pulsación resuelta y ack al cliente; una segunda pregunta simultánea
   falla en vez de encolarse.
@@ -244,9 +262,10 @@ chat ID.
 
 ## Limitaciones conocidas
 
-- **Los comandos con barra ya no se atienden.** El adaptador de comandos
+- **Un solo comando con barra: `/reset`.** El resto del adaptador de comandos
   (`/recordar`, `/tareas`, ayuda…) se eliminó junto con el runtime de base de
-datos: todo texto libre va a Pi y no hay forma de volver atrás.
+  datos: cualquier otro texto, `/reset algo` incluido, va a Pi como prompt y no hay
+  forma de volver atrás.
 - **Una sola pregunta pendiente.** Solo puede haber un `ask_options` en vuelo; una
   segunda pregunta simultánea devuelve error en vez de encolarse, porque el dueño
   solo puede contestar la que está mirando. Sin respuesta en 10 minutos, la tool

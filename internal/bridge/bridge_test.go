@@ -830,3 +830,150 @@ func TestEmptyToolsOmitsTheToolsFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestResetWithoutAProcessChangesTheSessionID pins the no-op case: with no child
+// running a reset spawns nothing, but the id the next spawn uses has changed, so
+// the next prompt starts a fresh conversation instead of resuming the old one. An
+// already cancelled context is reported before anything is touched.
+func TestResetWithoutAProcessChangesTheSessionID(t *testing.T) {
+	spawns := &fakeSpawns{}
+	s := newTestSession(t, Config{SessionID: "alter-telegram"}, spawns, "", "echo")
+	defer s.Close()
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Reset(expired, "ignorada"); !errors.Is(err, context.Canceled) {
+		t.Errorf("Reset with a cancelled context = %v, want context.Canceled", err)
+	}
+
+	if err := s.Reset(context.Background(), "alter-telegram-20240102-150405"); err != nil {
+		t.Fatalf("Reset with no process running: %v", err)
+	}
+	if got := spawns.count(); got != 0 {
+		t.Errorf("spawns after Reset = %d, want 0: a reset before the first prompt must not start a child", got)
+	}
+
+	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
+		t.Fatalf("Prompt after Reset: %v", err)
+	}
+	args := spawns.argsAt(0)
+	// The cancelled call must not have installed its id either.
+	if got := flagValues(args, "--session-id"); len(got) != 1 || got[0] != "alter-telegram-20240102-150405" {
+		t.Errorf("--session-id = %v, want the id the reset installed: %v", got, args)
+	}
+}
+
+// TestResetSpawnsTheNextPromptWithTheNewSessionID proves a reset to a different id
+// really starts a fresh conversation: the child that held the old transcript is
+// gone and the next prompt is spawned with the new --session-id, so Pi cannot
+// resume the old conversation.
+func TestResetSpawnsTheNextPromptWithTheNewSessionID(t *testing.T) {
+	spawns := &fakeSpawns{}
+	s := newTestSession(t, Config{SessionID: "vieja"}, spawns, "", "echo")
+	defer s.Close()
+
+	if _, err := s.Prompt(context.Background(), "uno"); err != nil {
+		t.Fatalf("Prompt before Reset: %v", err)
+	}
+	if err := s.Reset(context.Background(), "nueva"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if got, err := s.Prompt(context.Background(), "dos"); err != nil || got != "dos" {
+		t.Fatalf("Prompt after Reset = (%q, %v), want the fresh session to answer", got, err)
+	}
+
+	if got := spawns.count(); got != 2 {
+		t.Fatalf("spawns = %d, want 2: the reset must replace the child, not reuse it", got)
+	}
+	before := flagValues(spawns.argsAt(0), "--session-id")
+	after := flagValues(spawns.argsAt(1), "--session-id")
+	if len(before) != 1 || before[0] != "vieja" {
+		t.Errorf("first spawn --session-id = %v, want the configured id", before)
+	}
+	if len(after) != 1 || after[0] != "nueva" {
+		t.Errorf("second spawn --session-id = %v, want the id the reset installed", after)
+	}
+	if len(before) == 1 && len(after) == 1 && before[0] == after[0] {
+		t.Errorf("both spawns used --session-id %q: a reset to a different id must not resume the old transcript", after[0])
+	}
+}
+
+// TestResetRefusesWhileAPromptIsInFlight pins the chosen semantics: a reset never
+// interrupts a turn. While a prompt owns the session the reset is refused with
+// ErrTurnInFlight and changes nothing, so the run whose answer the caller waits
+// for still settles and the session is never left half-reset.
+func TestResetRefusesWhileAPromptIsInFlight(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	spawns := &fakeSpawns{}
+	s := newTestSession(t, Config{
+		SessionID: "vieja",
+		OnDialog: func(context.Context, DialogRequest) (DialogResponse, error) {
+			once.Do(func() { close(entered) })
+			<-release
+			return DialogResponse{Confirmed: true}, nil
+		},
+	}, spawns, "", "dialog")
+	defer s.Close()
+
+	var text string
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		text, err = s.Prompt(context.Background(), "aprueba")
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the prompt never reached the dialog: the turn was not in flight")
+	}
+
+	if err := s.Reset(context.Background(), "nueva"); !errors.Is(err, ErrTurnInFlight) {
+		t.Fatalf("Reset while a prompt is in flight = %v, want ErrTurnInFlight", err)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("the refused reset broke the in-flight turn: %v", err)
+	}
+	if !strings.Contains(text, `"confirmed":true`) {
+		t.Errorf("in-flight turn settled with %q, want the dialog answer it received", text)
+	}
+
+	// Once the turn is over the reset applies, and the next prompt uses the new id.
+	if err := s.Reset(context.Background(), "nueva"); err != nil {
+		t.Fatalf("Reset after the turn settled: %v", err)
+	}
+	if _, err := s.Prompt(context.Background(), "despues"); err != nil {
+		t.Fatalf("Prompt after Reset: %v", err)
+	}
+	if got := spawns.count(); got != 2 {
+		t.Fatalf("spawns = %d, want 2: one for the turn and one after the reset", got)
+	}
+	if got := flagValues(spawns.argsAt(1), "--session-id"); len(got) != 1 || got[0] != "nueva" {
+		t.Errorf("spawn after Reset --session-id = %v, want nueva", got)
+	}
+}
+
+// TestResetReleasesTheChild pins reaping: a reset terminates the child like Close
+// does, so it must not leave a zombie waiting or an extra descriptor behind.
+func TestResetReleasesTheChild(t *testing.T) {
+	baseFDs := countOpenFDs(t)
+	s := newTestSession(t, Config{SessionID: "vieja"}, nil, "", "echo")
+	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if err := s.Reset(context.Background(), "nueva"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	if zombies := unreapedChildren(t); len(zombies) > 0 {
+		t.Errorf("unreaped children after Reset %v: cmd.Wait must run on every termination path", zombies)
+	}
+	if after := countOpenFDs(t); after > baseFDs {
+		t.Errorf("descriptors grew from %d to %d across start and Reset: the pipes must be released", baseFDs, after)
+	}
+	s.Close()
+}

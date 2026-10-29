@@ -56,6 +56,27 @@ const (
 	// the argument preview, so the two caps agree instead of fighting.
 	bridgeDialogHeadShare = 2
 	bridgeDialogShareOf   = 3
+
+	// bridgeResetCommand is the one text the bridge consumes itself: it starts a
+	// fresh Pi conversation without restarting the service, the poller or the tools
+	// server. The match is exact, so "/reset algo" stays an ordinary prompt.
+	bridgeResetCommand = "/reset"
+
+	// bridgeResetBaseID is the session id the reset builds its timestamps on when
+	// no base id is configured, so the id always says which channel it belongs to.
+	bridgeResetBaseID = "telegram"
+
+	// bridgeResetIDLayout is the timestamp layout of a reset session id: readable
+	// in the chat and in Pi's own session list.
+	bridgeResetIDLayout = "20060102-150405"
+)
+
+// The three answers a /reset can produce. A reset is a command of its own, so it
+// always answers something: the new id, why it was refused, or why it failed.
+const (
+	bridgeResetReply       = "Conversación reiniciada. Nuevo id de sesión: %s"
+	bridgeResetBusyReply   = "Hay un turno en marcha: espera a que termine y vuelve a enviar /reset."
+	bridgeResetFailedReply = "No pude reiniciar la conversación. Inténtalo de nuevo en un momento."
 )
 
 // The two variables that configure the files Pi needs. They appear in the
@@ -177,6 +198,14 @@ type bridgeRuntime struct {
 	newCmd func(name string, args ...string) *exec.Cmd
 	// onTeardown observes the shutdown stages in order (test seam).
 	onTeardown func(stage string)
+
+	// sessionBase is the configured session id, kept so a reset can show it in the
+	// log and derive the new id from it. The live id belongs to the session, which
+	// owns the spawn; this is only the configured base.
+	sessionBase string
+	// resetSession performs the reset a /reset asks for (test seam): the real one
+	// is Session.Reset, and a test can make it fail to pin the error line.
+	resetSession func(ctx context.Context, sessionID string) error
 }
 
 // bridgeRuntimeOption tunes the composed runtime. Options exist for the test
@@ -206,6 +235,12 @@ func withTurnGate(gate func(ctx context.Context)) bridgeRuntimeOption {
 // the two disagree on would either waste a download or drop a legal file.
 func withInboundFileLimit(max int64) bridgeRuntimeOption {
 	return func(r *bridgeRuntime) { r.inboundMax = max }
+}
+
+// withSessionReset replaces the reset a /reset command performs (test seam), so a
+// test can pin what the chat receives when the reset fails.
+func withSessionReset(f func(ctx context.Context, sessionID string) error) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.resetSession = f }
 }
 
 // newBridgeRuntime composes the bridge: vault store → tools server → Pi session
@@ -300,6 +335,12 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	r.tools = server
 	r.toolsURL = toolsURL
 	r.sess = session
+	// /reset keeps the configured base id visible in the log and derives the new
+	// id from it; the real reset is the session's, unless a test replaced it.
+	r.sessionBase = cfg.BridgeSessionID
+	if r.resetSession == nil {
+		r.resetSession = session.Reset
+	}
 	r.poller = telegram.NewPoller(client, cfg.TelegramChatID, logger, r.handleEvent)
 	return r, nil
 }
@@ -433,9 +474,52 @@ func clipDialogText(text string, limit int) string {
 	return string(runes[:head]) + bridgeDialogEllipsis + string(runes[len(runes)-tail:])
 }
 
-// handleText starts one text turn through the shared turn pipeline.
+// handleText routes one text message: /reset is the only text the bridge consumes
+// itself, so it can never reach Pi as a prompt; everything else runs a turn.
 func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text string) error {
+	if isBridgeReset(text) {
+		return r.resetConversation(ctx, chatID)
+	}
 	return r.runTurn(ctx, chatID, text)
+}
+
+// isBridgeReset reports whether the message is the reset command. The match is
+// exact after trimming the surrounding whitespace Telegram may add, so a message
+// that says something else ("/reset algo") is never turned into a reset.
+func isBridgeReset(text string) bool {
+	return strings.TrimSpace(text) == bridgeResetCommand
+}
+
+// resetConversation starts a fresh Pi conversation from the chat and answers with
+// the new session id. It runs in the poll loop instead of the turn pipeline on
+// purpose: the reset never interrupts a turn (Session.Reset refuses while one is
+// in flight), so the honest answer while Pi is busy is an immediate line the owner
+// can act on, not a command queued behind a turn that may run for the whole
+// ALTER_BRIDGE_TIMEOUT.
+func (r *bridgeRuntime) resetConversation(ctx context.Context, chatID int64) error {
+	id := bridgeResetSessionID(r.sessionBase, time.Now())
+	if err := r.resetSession(ctx, id); err != nil {
+		if errors.Is(err, bridge.ErrTurnInFlight) {
+			r.logger.Printf("bridge: /reset refused: a turn is in flight, so the session was not reset (base id %q)", r.sessionBase)
+			return r.reply(ctx, chatID, bridgeResetBusyReply)
+		}
+		r.logger.Printf("bridge: /reset failed (base id %q, new session id %q): %v", r.sessionBase, id, err)
+		return r.reply(ctx, chatID, bridgeResetFailedReply)
+	}
+	r.logger.Printf("bridge: /reset: conversation reset (base id %q, new session id %q)", r.sessionBase, id)
+	return r.reply(ctx, chatID, fmt.Sprintf(bridgeResetReply, id))
+}
+
+// bridgeResetSessionID builds the id of the conversation a reset starts: the
+// configured base id plus a UTC timestamp, so the owner sees in the confirmation
+// (and in Pi's own session list) which conversation is current. A reset always
+// replaces the child, so second granularity is enough: two resets inside the same
+// second only reuse an id whose transcript is empty.
+func bridgeResetSessionID(base string, now time.Time) string {
+	if base == "" {
+		base = bridgeResetBaseID
+	}
+	return base + "-" + now.UTC().Format(bridgeResetIDLayout)
 }
 
 // runTurn starts one prompt: typing feedback, throttled streamed drafts, then the

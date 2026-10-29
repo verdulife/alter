@@ -1317,3 +1317,154 @@ func TestDialogQuestionKeepsTheTailOfALongCommand(t *testing.T) {
 		t.Errorf("bridge re-cut the extension preview: %q, want %q", got, preview)
 	}
 }
+
+// count reports how many times the fake pi was spawned.
+func (a *argsRecorder) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.args)
+}
+
+// resetSessionIDFromReply reads the new session id out of the /reset confirmation:
+// it is the last token of the reply and must be the configured base id plus a
+// timestamp, so the owner can tell which conversation is current and a test can
+// check that the id the chat was told is the id the next spawn uses.
+func resetSessionIDFromReply(t *testing.T, confirmation, base string) string {
+	t.Helper()
+	i := strings.LastIndex(confirmation, " ")
+	if i < 0 {
+		t.Fatalf("confirmation %q carries no session id", confirmation)
+	}
+	id := strings.TrimSpace(confirmation[i+1:])
+	rest, ok := strings.CutPrefix(id, base+"-")
+	if !ok {
+		t.Fatalf("confirmation %q does not state the configured base id %q plus a suffix (id %q)", confirmation, base, id)
+	}
+	if _, err := time.Parse("20060102-150405", rest); err != nil {
+		t.Fatalf("session id %q is not %q plus a YYYYMMDD-HHMMSS timestamp: %v", id, base, err)
+	}
+	return id
+}
+
+// TestBridgeResetStartsAFreshConversation covers the whole /reset route: the
+// command is consumed by the bridge (Pi is never spawned, so it can never become a
+// prompt), exactly one confirmation reaches the chat stating the new id, the
+// configured base id stays visible in the log, and the next ordinary message
+// carries the new session id.
+func TestBridgeResetStartsAFreshConversation(t *testing.T) {
+	h := startDialogBridge(t, "stream", 0)
+
+	h.sendText(1, 1, "/reset")
+	rich := h.waitRich(t, 1)
+	// Give a wrong second delivery the chance to show up before asserting.
+	time.Sleep(100 * time.Millisecond)
+	if got := h.rich(); len(got) != 1 {
+		t.Fatalf("deliveries = %v, want exactly one confirmation", got)
+	}
+	if got := h.spawns.count(); got != 0 {
+		t.Fatalf("pi was spawned %d times for /reset: the command must never reach Pi as a prompt", got)
+	}
+
+	confirmation := rich[0]
+	if !strings.Contains(confirmation, "reiniciada") {
+		t.Errorf("confirmation %q is not the Spanish reset line", confirmation)
+	}
+	id := resetSessionIDFromReply(t, confirmation, "dialog-session")
+	if logs := h.logs.String(); !strings.Contains(logs, "dialog-session") || !strings.Contains(logs, id) {
+		t.Errorf("log %q does not keep the configured base id and the new session id %q visible", logs, id)
+	}
+
+	// The next ordinary message is a prompt for Pi, on the conversation the reset
+	// started.
+	h.sendText(2, 2, "hola Pi")
+	rich = h.waitRich(t, 2)
+	if rich[1] != "Hola desde Pi, **con markdown**" {
+		t.Errorf("second delivery = %q, want the ordinary Pi answer", rich[1])
+	}
+	if got := h.spawns.count(); got != 1 {
+		t.Fatalf("spawns = %d, want 1: only the ordinary message starts Pi", got)
+	}
+	if got := flagValue(h.spawns.first(), "--session-id"); got != id {
+		t.Errorf("next prompt used --session-id %q, want the id the reset announced (%q)", got, id)
+	}
+}
+
+// TestBridgeSlashCommandThatIsNotResetStillReachesPi pins the exact match: only
+// the bare command is a reset. "/reset algo" is an ordinary message, so it runs a
+// turn and leaves the session untouched.
+func TestBridgeSlashCommandThatIsNotResetStillReachesPi(t *testing.T) {
+	h := startDialogBridge(t, "stream", 0)
+
+	h.sendText(1, 1, "/reset algo")
+	rich := h.waitRich(t, 1)
+	if rich[0] != "Hola desde Pi, **con markdown**" {
+		t.Fatalf("delivery = %q, want the ordinary Pi answer: %q is not the reset command", rich[0], "/reset algo")
+	}
+	if got := h.spawns.count(); got != 1 {
+		t.Fatalf("spawns = %d, want 1: %q must reach Pi as a prompt", got, "/reset algo")
+	}
+	if got := flagValue(h.spawns.first(), "--session-id"); got != "dialog-session" {
+		t.Errorf("--session-id = %q, want the configured id untouched: %q is not a reset", got, "/reset algo")
+	}
+}
+
+// TestBridgeResetWhileATurnIsInFlightIsRefused pins the documented semantics at
+// the chat level: while a turn is in flight the reset is refused with a short
+// Spanish line, the turn still settles with the owner's answer, and the child is
+// never restarted under it.
+func TestBridgeResetWhileATurnIsInFlightIsRefused(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm", 120*time.Second)
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question = %q, want the approval buttons: the turn must be parked", question)
+	}
+
+	h.sendText(2, 2, "/reset")
+	rich := h.waitRich(t, 2)
+	if rich[1] != bridgeResetBusyReply {
+		t.Fatalf("delivery = %q, want the busy line %q", rich[1], bridgeResetBusyReply)
+	}
+	if got := h.spawns.count(); got != 1 {
+		t.Fatalf("spawns = %d, want 1: a refused reset must not restart Pi", got)
+	}
+
+	// The refused reset changed nothing: the parked turn still settles.
+	pushUpdates(h.bot.fakeBot, callbackUpdate(3, "cb-1", askButtonData(t, question)[0]))
+	rich = h.waitRich(t, 3)
+	if !strings.HasPrefix(rich[2], `{"confirmed":true`) {
+		t.Errorf("delivery = %q, want the answer the parked turn received", rich[2])
+	}
+
+	// And once the turn is over the same command works, so the refusal is not a
+	// dead end.
+	h.sendText(4, 4, "/reset")
+	rich = h.waitRich(t, 4)
+	resetSessionIDFromReply(t, rich[3], "dialog-session")
+}
+
+// TestBridgeResetFailureAnswersTheErrorLine proves a failed reset is not silent:
+// the chat gets a short Spanish error and the session stays usable, because a
+// reset that failed must leave the conversation exactly as it was.
+func TestBridgeResetFailureAnswersTheErrorLine(t *testing.T) {
+	h := startDialogBridge(t, "stream", 0, withSessionReset(func(context.Context, string) error {
+		return errors.New("boom")
+	}))
+
+	h.sendText(1, 1, "/reset")
+	rich := h.waitRich(t, 1)
+	if rich[0] != bridgeResetFailedReply {
+		t.Fatalf("delivery = %q, want the error line %q", rich[0], bridgeResetFailedReply)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "boom") {
+		t.Errorf("log %q does not report why the reset failed", logs)
+	}
+
+	// Still usable: the next message is an ordinary turn.
+	h.sendText(2, 2, "hola Pi")
+	rich = h.waitRich(t, 2)
+	if rich[1] != "Hola desde Pi, **con markdown**" {
+		t.Errorf("delivery after the failed reset = %q, want the ordinary Pi answer", rich[1])
+	}
+}
