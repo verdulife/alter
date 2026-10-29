@@ -44,7 +44,11 @@ type piReport struct {
 	Cwd        string `json:"cwd"`
 	ToolsURL   string `json:"tools_url"`
 	ToolsToken string `json:"tools_token"`
-	Args       string `json:"args"`
+	// PersonaFile is ALTER_PERSONA_FILE as the child saw it: the extension
+	// re-states that file as the last system-prompt block, so it must be the same
+	// persona this process appended and an absolute path (Pi runs in WorkDir).
+	PersonaFile string `json:"persona_file"`
+	Args        string `json:"args"`
 }
 
 // TestBridgeFakePiProcess is the helper-process entry point. When the scenario
@@ -60,10 +64,11 @@ func TestBridgeFakePiProcess(t *testing.T) {
 			os.Exit(1)
 		}
 		raw, err := json.Marshal(piReport{
-			Cwd:        wd,
-			ToolsURL:   os.Getenv("ALTER_TOOLS_URL"),
-			ToolsToken: os.Getenv("ALTER_TOOLS_TOKEN"),
-			Args:       strings.Join(os.Args[1:], " "),
+			Cwd:         wd,
+			ToolsURL:    os.Getenv("ALTER_TOOLS_URL"),
+			ToolsToken:  os.Getenv("ALTER_TOOLS_TOKEN"),
+			PersonaFile: os.Getenv("ALTER_PERSONA_FILE"),
+			Args:        strings.Join(os.Args[1:], " "),
 		})
 		if err != nil {
 			os.Exit(1)
@@ -506,6 +511,161 @@ func TestBridgeTextTurnStreamsDraftAndDeliversFinal(t *testing.T) {
 	}
 }
 
+// TestBridgeAbsolutizesConfiguredAssets proves the wiring hands Pi absolute asset
+// paths even when the configuration is relative — which is exactly how the
+// shipped defaults arrive ("alter-persona.md",
+// "internal/tools/extension/index.ts"). Pi is spawned with cwd =
+// ALTER_BRIDGE_WORKDIR ($HOME), so a relative -e made Pi fail with "Extension
+// path does not exist" and a relative --append-system-prompt was appended as that
+// literal string: the bridge answered with no tools and no persona, silently.
+// ALTER_PERSONA_FILE must also reach the child, absolute, as the first configured
+// prompt file, because the extension re-states that file as the last
+// system-prompt block and two different personas would contradict each other.
+func TestBridgeAbsolutizesConfiguredAssets(t *testing.T) {
+	dir := t.TempDir()
+	personaAbs := writeSmokeAsset(t, dir, "persona.md", "# persona propia\n")
+	contractAbs := writeSmokeAsset(t, dir, "contrato.md", "# contrato\n")
+	toolsExtAbs := writeSmokeAsset(t, dir, "index.ts", "// tools extension\n")
+	extraExtAbs := writeSmokeAsset(t, dir, "extra.ts", "// extra extension\n")
+
+	// Configured exactly as the environment would: relative to the repository
+	// root, never absolute.
+	prompts := []string{relativeToCwd(t, personaAbs), relativeToCwd(t, contractAbs)}
+	extensions := []string{relativeToCwd(t, toolsExtAbs), relativeToCwd(t, extraExtAbs)}
+
+	h := startBridgeWith(t, func(cfg *config.Config) {
+		cfg.BridgeEnabled = true
+		cfg.BridgePromptFiles = prompts
+		cfg.BridgeExtensions = extensions
+	}, "stream", 0, telegram.Update{
+		ID: 1,
+		Message: &telegram.Message{
+			MessageID: 21,
+			Chat:      telegram.Chat{ID: testOwnerID},
+			Text:      "hola Pi",
+		},
+	})
+
+	// The turn proves the real runtime started with these relative assets and
+	// reached Pi; the assertions below then inspect the argv Pi was given.
+	h.bot.waitDelivery(t)
+
+	args := h.spawns.first()
+	if args == nil {
+		t.Fatal("pi was never spawned, so there is no argv to check")
+	}
+
+	gotExt := flagValues(args, "-e")
+	if len(gotExt) != len(extensions) {
+		t.Fatalf("-e values = %v, want one per configured extension (%v): %v", gotExt, extensions, args)
+	}
+	for i, wantAbs := range []string{toolsExtAbs, extraExtAbs} {
+		assertAbsoluteAsset(t, "-e", i, gotExt[i], wantAbs, h.workDir)
+	}
+
+	gotPrompts := flagValues(args, "--append-system-prompt")
+	if len(gotPrompts) != len(prompts) {
+		t.Fatalf("--append-system-prompt values = %v, want one per configured prompt file (%v): %v",
+			gotPrompts, prompts, args)
+	}
+	for i, wantAbs := range []string{personaAbs, contractAbs} {
+		assertAbsoluteAsset(t, "--append-system-prompt", i, gotPrompts[i], wantAbs, h.workDir)
+	}
+	// Order is part of the contract: the first prompt file is the persona.
+	if !samePath(gotPrompts[0], personaAbs) {
+		t.Errorf("first --append-system-prompt = %q, want the first configured prompt file %q", gotPrompts[0], personaAbs)
+	}
+
+	// The extension needs the persona file itself, from Pi's cwd: a relative value
+	// would point at $HOME instead of the configured file.
+	report := h.readReport(t)
+	if report.PersonaFile == "" {
+		t.Fatalf("ALTER_PERSONA_FILE did not reach Pi (environment %+v): the extension cannot re-state the persona", report)
+	}
+	assertAbsoluteAsset(t, "ALTER_PERSONA_FILE", 0, report.PersonaFile, personaAbs, h.workDir)
+	if !samePath(report.PersonaFile, gotPrompts[0]) {
+		t.Errorf("ALTER_PERSONA_FILE = %q but --append-system-prompt[0] = %q: Pi would see two different personas",
+			report.PersonaFile, gotPrompts[0])
+	}
+
+	// The values really are the configured files, not a plausible-looking fallback.
+	for _, asset := range []struct{ path, marker string }{
+		{gotExt[0], "// tools extension"},
+		{gotExt[1], "// extra extension"},
+		{gotPrompts[0], "# persona propia"},
+		{gotPrompts[1], "# contrato"},
+		{report.PersonaFile, "# persona propia"},
+	} {
+		body, err := os.ReadFile(asset.path)
+		if err != nil {
+			t.Errorf("read %q: %v", asset.path, err)
+			continue
+		}
+		if !strings.Contains(string(body), asset.marker) {
+			t.Errorf("asset %q contains %q, want the configured %q", asset.path, string(body), asset.marker)
+		}
+	}
+}
+
+// TestBridgeStartupRejectsMissingRelativeAsset covers the asset guard for a
+// relative configured value — the shape production ships, and the one the guard
+// stats against this process's working directory rather than Pi's. The
+// absolute-path cases (missing file, directory instead of file) already live in
+// TestBridgeStartupRejectsMissingAssets in bridge_smoke_test.go and are not
+// repeated here; this case pins the relative variant.
+func TestBridgeStartupRejectsMissingRelativeAsset(t *testing.T) {
+	dir := t.TempDir()
+	persona := writeSmokeAsset(t, dir, "persona.md", "# persona\n")
+	extension := writeSmokeAsset(t, dir, "index.ts", "// extension\n")
+	missingPrompt := relativeToCwd(t, filepath.Join(dir, "no-existe.md"))
+	missingExtension := relativeToCwd(t, filepath.Join(dir, "no-existe.ts"))
+
+	for _, tc := range []struct {
+		name     string
+		prompts  []string
+		exts     []string
+		wantPath string
+		wantEnv  string
+	}{
+		{
+			name:     "relative missing prompt file",
+			prompts:  []string{relativeToCwd(t, persona), missingPrompt},
+			exts:     []string{relativeToCwd(t, extension)},
+			wantPath: missingPrompt,
+			wantEnv:  "ALTER_BRIDGE_PROMPT_FILES",
+		},
+		{
+			name:     "relative missing extension",
+			prompts:  []string{relativeToCwd(t, persona)},
+			exts:     []string{missingExtension},
+			wantPath: missingExtension,
+			wantEnv:  "ALTER_BRIDGE_EXTENSIONS",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawns := &argsRecorder{}
+			rt, err := newBridgeRuntime(smokeConfig(dir, tc.prompts, tc.exts), discardLogger(),
+				withBridgeCommandFactory(fakePiFactory(spawns)))
+			if err == nil {
+				if rt != nil {
+					closeRuntime(rt)
+				}
+				t.Fatalf("newBridgeRuntime accepted the missing relative asset %q; the guard must reject what Pi could not load", tc.wantPath)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.wantPath) {
+				t.Errorf("error %q does not name the offending relative path %q", msg, tc.wantPath)
+			}
+			if !strings.Contains(msg, tc.wantEnv) {
+				t.Errorf("error %q does not name %q, so the owner cannot fix it", msg, tc.wantEnv)
+			}
+			if args := spawns.first(); args != nil {
+				t.Errorf("Pi was spawned with %v: the guard must fail before any child process starts", args)
+			}
+		})
+	}
+}
+
 // TestBridgeWithoutAllowlistRestrictsNoTools proves T11 at the composition level:
 // with no BridgeTools configured (the new default) the bridge passes no --tools at
 // all, so Pi runs with its own full selection from the global configuration. Pi
@@ -670,12 +830,64 @@ func TestFileSenderPicksPhotoOrDocument(t *testing.T) {
 }
 
 func flagValue(args []string, flag string) string {
+	values := flagValues(args, flag)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+// flagValues returns every value passed with flag, in argv order: -e and
+// --append-system-prompt repeat once per asset, so a test must see all of them.
+func flagValues(args []string, flag string) []string {
+	values := make([]string, 0, 1)
 	for i, arg := range args {
 		if arg == flag && i+1 < len(args) {
-			return args[i+1]
+			values = append(values, args[i+1])
 		}
 	}
-	return ""
+	return values
+}
+
+// relativeToCwd turns an absolute path into a relative one, resolved against this
+// process's working directory: the same base verifyBridgeAssets stats a
+// configured asset against, and the way the shipped defaults arrive
+// ("alter-persona.md", "internal/tools/extension/index.ts"). The asset itself
+// stays outside the worktree.
+func relativeToCwd(t *testing.T, path string) string {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	rel, err := filepath.Rel(cwd, path)
+	if err != nil {
+		t.Fatalf("relative path for %q against %q: %v", path, cwd, err)
+	}
+	if filepath.IsAbs(rel) {
+		t.Fatalf("relative path for %q = %q, want a relative value", path, rel)
+	}
+	return rel
+}
+
+// assertAbsoluteAsset checks one asset path Pi received: it must be absolute,
+// must not point inside the child's working directory (the defect resolved the
+// configured value there and Pi found nothing) and must be the file that was
+// configured.
+func assertAbsoluteAsset(t *testing.T, flag string, index int, got, wantAbs, childCwd string) {
+	t.Helper()
+	if !filepath.IsAbs(got) {
+		t.Errorf("%s[%d] = %q, want an absolute path: Pi runs in %q, so a relative asset is not found there",
+			flag, index, got, childCwd)
+		return
+	}
+	if strings.HasPrefix(got, childCwd+string(filepath.Separator)) {
+		t.Errorf("%s[%d] = %q, want a path outside the child's working directory %q", flag, index, got, childCwd)
+	}
+	if !samePath(got, wantAbs) {
+		t.Errorf("%s[%d] = %q, want the configured file %q (no silent fallback to another path)",
+			flag, index, got, wantAbs)
+	}
 }
 
 func samePath(a, b string) bool {

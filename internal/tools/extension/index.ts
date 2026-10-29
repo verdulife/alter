@@ -1,27 +1,30 @@
 /**
- * Pi extension: the four deterministic Alter tools (S7 of the phase-1 Telegram
- * bridge).
+ * Pi extension: Alter's identity block and the four deterministic Alter tools
+ * (S7 and T12 of the phase-1 Telegram bridge).
  *
- * Pi never receives `bash`, `edit` or `write`. Every vault mutation and every
- * message to the owner goes through these tools, which forward the call to the
- * bridge's loopback tools server:
+ * The four tools forward every vault mutation and every message to the owner to
+ * the bridge's loopback tools server:
  *
  *   ALTER_TOOLS_URL    base URL, for example http://127.0.0.1:43117
  *   ALTER_TOOLS_TOKEN  per-process secret sent as the X-Alter-Token header
  *
  * Both variables are set by the bridge in Pi's environment; the model never
- * chooses them and never sees the token.
+ * chooses them and never sees the token. They are additive on top of Pi's own
+ * tools: the bridge no longer restricts the toolset (S7), so `bash`, `read`,
+ * `write`, `edit`, `grep`, `find`, `ls` and whatever the loaded packages provide
+ * are still there.
  *
- * Load it explicitly and list the four tools in the allowlist, because `--tools`
- * replaces Pi's whole tool selection instead of extending it:
+ * The extension is loaded by the bridge with `-e`, next to the persona file that
+ * `--append-system-prompt` injects.
  *
- *   pi -e internal/tools/extension/index.ts \
- *      --tools read,grep,find,ls,save_note,append_note,send_file,ask_options
- *
- * Dependency-free on purpose: only the global `fetch` is used, so the extension
- * works without installing anything into the Pi package.
+ * Dependency-free on purpose: only `node:fs`/`node:path` and the global `fetch`
+ * are used, so the extension works without installing anything into the Pi
+ * package.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Json = Record<string, unknown>;
@@ -184,7 +187,84 @@ function text(data: Json, key: string): string {
 	return typeof value === "string" ? value : "";
 }
 
+/**
+ * Name of the system prompt section that carries Alter's identity. Pi renders
+ * custom sections after every built-in one (see `buildSystemPromptSections`), so
+ * this is the last instruction block of the prompt.
+ */
+const IDENTITY_SECTION = "alter_identity";
+
+/**
+ * Fail-safe identity, used only when the persona file cannot be read. A shorter
+ * block is better than losing the last word, but it must never disagree with
+ * `alter-persona.md`: it states the same two facts the full persona opens with.
+ */
+const IDENTITY_FALLBACK =
+	"Eres ALTER, el secretario personal de Verdu, y no el Gentleman. Heredas su disciplina " +
+	"(planificar antes de actuar, delegar cuando toca, verificar lo que afirmas, cuidar al revisor) " +
+	"pero tu identidad, tu canal y tu voz son Alter: respondes breve, en español y en markdown rico, " +
+	"sin volcar código ni salidas de herramientas en el chat.";
+
+/**
+ * Reads the persona once, at load time, so the injected block is exactly the file
+ * the bridge also passes to `--append-system-prompt`: one text, no drift.
+ *
+ * `ALTER_PERSONA_FILE` wins, so a deployment that points the bridge at another
+ * persona gets the same file injected last. The default is the repository copy,
+ * resolved from this extension's own location because Pi's working directory is
+ * the owner's `$HOME`, not the repository root.
+ */
+function loadIdentity(): string {
+	const configured = (process.env.ALTER_PERSONA_FILE ?? "").trim();
+	const path = configured || resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "alter-persona.md");
+	try {
+		const persona = readFileSync(path, "utf8").trim();
+		return persona.length > 0 ? persona : IDENTITY_FALLBACK;
+	} catch {
+		return IDENTITY_FALLBACK;
+	}
+}
+
+/** The identity block, read once per Pi process. */
+const IDENTITY = loadIdentity();
+
 export default function alterTools(pi: ExtensionAPI): void {
+	// Identity precedence (T12). Why the ordering matters:
+	//
+	// gentle-pi is loaded globally as a package and, in its own
+	// `before_agent_start` handler, APPENDS its block through
+	// `appendSystemPromptOnce` (gentle-pi/lib/append-system-prompt.ts): it writes
+	// `options.appendSystemPrompt = current + block` and never replaces the
+	// prompt. That text becomes the `addendum` section, and the CLI's
+	// `--append-system-prompt` (our persona) sits earlier still. Doing nothing
+	// leaves the Gentleman block last, so the model introduces itself as the
+	// Gentleman.
+	//
+	// Appending to the same string cannot fix that: the `-e` extension loads
+	// before the package handlers, so gentle-pi would still write after us.
+	// Pi renders custom `sections` after `addendum`, the skills and the cwd, in
+	// whatever order the handlers ran, so registering the identity as a section
+	// is what puts it after the Gentleman block.
+	//
+	// Known limit: a handler that runs after this one can still add its own
+	// section (the MCP catalogue does), and a handler that forces the whole
+	// prompt replaces every section. The first only appends a tool catalogue; the
+	// second is handled below.
+	pi.on("before_agent_start", (event) => {
+		// Idempotent: assigning the key replaces the previous value instead of
+		// appending to it, so a handler that runs twice leaves one block.
+		event.systemPromptOptions.sections[IDENTITY_SECTION] = IDENTITY;
+
+		// A handler that forces the whole prompt discards every section. In that
+		// case re-assert the block over the text that will actually be sent, read
+		// from the event, and never truncate what was there.
+		const current = event.systemPrompt;
+		if (event.systemPromptOptions.forceSystemPrompt !== undefined && !current.includes(IDENTITY)) {
+			return { systemPrompt: `${current}\n\n${IDENTITY}` };
+		}
+		return undefined;
+	});
+
 	pi.registerTool({
 		name: "save_note",
 		label: "Guardar nota",

@@ -95,6 +95,27 @@ func verifyBridgeAssets(cfg config.Config) error {
 	return nil
 }
 
+// resolveBridgeAssetPaths turns the configured prompt files and extensions into
+// absolute paths.
+//
+// verifyBridgeAssets checks them against this process's working directory (the
+// repository root in a normal deployment), but Pi is spawned with WorkDir set to
+// the owner's directory: with `cwd` = $HOME a relative `-e` fails to load
+// ("Extension path does not exist") and a relative `--append-system-prompt` is
+// silently appended as that literal string instead of the persona's content.
+// Resolving here makes the same configured asset reach Pi from any directory.
+func resolveBridgeAssetPaths(paths []string) []string {
+	resolved := make([]string, 0, len(paths))
+	for _, path := range paths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			absolute = path
+		}
+		resolved = append(resolved, absolute)
+	}
+	return resolved
+}
+
 // bridgeRuntime is the composed runtime of one bridge process: the vault store,
 // the loopback tools server Pi calls, the persistent Pi session and the Telegram
 // poller.
@@ -199,6 +220,22 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	if r.newCmd != nil {
 		sessionOpts = append(sessionOpts, bridge.WithCommandFactory(r.newCmd))
 	}
+	// The extension discovers the bridge tools through these two variables.
+	env := map[string]string{
+		"ALTER_TOOLS_URL":   toolsURL,
+		"ALTER_TOOLS_TOKEN": server.Token(),
+	}
+	// T12: the extension re-states the persona as the LAST block of the system
+	// prompt, so it must inject the same file this process appends with
+	// --append-system-prompt; otherwise a persona configured through
+	// ALTER_BRIDGE_PROMPT_FILES would be contradicted by the repository copy.
+	// The first configured prompt file is the persona; the rest are extra
+	// contracts. The path is absolute because Pi runs in WorkDir ($HOME).
+	promptFiles := resolveBridgeAssetPaths(cfg.BridgePromptFiles)
+	if len(promptFiles) > 0 {
+		env["ALTER_PERSONA_FILE"] = promptFiles[0]
+	}
+
 	session := bridge.NewSession(bridge.Config{
 		Bin:         cfg.PiBin,
 		Provider:    cfg.PiProvider,
@@ -206,15 +243,11 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		Timeout:     cfg.BridgeTimeout,
 		SessionID:   cfg.BridgeSessionID,
 		Tools:       cfg.BridgeTools,
-		Extensions:  cfg.BridgeExtensions,
-		PromptFiles: cfg.BridgePromptFiles,
+		Extensions:  resolveBridgeAssetPaths(cfg.BridgeExtensions),
+		PromptFiles: promptFiles,
 		// cwd = the owner's directory ($HOME by default), never the vault.
 		WorkDir: cfg.WorkDir,
-		// The extension discovers the bridge tools through these two variables.
-		Env: map[string]string{
-			"ALTER_TOOLS_URL":   toolsURL,
-			"ALTER_TOOLS_TOKEN": server.Token(),
-		},
+		Env:     env,
 	}, sessionOpts...)
 
 	r.client = client
