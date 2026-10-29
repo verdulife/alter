@@ -69,10 +69,14 @@ type Config struct {
 	// through deterministic extension tools.
 	BridgeTools string
 	// BridgePromptFiles are markdown files appended to the system prompt via
-	// --append-system-prompt, in order.
+	// --append-system-prompt, in order. Defaults to the repository-relative
+	// alter-persona.md, so a bridge started from the repository root needs no
+	// extra configuration.
 	BridgePromptFiles []string
 	// BridgeExtensions are explicit extension entry points loaded with -e. They
 	// coexist with --no-extensions (discovery off, explicit paths still load).
+	// Defaults to the repository-relative tools extension, which is the only
+	// thing that gives Pi its deterministic write tools.
 	BridgeExtensions []string
 	// BridgeTimeout bounds one full bridge turn (spawn + model + tools + reply).
 	BridgeTimeout time.Duration
@@ -108,6 +112,14 @@ const (
 	// only the read-only tools would silently disable every vault write (S7).
 	defaultBridgeTools   = "read,grep,find,ls,save_note,append_note,send_file,ask_options"
 	defaultBridgeTimeout = 120 * time.Second
+
+	// defaultBridgePromptFiles and defaultBridgeExtensions are the assets the
+	// phase-1 bridge needs from Pi, both repository-relative so that running the
+	// binary from the repository root works with no environment at all. Missing
+	// them is a silent failure (Pi would write nothing), so the wiring verifies
+	// them at start-up instead of trusting the defaults.
+	defaultBridgePromptFiles = "alter-persona.md"
+	defaultBridgeExtensions  = "internal/tools/extension/index.ts"
 )
 
 // Load returns the application configuration from environment variables
@@ -136,8 +148,8 @@ func Load() Config {
 		BridgeEnabled:     parseBoolEnv("ALTER_BRIDGE_ENABLED", false),
 		BridgeSessionID:   envOr("ALTER_BRIDGE_SESSION_ID", defaultBridgeSessionID),
 		BridgeTools:       envOr("ALTER_BRIDGE_TOOLS", defaultBridgeTools),
-		BridgePromptFiles: splitListEnv("ALTER_BRIDGE_PROMPT_FILES"),
-		BridgeExtensions:  splitListEnv("ALTER_BRIDGE_EXTENSIONS"),
+		BridgePromptFiles: splitListEnv("ALTER_BRIDGE_PROMPT_FILES", defaultBridgePromptFiles),
+		BridgeExtensions:  splitListEnv("ALTER_BRIDGE_EXTENSIONS", defaultBridgeExtensions),
 		BridgeTimeout:     parseDurationEnv("ALTER_BRIDGE_TIMEOUT", defaultBridgeTimeout),
 
 		Timezone: envOr("ALTER_TIMEZONE", ""),
@@ -173,9 +185,19 @@ func defaultVaultDir() string {
 }
 
 // splitListEnv parses a semicolon-separated list, trimming whitespace and
-// dropping empty entries. An unset variable yields nil.
-func splitListEnv(key string) []string {
-	raw := os.Getenv(key)
+// dropping empty entries. def is the semicolon-separated default list, used when
+// the variable is unset or yields no entry at all, so an empty value never
+// silently drops an asset the bridge depends on.
+func splitListEnv(key, def string) []string {
+	if list := parseList(os.Getenv(key)); len(list) > 0 {
+		return list
+	}
+	return parseList(def)
+}
+
+// parseList parses a semicolon-separated list, trimming whitespace and dropping
+// empty entries. An empty value yields nil.
+func parseList(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}

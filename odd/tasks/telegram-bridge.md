@@ -69,7 +69,8 @@ acumulación. Slices cerrados:
 | 8 | T7 (tools deterministas + fix de contención) | `d0979fa` + `186ac4c` |
 | 9 | T9a (wiring de texto) | `9bb4659` |
 | 10 | T9c (archivos entrantes) | `ee25faa` |
-| 11 | T9b (ask_options) | siguiente |
+| 11 | T9b (ask_options) | `197409f` |
+| 12 | T10 (guardia, smoke, docs) | siguiente |
 
 Siguiente corte: **T5 (vault)** y **T6 (proceso Pi)**, cada uno un slice propio.
 

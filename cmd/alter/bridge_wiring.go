@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,54 @@ const (
 	bridgeEmptyReply = "Pi no devolvió ningún texto. Prueba a reformular el mensaje."
 	bridgeErrorReply = "No pude terminar la respuesta. Inténtalo de nuevo en un momento."
 )
+
+// The two variables that configure the files Pi needs. They appear in the
+// start-up error so the owner learns what to change and not only what is missing.
+const (
+	envBridgePromptFiles = "ALTER_BRIDGE_PROMPT_FILES"
+	envBridgeExtensions  = "ALTER_BRIDGE_EXTENSIONS"
+)
+
+// bridgeAsset is one file Pi needs before the bridge can start: a markdown file
+// appended to its system prompt, or an extension it must load. Both are silent
+// failures when absent — Pi would answer with no persona and, worse, with no
+// write tools at all — so start-up verifies them instead of trusting the paths.
+type bridgeAsset struct {
+	// kind is the human name of the asset in the error line.
+	kind string
+	// envKey is the variable that configured the path.
+	envKey string
+	// path is the configured path, repository-relative or absolute.
+	path string
+}
+
+// verifyBridgeAssets checks that every configured prompt file and extension
+// exists and is a regular file, returning one error that names the offending
+// path and the variable behind it. It runs before the tools server is bound and
+// before Pi can be spawned, so a misconfigured bridge never starts in a
+// half-useful state.
+func verifyBridgeAssets(cfg config.Config) error {
+	assets := make([]bridgeAsset, 0, len(cfg.BridgePromptFiles)+len(cfg.BridgeExtensions))
+	for _, path := range cfg.BridgePromptFiles {
+		assets = append(assets, bridgeAsset{kind: "prompt file", envKey: envBridgePromptFiles, path: path})
+	}
+	for _, path := range cfg.BridgeExtensions {
+		assets = append(assets, bridgeAsset{kind: "extension", envKey: envBridgeExtensions, path: path})
+	}
+
+	for _, asset := range assets {
+		info, err := os.Stat(asset.path)
+		if err != nil {
+			return fmt.Errorf("%s %q is not readable (configured by %s): %w",
+				asset.kind, asset.path, asset.envKey, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s %q is not a regular file (configured by %s)",
+				asset.kind, asset.path, asset.envKey)
+		}
+	}
+	return nil
+}
 
 // bridgeRuntime is the composed runtime of one bridge process: the vault store,
 // the loopback tools server Pi calls, the persistent Pi session and the Telegram
@@ -99,6 +148,17 @@ func withInboundFileLimit(max int64) bridgeRuntimeOption {
 // chat. Nothing is spawned until the first prompt, and the tools server is bound
 // before Pi can be started, so the extension always has a live endpoint.
 func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRuntimeOption) (*bridgeRuntime, error) {
+	// Start-up guard (T10): Pi's persona and, above all, its tools extension must
+	// exist before anything is composed. A missing extension would leave the
+	// bridge answering while Pi cannot write anything — a silent, confusing
+	// failure — so refuse to start and say which path is wrong. Only bridge mode
+	// checks: the legacy path has no assets to load.
+	if cfg.BridgeEnabled {
+		if err := verifyBridgeAssets(cfg); err != nil {
+			return nil, err
+		}
+	}
+
 	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes}
 	for _, opt := range opts {
 		opt(r)

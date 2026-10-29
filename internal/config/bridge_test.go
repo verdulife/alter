@@ -48,11 +48,13 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	if cfg.BridgeTools != "read,grep,find,ls,save_note,append_note,send_file,ask_options" {
 		t.Errorf("BridgeTools = %q, want the read-only tools plus the deterministic ones", cfg.BridgeTools)
 	}
-	if got := len(cfg.BridgePromptFiles); got != 0 {
-		t.Errorf("BridgePromptFiles = %v, want empty", cfg.BridgePromptFiles)
+	// A run from the repository root must work with no extra configuration, so
+	// both lists default to the repository-relative assets Pi needs.
+	if len(cfg.BridgePromptFiles) != 1 || cfg.BridgePromptFiles[0] != "alter-persona.md" {
+		t.Errorf("BridgePromptFiles = %v, want [alter-persona.md]", cfg.BridgePromptFiles)
 	}
-	if got := len(cfg.BridgeExtensions); got != 0 {
-		t.Errorf("BridgeExtensions = %v, want empty", cfg.BridgeExtensions)
+	if len(cfg.BridgeExtensions) != 1 || cfg.BridgeExtensions[0] != "internal/tools/extension/index.ts" {
+		t.Errorf("BridgeExtensions = %v, want [internal/tools/extension/index.ts]", cfg.BridgeExtensions)
 	}
 	if cfg.BridgeTimeout != 120*time.Second {
 		t.Errorf("BridgeTimeout = %v, want 120s", cfg.BridgeTimeout)
@@ -129,8 +131,25 @@ func TestLoadBridgeMalformedFallsBack(t *testing.T) {
 	if len(cfg.BridgePromptFiles) != 1 || cfg.BridgePromptFiles[0] != "/b.md" {
 		t.Errorf("BridgePromptFiles = %v, want [/b.md] (empty entries dropped)", cfg.BridgePromptFiles)
 	}
-	if len(cfg.BridgeExtensions) != 0 {
-		t.Errorf("BridgeExtensions = %v, want empty (empty entries dropped)", cfg.BridgeExtensions)
+	// Empty entries leave no usable list behind, so the defaults still apply.
+	if len(cfg.BridgeExtensions) != 1 || cfg.BridgeExtensions[0] != "internal/tools/extension/index.ts" {
+		t.Errorf("BridgeExtensions = %v, want the default extension", cfg.BridgeExtensions)
+	}
+}
+
+// TestLoadBridgeDefaultsSurviveOneSidedOverride proves each list falls back on
+// its own default: configuring prompt files must not drop the extension, which is
+// what gives Pi its write tools.
+func TestLoadBridgeDefaultsSurviveOneSidedOverride(t *testing.T) {
+	clearBridgeEnv(t)
+	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "docs/otra-persona.md")
+
+	cfg := Load()
+	if len(cfg.BridgePromptFiles) != 1 || cfg.BridgePromptFiles[0] != "docs/otra-persona.md" {
+		t.Errorf("BridgePromptFiles = %v, want the configured file only", cfg.BridgePromptFiles)
+	}
+	if len(cfg.BridgeExtensions) != 1 || cfg.BridgeExtensions[0] != "internal/tools/extension/index.ts" {
+		t.Errorf("BridgeExtensions = %v, want the default extension", cfg.BridgeExtensions)
 	}
 }
 

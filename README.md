@@ -2,36 +2,49 @@
 
 Personal virtual secretary — modular, extensible, low-resource.
 
-## Purpose
+## Estado actual
 
-A local-first tool that will progressively grow into a personal secretary with integrations (calendar, email, messaging). The first communication channel will be Telegram, but nothing is implemented yet.
+La **fase 1 del canal Telegram ↔ Pi está implementada**: Telegram es la única
+entrada y salida, Pi es el motor y responde con markdown rico (tablas, listas,
+citas, botones). Se pueden enviar y recibir archivos, y Pi escribe en el vault
+global únicamente a través de tools deterministas (`save_note`, `append_note`,
+`send_file`, `ask_options`): nunca tiene `bash`, `edit` ni `write`.
 
-## Principles
+Antes de esa fase ya existían, y siguen funcionando sin el bridge activo: SQLite
+como fuente de verdad, tareas y recordatorios con comandos de Telegram, el
+Scheduler y el Pi Agent opcional.
 
-- **Modular from day one** — integrations are added as packages under `internal/`, never by modifying the core.
-- **SQLite first, PostgreSQL ready** — data layer abstracted via interfaces so the migration path is clear.
-- **Minimal dependencies** — only stdlib until a real need justifies an external package.
-- **Low resource usage** — designed to run on small machines without constant attention.
-- **No AI, no tasks, no Telegram yet** — those will come later.
+Detalle operativo (variables, arranque, qué está probado y qué no, limitaciones):
+**[`docs/bridge-fase1.md`](docs/bridge-fase1.md)**.
 
-## Project Structure
+Pendiente: fase 2 (skills para casos concretos) y fase 3 (rutinas programadas).
+
+## Principios
+
+- **Modular desde el primer día** — las integraciones se añaden como paquetes bajo
+  `internal/`, sin tocar el núcleo.
+- **SQLite primero, PostgreSQL preparado** — la capa de datos está tras interfaces,
+  así que el camino de migración es claro.
+- **Dependencias mínimas** — solo stdlib hasta que una necesidad real justifique un
+  paquete externo.
+- **Poco consumo** — pensado para máquinas pequeñas, sin atención constante.
+
+## Estructura
 
 ```
 alter/
-├── cmd/alter/      # Entry point
+├── cmd/alter/                  # Entry point y wiring del bridge
 ├── internal/
-│   └── config/         # Application configuration
+│   ├── adapter/telegram/       # Cliente Bot API, poller, canal
+│   ├── bridge/                 # Sesión Pi persistente (pi --mode rpc)
+│   ├── tools/                  # Servidor de tools deterministas + extensión Pi
+│   ├── vault/                  # Almacén de notas y adjuntos
+│   ├── config/                 # Configuración por entorno + .env
+│   ├── scheduler/              # Triggers y recordatorios
+│   └── storage/sqlite/         # Persistencia
+├── alter-persona.md            # Persona y contrato de formato de Pi
+├── docs/
 └── README.md
-```
-
-Future additions:
-
-```
-internal/
-├── storage/            # Database abstraction (SQLite → PostgreSQL)
-├── calendar/           # Calendar integration
-├── email/              # Email integration
-└── channel/            # Communication channels (Telegram, etc.)
 ```
 
 ## Build & Run
@@ -41,13 +54,21 @@ go build -o alter ./cmd/alter
 ./alter
 ```
 
-Or directly:
+O directamente:
 
 ```bash
 go run ./cmd/alter
 ```
 
+Requiere `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID`; el resto tiene valores por defecto
+(véase `docs/bridge-fase1.md`). Para el canal rico completo:
+
+```bash
+ALTER_BRIDGE_ENABLED=true go run ./cmd/alter
+```
+
 ## Requirements
 
-- Go 1.24+
+- Go 1.25+
 - Git
+- `pi` (CLI de Pi) en el `PATH` o en `ALTER_PI_BIN`, para el bridge
