@@ -44,8 +44,11 @@ type Config struct {
 	// NOT the working directory of Pi; that is WorkDir.
 	VaultDir string
 	// WorkDir is the working directory of the bridge's Pi process (cwd). Defaults
-	// to $HOME, so Pi sees the same tree a terminal session sees: the bridge is the
-	// owner's gentle-shell, not a sandbox with a smaller view.
+	// to the process working directory, which in deployment is the repository:
+	// Pi discovers project skills and project context relative to it (from the
+	// cwd up to the repository root), so the default must be the repository and
+	// not $HOME, where those skills would never be found. It is not a sandbox:
+	// bash works with absolute paths, so the whole system stays reachable.
 	WorkDir string
 
 	// BridgeSessionID is the Pi session resumed across messages, so the
@@ -142,16 +145,32 @@ func defaultVaultDir() string {
 	return filepath.Join(home, "vault")
 }
 
-// defaultWorkDir returns $HOME, the directory Pi works in: the bridge is the
-// owner's shell, so it must see what a terminal session sees. ALTER_BRIDGE_WORKDIR
-// always wins; without a resolvable home the bridge inherits its own working
-// directory instead of inventing a path.
+// defaultWorkDir returns the process working directory, the directory Pi works
+// in. Pi only discovers project skills (~/.agents/skills and .agents/skills,
+// scanned from the cwd up to the repository root) and project context files
+// relative to that directory, and the service already runs with the repository
+// as its working directory, so the default has to be the repository and not
+// $HOME. Reach over the rest of the system is untouched: bash takes absolute
+// paths and the vault stays at $HOME/vault.
+//
+// ALTER_BRIDGE_WORKDIR always wins. When the working directory cannot be
+// resolved the default falls back to $HOME, and to "" (inherit the working
+// directory) when neither resolves, instead of inventing a path.
 func defaultWorkDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+	return defaultWorkDirFrom(os.Getwd, os.UserHomeDir)
+}
+
+// defaultWorkDirFrom is the resolver behind defaultWorkDir, with the two
+// lookups injected so the fallbacks are testable without changing the process
+// working directory.
+func defaultWorkDirFrom(getwd func() (string, error), homeDir func() (string, error)) string {
+	if wd, err := getwd(); err == nil && wd != "" {
+		return wd
 	}
-	return home
+	if home, err := homeDir(); err == nil && home != "" {
+		return home
+	}
+	return ""
 }
 
 // splitListEnv parses a semicolon-separated list, trimming whitespace and

@@ -13,9 +13,9 @@
 // configured Pi keeps its own default selection, which includes modifying tools
 // (`bash`, `edit`, `write`).
 //
-// Pi works in Config.WorkDir ($HOME in production), so it sees the same tree the
-// owner sees in a terminal. The vault is only the store the deterministic bridge
-// tools write through, never the cwd.
+// Pi works in Config.WorkDir (the repository in production, so project skills and
+// project context are discovered from it). The vault is only the store the bridge
+// tools read paths against, never the cwd.
 package bridge
 
 import (
@@ -71,8 +71,9 @@ type Config struct {
 	PromptFiles []string
 	// WorkDir is the working directory of the child process (cwd). Empty inherits
 	// the bridge's own working directory. Production passes the configured
-	// ALTER_BRIDGE_WORKDIR, which defaults to $HOME, so Pi sees the same tree a
-	// terminal session sees. The vault path is not part of this struct: it belongs
+	// ALTER_BRIDGE_WORKDIR, which defaults to the process working directory: the
+	// repository, so project skills in .agents/skills are discovered and never leak
+	// into unrelated sessions. The vault path is not part of this struct: it belongs
 	// to the tools server config, never to the child's cwd.
 	WorkDir string
 	// Env holds extra environment variables for the child process, applied on
@@ -245,8 +246,9 @@ func (s *Session) ensureStarted() error {
 // with exec.CommandContext) so the process is not bound to one prompt's context.
 func (s *Session) start() error {
 	cmd := s.newCmd(s.cfg.Bin, s.args()...)
-	// cwd = the configured work dir ($HOME in production): Pi sees the owner's
-	// tree, exactly as a terminal session does.
+	// cwd = the configured work dir (the repository in production), so project
+	// skills and project context resolve from the same place a terminal session
+	// would see them.
 	if s.cfg.WorkDir != "" {
 		cmd.Dir = s.cfg.WorkDir
 	}

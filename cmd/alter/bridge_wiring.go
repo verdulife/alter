@@ -270,7 +270,8 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	// --append-system-prompt; otherwise a persona configured through
 	// ALTER_BRIDGE_PROMPT_FILES would be contradicted by the repository copy.
 	// The first configured prompt file is the persona; the rest are extra
-	// contracts. The path is absolute because Pi runs in WorkDir ($HOME).
+	// contracts. The path is absolute because Pi runs in WorkDir, which is not
+	// necessarily the bridge's own directory.
 	promptFiles := resolveBridgeAssetPaths(cfg.BridgePromptFiles)
 	if len(promptFiles) > 0 {
 		env["ALTER_PERSONA_FILE"] = promptFiles[0]

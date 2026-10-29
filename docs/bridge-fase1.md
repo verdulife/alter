@@ -38,9 +38,16 @@ entrada de texto libre; Pi es el motor.
   una terminal (gentle-pi, gentle-engram, pi-btw, pi-web-access, sus skills y los
   ficheros de contexto). Las rutas `-e` y los `--append-system-prompt` del bridge
   son **aditivos** a lo descubierto, no un reemplazo.
-- **Directorio de trabajo (T11).** Pi arranca con `cwd` = `ALTER_BRIDGE_WORKDIR`,
-  que por defecto es `$HOME`. Ve todo lo que ves tú. El vault ya **no** es el `cwd`:
-  es solo el almacén que Pi escribe con `write`/`edit` y del que `send_file` lee.
+- **Directorio de trabajo (T11, T18).** Pi arranca con `cwd` =
+  `ALTER_BRIDGE_WORKDIR`, que por defecto es el directorio de trabajo del proceso
+  (el repositorio, que es donde corre el servicio). Desde ahí descubre las skills
+  del proyecto. Ve todo lo que ves tú: `bash` llega a cualquier ruta absoluta y el
+  vault sigue en `$HOME/vault`. El vault ya **no** es el `cwd`: es solo el almacén
+  que Pi escribe con `write`/`edit` y del que `send_file` lee.
+- **Skills del proyecto (T18).** Las skills de Alter, como `alter-vault`, viven en
+  `.agents/skills/` del repositorio, no en la configuración global: Pi las
+descubre desde su directorio de trabajo hacia arriba, así que solo existen para
+  Alter y solo cuestan su nombre y descripción hasta que el modelo las invoca.
 - **Sesión persistente.** Un único proceso `pi --mode rpc` con sesión nombrada, así
   que la conversación conserva el hilo entre mensajes.
 - **Timeout amplio.** El tope por turno son 300 s por defecto
@@ -59,9 +66,9 @@ desactivado.
 existe: al arrancar no se crea nada en disco. `go.mod` no tiene dependencias
 externas.
 - **Sin trabajo programado.** El scheduler y sus servicios desaparecen con la base
-de datos. Tareas, recordatorios y eventos vivirán como notas markdown con
-frontmatter **en el vault**, y esa migración es un slice posterior: aquí no hay
-todavía esquema ni escritura de tareas.
+de datos. Tareas, recordatorios y eventos viven como notas markdown con
+frontmatter **en el vault**; el contrato está en la skill de proyecto
+`alter-vault`, no en código.
 - **Un único camino de arranque.** `ALTER_BRIDGE_ENABLED` deja de ser un
 interruptor. Si sigue en el entorno con un valor que antes apagaba el bridge, el
 proceso escribe una línea diciendo que se ignora y arranca igual: el bridge no se
@@ -85,7 +92,7 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `ALTER_BRIDGE_PROMPT_FILES` | `alter-persona.md` | Ficheros markdown para `--append-system-prompt`, en orden. Separador `;`. |
 | `ALTER_BRIDGE_EXTENSIONS` | `internal/tools/extension/index.ts` | Extensiones cargadas con `-e`. Separador `;`. |
 | `ALTER_BRIDGE_TIMEOUT` | `300s` | Tope de un turno completo (spawn + modelo + tools + respuesta). |
-| `ALTER_BRIDGE_WORKDIR` | `$HOME` | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. |
+| `ALTER_BRIDGE_WORKDIR` | directorio de trabajo del proceso (el repositorio) | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. De ahí para arriba se descubren las skills del proyecto; si no se puede resolver, cae a `$HOME`. |
 | `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: el almacén que Pi escribe con `write`/`edit` y donde caen los archivos entrantes. No es el `cwd` de Pi. |
 | `ALTER_TELEGRAM_API_BASE` | `https://api.telegram.org` | Base URL del Bot API (S8). |
 | `ALTER_PI_BIN` | `pi` | Binario de Pi. Un servicio (systemd/cron) casi siempre necesita ruta absoluta porque su `PATH` no incluye fnm. |
@@ -96,8 +103,8 @@ Las rutas de `ALTER_BRIDGE_PROMPT_FILES` y `ALTER_BRIDGE_EXTENSIONS` son
 **relativas al repositorio**, así que arrancar desde la raíz del repositorio
 funciona sin configurar nada. Se admiten rutas absolutas. La guardia de arranque
 las resuelve contra el `cwd` del propio bridge (el repositorio), **nunca** contra
-`ALTER_BRIDGE_WORKDIR`: los ficheros pertenecen al repositorio, y el hijo arranca
-en `$HOME`, donde no existen.
+`ALTER_BRIDGE_WORKDIR`: los ficheros pertenecen al repositorio y una configuración
+explícita del directorio de trabajo no debe romper el arranque.
 
 ## Cómo arrancarlo
 
@@ -181,9 +188,10 @@ chat ID.
 - Bridge completo contra un RPC falso: drafts, entrega final, línea humana cuando
   Pi no devuelve texto, reintento tras un `getUpdates` fallido, y orden de
   apagado (poller → tools → sesión).
-- Ámbito del bridge (T11): los argumentos no llevan ningún `--no-*`, un
+- Ámbito del bridge (T11, T18): los argumentos no llevan ningún `--no-*`, un
   `ALTER_BRIDGE_TOOLS` vacío **no** emite `--tools`, el `cwd` del hijo es
-  `ALTER_BRIDGE_WORKDIR` (nunca el vault) y el defecto de timeout es 300 s.
+  `ALTER_BRIDGE_WORKDIR` (nunca el vault), el defecto es el directorio de trabajo
+  del proceso con caída a `$HOME`, y el defecto de timeout es 300 s.
 - Aprobaciones (T13): un diálogo `confirm` llega al bridge y se convierte en dos
   botones; un `select` en una lista de botones; `input`/`editor` se cancelan con
   traza. Sin respuesta, error o cancelación: `cancelled`, nunca permitido.

@@ -7,8 +7,9 @@ Personal virtual secretary — modular, extensible, low-resource.
 La **fase 1 del canal Telegram ↔ Pi está implementada**: Telegram es la única
 entrada y salida, Pi es el motor y responde con markdown rico (tablas, listas,
 citas, botones). Se pueden enviar y recibir archivos, y Pi escribe en el vault
-global únicamente a través de tools deterministas (`save_note`, `append_note`,
-`send_file`, `ask_options`): nunca tiene `bash`, `edit` ni `write`.
+global con sus propias herramientas de terminal: puede ejecutar `bash`, editar y
+escribir como en una sesión normal. Solo dos tools son propias de Alter
+(`send_file`, `ask_options`), las que un shell no puede suplir.
 
 Antes de esa fase ya existían, y siguen funcionando sin el bridge activo: SQLite
 como fuente de verdad, tareas y recordatorios con comandos de Telegram, el

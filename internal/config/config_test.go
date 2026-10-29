@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -96,23 +97,6 @@ func TestBridgeToolsExplicitStillWins(t *testing.T) {
 	}
 }
 
-// TestWorkDirDefaultsToHome pins the working directory of the bridge's Pi: $HOME,
-// so it sees the same tree a terminal session sees. It stays independent of the
-// vault, which is only where notes live.
-func TestWorkDirDefaultsToHome(t *testing.T) {
-	clearBridgeEnv(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	cfg := Load()
-	if cfg.WorkDir != home {
-		t.Errorf("WorkDir = %q, want $HOME %q", cfg.WorkDir, home)
-	}
-	if want := filepath.Join(home, "vault"); cfg.VaultDir != want {
-		t.Errorf("VaultDir = %q, want %q: the vault keeps its own value", cfg.VaultDir, want)
-	}
-}
-
 // TestWorkDirFromEnvWins proves ALTER_BRIDGE_WORKDIR overrides $HOME without
 // touching the vault path.
 func TestWorkDirFromEnvWins(t *testing.T) {
@@ -127,5 +111,53 @@ func TestWorkDirFromEnvWins(t *testing.T) {
 	}
 	if cfg.VaultDir != "/srv/vault" {
 		t.Errorf("VaultDir = %q, want /srv/vault", cfg.VaultDir)
+	}
+}
+
+// TestWorkDirDefaultsToProcessWorkingDirectory pins T18/L19: Pi's cwd defaults
+// to the process working directory (the repository), not $HOME, because project
+// skills and project context are discovered relative to it. $HOME is only a
+// fallback for when the working directory cannot be resolved.
+func TestWorkDirDefaultsToProcessWorkingDirectory(t *testing.T) {
+	clearBridgeEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+
+	cfg := Load()
+	if cfg.WorkDir != wd {
+		t.Errorf("WorkDir = %q, want the process working directory %q", cfg.WorkDir, wd)
+	}
+	if cfg.WorkDir == home {
+		t.Errorf("WorkDir = %q: the working directory is the repository, not $HOME", cfg.WorkDir)
+	}
+	// The vault keeps its own default; moving the cwd must not move the vault.
+	if want := filepath.Join(home, "vault"); cfg.VaultDir != want {
+		t.Errorf("VaultDir = %q, want %q", cfg.VaultDir, want)
+	}
+}
+
+// TestDefaultWorkDirFallbacks covers the resolver without chdir: when
+// os.Getwd fails the default falls back to $HOME, and to "" (inherit) when
+// neither resolves, so the bridge never invents a path.
+func TestDefaultWorkDirFallbacks(t *testing.T) {
+	home := t.TempDir()
+	getwdErr := func() (string, error) { return "", os.ErrNotExist }
+	getwdEmpty := func() (string, error) { return "", nil }
+	homeErr := func() (string, error) { return "", os.ErrNotExist }
+
+	homeOK := func() (string, error) { return home, nil }
+	if got := defaultWorkDirFrom(getwdErr, homeOK); got != home {
+		t.Errorf("defaultWorkDirFrom(getwd error) = %q, want $HOME %q", got, home)
+	}
+	if got := defaultWorkDirFrom(getwdEmpty, homeOK); got != home {
+		t.Errorf("defaultWorkDirFrom(empty workdir) = %q, want $HOME %q", got, home)
+	}
+	if got := defaultWorkDirFrom(getwdErr, homeErr); got != "" {
+		t.Errorf("defaultWorkDirFrom(no workdir, no home) = %q, want empty", got)
 	}
 }

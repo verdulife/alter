@@ -39,9 +39,15 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	if cfg.VaultDir != wantVault {
 		t.Errorf("VaultDir = %q, want %q", cfg.VaultDir, wantVault)
 	}
-	// Pi works in $HOME, not in the vault: the bridge is the owner's shell.
-	if cfg.WorkDir != home {
-		t.Errorf("WorkDir = %q, want $HOME %q", cfg.WorkDir, home)
+	// Pi works in the process working directory (the repository), not in the
+	// vault: the vault is only the store, and project skills are discovered
+	// relative to the cwd (L19).
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	if cfg.WorkDir != wd {
+		t.Errorf("WorkDir = %q, want the process working directory %q", cfg.WorkDir, wd)
 	}
 	if cfg.BridgeSessionID != "telegram" {
 		t.Errorf("BridgeSessionID = %q, want telegram", cfg.BridgeSessionID)

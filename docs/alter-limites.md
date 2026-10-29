@@ -42,7 +42,13 @@ mantener y una ruta más que contener.
 Carga la configuración global de Pi: gentle-pi, gentle-engram, pi-btw,
 pi-web-access y sus skills. No hay "carga limpia".
 
-Directorio de trabajo: `$HOME`. Ve todo lo que ves tú.
+Directorio de trabajo: el repositorio de Alter. Ve todo lo que ves tú: `bash`
+llega a cualquier ruta absoluta y el vault sigue en `$HOME/vault`.
+
+Sus skills son del proyecto, no globales: viven en `.agents/skills/` del
+repositorio y Pi las descubre desde su directorio de trabajo hacia arriba. No
+aparecen en ninguna sesión ajena a Alter, y de ellas solo entra en contexto el
+nombre y la descripción hasta que el modelo las invoca.
 
 ## Aprobaciones
 
@@ -66,7 +72,7 @@ existe.
 | Preguntas pendientes | Una | Evita respuestas cruzadas |
 | Timeout de turno | Configurable, 300 s por defecto | Un `bash` largo necesita margen |
 | Archivos entrantes | 20 MB con la API cloud; sin límite con Bot API server propio | Techo de descarga de Telegram |
-| Directorio de trabajo | `$HOME` | Es tu gentle-shell |
+| Directorio de trabajo | El repositorio de Alter | Es tu gentle-shell, y las skills del proyecto se descubren desde ahí |
 
 ## Riesgos aceptados
 
@@ -98,16 +104,18 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 - No expone nada a Internet: Telegram es la única entrada, con conexión saliente.
 - No ejecuta trabajo programado. Eso es la fase 3, con cron o daemon despertando
   a Pi.
-- No tiene skills propias todavía. Eso es la fase 2.
+- No tiene skills globales. Las suyas son del proyecto (`.agents/skills/`) y solo
+existen en las sesiones que arrancan desde el repositorio. La fase 2 añadirá más;
+la primera es el contrato del vault.
 
 ## Qué cambia respecto a lo construido
 
 Lo entregado en la fase 1 se hizo con la restricción heredada de solo lectura.
 Quedan tres cambios, en este orden:
 
-1. **T11 — Permisos y ámbito**: allowlist completa, cwd `$HOME`, carga global de
-   Pi, timeout configurable. Se retira `--no-skills`, `--no-extensions`,
-   `--no-context-files` y la allowlist de solo lectura.
+1. **T11 — Permisos y ámbito**: allowlist completa, carga global de Pi, timeout
+   configurable. Se retira `--no-skills`, `--no-extensions`, `--no-context-files`
+   y la allowlist de solo lectura.
 2. **T12 — Identidad**: reescribir `alter-persona.md` con la disciplina de
    Gentleman y una identidad Alter explícita; imponerla por `tool_call`/
    `before_agent_start` si el orden de prompts no basta. Verificar empíricamente
