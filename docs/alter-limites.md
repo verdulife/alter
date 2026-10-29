@@ -111,11 +111,23 @@ se clasifica línea a línea, así que una línea que empiece por un programa
 peligroso pregunta aunque sea texto: se equivoca pidiendo permiso, nunca al
 revés.
 
+La pregunta está escrita para leerla en un móvil: el título es siempre «¿Lo
+permito?» y debajo va una frase con la consecuencia, en segunda persona, que no
+nombra el programa salvo que el programa sea el asunto («Va a borrar archivos.»,
+«Va a sobrescribir ~/notas.md.», «Va a pedir permisos de administrador.»). El
+comando viaja dentro de un bloque de código, con sus saltos de línea, para poder
+juzgarlo línea a línea; uno de más de 800 caracteres se recorta por el medio,
+marcando el hueco con `…` y conservando el principio y el final, que es donde
+suele estar lo peligroso.
+
 El botón recorre el mismo camino: la pregunta viaja a Telegram como dos botones
 y tu pulsación la responde; un rechazo, una cancelación o un error bloquean la
 llamada, y sin respuesta en el plazo **se bloquea**. Cada decisión deja una línea
 en el diario (`alter-gate: allow bash …`, `alter-gate: ask (git push publica en
-el remoto) bash …`), así que un turno real se puede auditar después.
+el remoto) bash …`), así que un turno real se puede auditar después. Esa línea
+sigue siendo la técnica y la completa —herramienta, regla aplicada y vista previa
+del argumento—, y por eso distingue `git push` de `git reset --hard` aunque la
+pregunta use la misma frase para los dos.
 
 Sin terminal no hay nadie mirando: el botón es la única aprobación real que
 existe, y por eso el diario es la otra mitad de la defensa.

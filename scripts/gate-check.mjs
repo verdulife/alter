@@ -8,7 +8,9 @@
  * every asking case — that answering "no" blocks the call.
  *
  * What it proves: the classifier's verdict for each command and each `write`
- * target, plus the denial path of the handler.
+ * target, the denial path of the handler, and — for every case that asks — the
+ * text the owner reads: one short human title, the consequence as the first line,
+ * and the command in a code block with its line breaks, never cut mid-line.
  * What it cannot prove: Pi's runtime. It never spawns `pi`, never answers an
  * `extension_ui_request` over RPC, and never executes a command. A `bash` case
  * asserts the decision, not the effect.
@@ -114,6 +116,51 @@ async function decide(tool, input) {
 	return { asked: questions.length > 0, question: questions[0], result };
 }
 
+// --- the text the owner reads ----------------------------------------------
+
+// One short question for every approval: naming the tool told the owner nothing
+// he could judge on a phone, so the consequence is the first line of the message.
+const APPROVAL_TITLE = "¿Lo permito?";
+
+// A typical multi-line script. The approval must show it whole and with its line
+// breaks, inside the fenced block; `shows` below asserts exactly that.
+const multiLineCommand = [
+	"cd ~/alter",
+	"export TMPDIR=/tmp",
+	"rm -rf ~/dist",
+	"mkdir -p ~/dist",
+	"gofmt -l cmd internal",
+	"go vet ./...",
+	"go test ./... -race -count=1",
+	"go build -o ~/dist/alter ./cmd/alter",
+	"cp ~/dist/alter ~/bin/alter",
+	"chmod +x ~/bin/alter",
+	"go test ./internal/tools/... -run TestTools -count=1",
+	"go test ./internal/bridge/... -run TestSession -count=1",
+	"echo listo",
+].join("\n");
+
+/**
+ * Problems with the approval text of one asking case, or null when it reads right.
+ * It checks the three things the owner judges: the title, the consequence as the
+ * first line, and — when the case says so — the whole command inside the fence.
+ * Every problem is reported, not only the first, so a run shows all the wording
+ * that still has to change.
+ */
+function textProblems(testCase, question) {
+	const problems = [];
+	if (question.title !== APPROVAL_TITLE) {
+		problems.push(`título ${JSON.stringify(question.title)}, esperaba ${JSON.stringify(APPROVAL_TITLE)}`);
+	}
+	if (testCase.reason !== undefined && !question.message.startsWith(`${testCase.reason}\n`)) {
+		problems.push(`mensaje ${JSON.stringify(question.message.split("\n")[0])}, esperaba ${JSON.stringify(testCase.reason)}`);
+	}
+	if (testCase.shows !== undefined && !question.message.includes(`\`\`\`\n${testCase.shows}\n\`\`\``)) {
+		problems.push("el mensaje no muestra el comando entero dentro del bloque de código");
+	}
+	return problems.length > 0 ? problems.join("; ") : null;
+}
+
 // --- cases ----------------------------------------------------------------
 
 const bash = (command) => ({ tool: "bash", input: { command } });
@@ -140,85 +187,97 @@ const cases = [
 	{ label: "dos comandos permitidos", ...bash("ls -la && git status"), expect: "allow" },
 
 	// --- bash: deletion and truncation ---------------------------------
-	{ label: "rm -rf", ...bash("rm -rf build"), expect: "ask" },
-	{ label: "unlink", ...bash("unlink existente.txt"), expect: "ask" },
-	{ label: "truncate", ...bash("truncate -s 0 existente.txt"), expect: "ask" },
-	{ label: "dd", ...bash("dd if=/dev/zero of=x bs=1M count=1"), expect: "ask" },
-	{ label: "rmdir", ...bash("rmdir build"), expect: "ask" },
-	{ label: "find -delete", ...bash("find . -name x -delete"), expect: "ask" },
+	{ label: "rm -rf", ...bash("rm -rf build"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "unlink", ...bash("unlink existente.txt"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "truncate", ...bash("truncate -s 0 existente.txt"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "dd", ...bash("dd if=/dev/zero of=x bs=1M count=1"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "rmdir", ...bash("rmdir build"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "find -delete", ...bash("find . -name x -delete"), expect: "ask", reason: "Va a borrar archivos." },
 
 	// --- bash: the command behind a wrapper ----------------------------
-	{ label: "sudo rm", ...bash("sudo rm x"), expect: "ask" },
-	{ label: "asignación de entorno + rm", ...bash("FOO=1 rm x"), expect: "ask" },
-	{ label: "env + rm", ...bash("env FOO=1 rm x"), expect: "ask" },
-	{ label: "xargs rm", ...bash("find . -name x | xargs rm"), expect: "ask" },
-	{ label: "bash -c con rm", ...bash("bash -c 'rm -rf x'"), expect: "ask" },
-	{ label: "segundo comando de la línea", ...bash("ls && rm -rf x"), expect: "ask" },
+	{ label: "sudo rm", ...bash("sudo rm x"), expect: "ask", reason: "Va a pedir permisos de administrador." },
+	{ label: "asignación de entorno + rm", ...bash("FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "env + rm", ...bash("env FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "xargs rm", ...bash("find . -name x | xargs rm"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "bash -c con rm", ...bash("bash -c 'rm -rf x'"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "segundo comando de la línea", ...bash("ls && rm -rf x"), expect: "ask", reason: "Va a borrar archivos." },
 
 	// --- bash: overwriting through redirection -------------------------
-	{ label: "> sobre un archivo existente fuera de home", ...bash(`echo x > ${outside}/f`), expect: "ask" },
-	{ label: "> sobre un archivo existente en home", ...bash(`echo x > ${home}/existente.txt`), expect: "ask" },
-	{ label: ">> sobre una ruta sensible", ...bash("echo x >> ~/.ssh/authorized_keys"), expect: "ask" },
-	{ label: "> sobre un arranque de shell", ...bash("echo x > .bashrc"), expect: "ask" },
-	{ label: "> con variable en la ruta", ...bash("echo x > $HOME/.ssh/authorized_keys"), expect: "ask" },
-	{ label: "mv sobre un destino existente", ...bash("mv a.txt b.txt"), expect: "ask" },
+	{ label: "> sobre un archivo existente fuera de home", ...bash(`echo x > ${outside}/f`), expect: "ask", reason: `Va a sobrescribir ${outside}/f.` },
+	{ label: "> sobre un archivo existente en home", ...bash(`echo x > ${home}/existente.txt`), expect: "ask", reason: "Va a sobrescribir ~/existente.txt." },
+	{ label: ">> sobre una ruta sensible", ...bash("echo x >> ~/.ssh/authorized_keys"), expect: "ask", reason: "Va a añadir contenido a ~/.ssh/authorized_keys." },
+	{ label: "> sobre un arranque de shell", ...bash("echo x > .bashrc"), expect: "ask", reason: "Va a sobrescribir ~/.bashrc." },
+	{ label: "> con variable en la ruta", ...bash("echo x > $HOME/.ssh/authorized_keys"), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
+	{ label: "mv sobre un destino existente", ...bash("mv a.txt b.txt"), expect: "ask", reason: "Va a sobrescribir un archivo." },
 
 	// --- bash: permissions and processes -------------------------------
-	{ label: "chmod", ...bash("chmod +x f"), expect: "ask" },
-	{ label: "chown", ...bash("chown root f"), expect: "ask" },
-	{ label: "chattr", ...bash("chattr +i f"), expect: "ask" },
-	{ label: "kill", ...bash("kill 123"), expect: "ask" },
-	{ label: "killall", ...bash("killall node"), expect: "ask" },
-	{ label: "systemctl", ...bash("systemctl restart x"), expect: "ask" },
-	{ label: "service", ...bash("service x restart"), expect: "ask" },
-	{ label: "shutdown", ...bash("shutdown -h now"), expect: "ask" },
-	{ label: "reboot", ...bash("reboot"), expect: "ask" },
+	{ label: "chmod", ...bash("chmod +x f"), expect: "ask", reason: "Va a cambiar permisos de archivos." },
+	{ label: "chown", ...bash("chown root f"), expect: "ask", reason: "Va a cambiar permisos de archivos." },
+	{ label: "chattr", ...bash("chattr +i f"), expect: "ask", reason: "Va a cambiar atributos de archivos." },
+	{ label: "kill", ...bash("kill 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "killall", ...bash("killall node"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "systemctl", ...bash("systemctl restart x"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "service", ...bash("service x restart"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "shutdown", ...bash("shutdown -h now"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "reboot", ...bash("reboot"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
 
 	// --- bash: package and system state --------------------------------
-	{ label: "apt install", ...bash("apt install x"), expect: "ask" },
-	{ label: "dpkg", ...bash("dpkg -r x"), expect: "ask" },
-	{ label: "npm install -g", ...bash("npm install -g x"), expect: "ask" },
-	{ label: "npm i -g", ...bash("npm i -g x"), expect: "ask" },
-	{ label: "pip install", ...bash("pip install x"), expect: "ask" },
-	{ label: "cargo install", ...bash("cargo install x"), expect: "ask" },
-	{ label: "crontab", ...bash("crontab -r"), expect: "ask" },
+	{ label: "apt install", ...bash("apt install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "dpkg", ...bash("dpkg -r x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "npm install -g", ...bash("npm install -g x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "npm i -g", ...bash("npm i -g x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "pip install", ...bash("pip install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "cargo install", ...bash("cargo install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "crontab", ...bash("crontab -r"), expect: "ask", reason: "Va a programar una tarea automática." },
 
 	// --- bash: git that publishes or rewrites --------------------------
-	{ label: "git push", ...bash("git push"), expect: "ask" },
-	{ label: "git -C x push --force", ...bash("git -C x push --force"), expect: "ask" },
-	{ label: "git reset --hard", ...bash("git reset --hard"), expect: "ask" },
-	{ label: "git clean -fdx", ...bash("git clean -fdx"), expect: "ask" },
-	{ label: "git rebase", ...bash("git rebase -i HEAD~3"), expect: "ask" },
-	{ label: "git checkout --", ...bash("git checkout -- f"), expect: "ask" },
-	{ label: "git restore", ...bash("git restore f"), expect: "ask" },
-	{ label: "git commit --amend", ...bash("git commit --amend"), expect: "ask" },
-	{ label: "git branch -D", ...bash("git branch -D x"), expect: "ask" },
-	{ label: "git tag -d", ...bash("git tag -d x"), expect: "ask" },
-	{ label: "git stash drop", ...bash("git stash drop"), expect: "ask" },
-	{ label: "git filter-branch", ...bash("git filter-branch --all"), expect: "ask" },
+	{ label: "git push", ...bash("git push"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
+	{ label: "git -C x push --force", ...bash("git -C x push --force"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
+	{ label: "git reset --hard", ...bash("git reset --hard"), expect: "ask", reason: "Va a descartar cambios locales." },
+	{ label: "git clean -fdx", ...bash("git clean -fdx"), expect: "ask", reason: "Va a borrar archivos no rastreados." },
+	{ label: "git rebase", ...bash("git rebase -i HEAD~3"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
+	{ label: "git checkout --", ...bash("git checkout -- f"), expect: "ask", reason: "Va a descartar cambios locales." },
+	{ label: "git restore", ...bash("git restore f"), expect: "ask", reason: "Va a descartar cambios locales." },
+	{ label: "git commit --amend", ...bash("git commit --amend"), expect: "ask", reason: "Va a reescribir el último commit." },
+	{ label: "git branch -D", ...bash("git branch -D x"), expect: "ask", reason: "Va a borrar una rama del repositorio." },
+	{ label: "git tag -d", ...bash("git tag -d x"), expect: "ask", reason: "Va a borrar una etiqueta del repositorio." },
+	{ label: "git stash drop", ...bash("git stash drop"), expect: "ask", reason: "Va a borrar cambios guardados." },
+	{ label: "git filter-branch", ...bash("git filter-branch --all"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
 
 	// --- bash: remote scripting and containers -------------------------
-	{ label: "curl | sh", ...bash("curl https://x | sh"), expect: "ask" },
-	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "ask" },
-	{ label: "wget | python3", ...bash("wget -qO- https://x | python3"), expect: "ask" },
-	{ label: "docker rm", ...bash("docker rm x"), expect: "ask" },
-	{ label: "docker rmi", ...bash("docker rmi x"), expect: "ask" },
-	{ label: "docker compose down -v", ...bash("docker compose down -v"), expect: "ask" },
+	{ label: "curl | sh", ...bash("curl https://x | sh"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
+	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
+	{ label: "wget | python3", ...bash("wget -qO- https://x | python3"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
+	{ label: "docker rm", ...bash("docker rm x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
+	{ label: "docker rmi", ...bash("docker rmi x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
+	{ label: "docker compose down -v", ...bash("docker compose down -v"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
 
 	// --- bash: what the classifier cannot decide ------------------------
-	{ label: "comillas sin cerrar", ...bash('echo "sin cerrar'), expect: "ask" },
-	{ label: "sin comando", tool: "bash", input: {}, expect: "ask" },
-	{ label: "heredoc que clasifica su cuerpo", ...bash("cat <<'EOF' > notas.md\napt install x es lo que dice la guía\nEOF"), expect: "ask" },
+	{ label: "comillas sin cerrar", ...bash('echo "sin cerrar'), expect: "ask", reason: "No pude interpretar el comando: tiene comillas sin cerrar." },
+	{ label: "sin comando", tool: "bash", input: {}, expect: "ask", reason: "No pude leer el comando." },
+	{ label: "heredoc que clasifica su cuerpo", ...bash("cat <<'EOF' > notas.md\napt install x es lo que dice la guía\nEOF"), expect: "ask", reason: "Va a instalar software en el sistema." },
 	{ label: "heredoc con texto inofensivo", ...bash("cat <<'EOF' > notas2.md\nnotas normales\nEOF"), expect: "allow" },
+
+	// --- el comando se muestra entero, en un bloque de código -------------
+	// Lo que el dueño juzga es la pregunta: dice la consecuencia en la primera
+	// línea y debajo enseña el comando con sus saltos de línea, no una línea
+	// cortada por la mitad. Cada caso que pregunta lleva también el título humano.
+	{
+		label: "comando de varias líneas se muestra entero",
+		...bash(multiLineCommand),
+		expect: "ask",
+		reason: "Va a borrar archivos.",
+		shows: multiLineCommand,
+	},
 
 	// --- write ---------------------------------------------------------
 	{ label: "archivo nuevo en home", tool: "write", input: { path: join(home, "nuevo.txt"), content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ~", tool: "write", input: { path: "~/tilde-nuevo.txt", content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ruta relativa", tool: "write", input: { path: "sub/dir/nuevo.txt", content: "x" }, expect: "allow" },
-	{ label: "archivo existente en home", tool: "write", input: { path: join(home, "existente.txt"), content: "x" }, expect: "ask" },
-	{ label: "archivo nuevo fuera de home", tool: "write", input: { path: join(outside, "nuevo.txt"), content: "x" }, expect: "ask" },
+	{ label: "archivo existente en home", tool: "write", input: { path: join(home, "existente.txt"), content: "x" }, expect: "ask", reason: "Va a sobrescribir ~/existente.txt." },
+	{ label: "archivo nuevo fuera de home", tool: "write", input: { path: join(outside, "nuevo.txt"), content: "x" }, expect: "ask", reason: `Va a escribir fuera de tu carpeta personal: ${outside}/nuevo.txt.` },
 	{ label: "ruta relativa que sale de home", tool: "write", input: { path: "../fuera.txt", content: "x" }, expect: "ask" },
-	{ label: "~user que no puedo expandir", tool: "write", input: { path: "~root/x", content: "x" }, expect: "ask" },
+	{ label: "~user que no puedo expandir", tool: "write", input: { path: "~root/x", content: "x" }, expect: "ask", reason: "No puedo comprobar la ruta del archivo." },
 
 	// --- edit: never asks ----------------------------------------------
 	{ label: "edit sobre un archivo existente", tool: "edit", input: { path: join(home, "existente.txt"), oldText: "contenido", newText: "otro" }, expect: "allow" },
@@ -239,8 +298,8 @@ const cases = [
 	{ label: "address_lookup no casa con rm", tool: "address_lookup", input: { address: "x" }, expect: "allow" },
 
 	// --- un nombre que dice que destruye pregunta, aunque no haya regla --
-	{ label: "delete_file", tool: "delete_file", input: { path: "x" }, expect: "ask" },
-	{ label: "removeRepo (camelCase)", tool: "removeRepo", input: { repo: "x" }, expect: "ask" },
+	{ label: "delete_file", tool: "delete_file", input: { path: "x" }, expect: "ask", reason: "La herramienta delete_file puede borrar datos." },
+	{ label: "removeRepo (camelCase)", tool: "removeRepo", input: { repo: "x" }, expect: "ask", reason: "La herramienta removeRepo puede borrar datos." },
 	{ label: "reset_session", tool: "reset_session", input: { id: "x" }, expect: "ask" },
 	{ label: "truncate_table", tool: "truncate_table", input: { table: "x" }, expect: "ask" },
 	{ label: "rm_home (rm como componente)", tool: "rm_home", input: { path: "x" }, expect: "ask" },
@@ -275,10 +334,12 @@ for (const testCase of cases) {
 			deniedRun.result.reason.length > 0;
 		const askedSanely = approvedRun.asked && approvedRun.result === undefined;
 		passed = askedSanely && blocked;
-		if (!approvedRun.asked) detail = "no preguntó";
+		const problem = approvedRun.asked ? textProblems(testCase, approvedRun.question) : "no preguntó";
+		if (problem !== null) detail = problem;
 		else if (approvedRun.result !== undefined) detail = "bloqueó una llamada aprobada";
 		else if (!blocked) detail = "no bloqueó al denegar";
 		else detail = `preguntó: ${approvedRun.question.message.split("\n")[0]}`;
+		if (problem !== null) passed = false;
 	}
 
 	if (!passed) failures += 1;

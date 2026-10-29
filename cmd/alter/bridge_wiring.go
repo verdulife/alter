@@ -43,10 +43,12 @@ const (
 	bridgeErrorReply = "No pude terminar la respuesta. Inténtalo de nuevo en un momento."
 
 	// bridgeDialogTitleLimit and bridgeDialogMessageLimit bound how much of a Pi
-	// dialog reaches the chat. An approval must show what will run, but one long
-	// command cannot be allowed to fill the conversation.
+	// dialog reaches the chat. An approval must show the command it is about, and a
+	// multi-line command is only judgeable with its line breaks, so the message
+	// budget leaves room for a typical script; the clip below keeps both ends for
+	// the extreme case instead of letting one command fill the conversation.
 	bridgeDialogTitleLimit   = 120
-	bridgeDialogMessageLimit = 280
+	bridgeDialogMessageLimit = 800
 
 	// bridgeDialogEllipsis marks the elided middle of a clipped dialog text.
 	bridgeDialogEllipsis = "…"
@@ -440,7 +442,9 @@ func (r *bridgeRuntime) onDialog(ctx context.Context, req bridge.DialogRequest) 
 func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
-		title = "Aprobación"
+		// The same short human question the Pi extension asks: a dialog with no title
+		// of its own must not reach the owner as the bare word "Aprobación".
+		title = "¿Lo permito?"
 	}
 
 	var out strings.Builder
@@ -455,9 +459,9 @@ func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
 // clipDialogText caps text at limit runes while keeping BOTH its head and its
 // tail: the dangerous part of a long command usually sits at the end
 // (`... && rm -rf ~/x`), so a head-only cut would hide exactly what the approval
-// exists to show. Two thirds go to the head and one third to the tail, the same
-// split the Pi extension applies to the argument preview; because that preview is
-// shorter than this cap, this clipping never re-cuts the tail the extension kept.
+// exists to show. Two thirds go to the head and one third to the tail; the Pi
+// extension composes its message inside this cap with the same split, so a
+// message it already fitted is never re-cut here.
 // The elided middle is marked with an ellipsis, so the owner knows it is partial.
 func clipDialogText(text string, limit int) string {
 	runes := []rune(text)

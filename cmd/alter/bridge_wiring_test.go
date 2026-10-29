@@ -1290,23 +1290,29 @@ func TestDialogQuestionKeepsTheTailOfALongCommand(t *testing.T) {
 	}
 
 	// The shape of the clip: head, marker, tail. A short text is never cut.
-	if got := clipDialogText("corto", 280); got != "corto" {
+	if got := clipDialogText("corto", bridgeDialogMessageLimit); got != "corto" {
 		t.Errorf("clipDialogText(%q) = %q, want it untouched", "corto", got)
 	}
-	head := strings.Repeat("H", 300)
-	body := head + strings.Repeat("M", 300) + "TAIL!"
+	// Both halves are as long as the cap, so the body is twice what fits and the
+	// clip has to elide a middle: the head is the cap itself, so the two-thirds
+	// share below is still inside it.
+	head := strings.Repeat("H", bridgeDialogMessageLimit)
+	body := head + strings.Repeat("M", bridgeDialogMessageLimit) + "TAIL!"
 	clipped := clipDialogText(body, bridgeDialogMessageLimit)
 	if got, want := len([]rune(clipped)), bridgeDialogMessageLimit; got != want {
 		t.Errorf("clipped length = %d runes, want exactly %d", got, want)
 	}
 	wantHead := bridgeDialogMessageLimit * 2 / 3
+	wantTail := bridgeDialogMessageLimit - wantHead - len([]rune(bridgeDialogEllipsis))
 	if !strings.HasPrefix(clipped, head[:wantHead]) {
 		t.Errorf("clipped text %q does not keep the first %d runes of the head", clipped, wantHead)
 	}
 	if !strings.HasSuffix(clipped, "TAIL!") {
 		t.Errorf("clipped text %q does not keep the tail", clipped)
 	}
-	if !strings.Contains(clipped, bridgeDialogEllipsis) || strings.Contains(clipped, strings.Repeat("M", 200)) {
+	// The middle is gone: the tail keeps exactly its share of filler, so one more
+	// "M" than that could only come from the part the clip elided.
+	if !strings.Contains(clipped, bridgeDialogEllipsis) || strings.Contains(clipped, strings.Repeat("M", wantTail+1)) {
 		t.Errorf("clipped text %q does not elide the middle", clipped)
 	}
 
@@ -1315,6 +1321,52 @@ func TestDialogQuestionKeepsTheTailOfALongCommand(t *testing.T) {
 	preview := clipDialogText(body, 240)
 	if got := clipDialogText(preview, bridgeDialogMessageLimit); got != preview {
 		t.Errorf("bridge re-cut the extension preview: %q, want %q", got, preview)
+	}
+}
+
+// TestDialogQuestionKeepsAMultiLineCommandWhole pins what the owner reads on the
+// phone: the command arrives inside a code fence, with its line breaks intact,
+// and the message cap is wide enough that a typical multi-line script is shown
+// whole instead of cut in the middle of a line.
+func TestDialogQuestionKeepsAMultiLineCommandWhole(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	command := strings.Join([]string{
+		"cd ~/alter",
+		"export TMPDIR=/tmp",
+		"rm -rf ~/dist",
+		"mkdir -p ~/dist",
+		"gofmt -l cmd internal",
+		"go vet ./...",
+		"go test ./... -race -count=1",
+		"go build -o ~/dist/alter ./cmd/alter",
+		"cp ~/dist/alter ~/bin/alter",
+		"chmod +x ~/bin/alter",
+		"go test ./internal/tools/... -run TestTools -count=1",
+		"go test ./internal/bridge/... -run TestSession -count=1",
+		"echo listo",
+	}, "\n")
+	message := "Va a borrar archivos.\n\n```\n" + command + "\n```"
+	question := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Title: "¿Lo permito?", Message: message})
+
+	if want := "¿Lo permito?\n\n"; !strings.HasPrefix(question, want) {
+		t.Fatalf("question %q does not open with the short human title %q", question, want)
+	}
+	if !strings.Contains(question, "Va a borrar archivos.\n\n```\n"+escapeAskText(command)) {
+		t.Errorf("question %q does not carry the reason and the whole command between code fences", question)
+	}
+	if !strings.HasSuffix(question, "\n```") {
+		t.Errorf("question %q does not close the code fence", question)
+	}
+	if strings.Contains(question, bridgeDialogEllipsis) {
+		t.Errorf("question %q clipped a command that fits the message", question)
+	}
+
+	// A dialog that arrives without a title of its own gets the same human
+	// question, never the bare label the owner rejected.
+	fallback := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Message: "Va a borrar archivos."})
+	if !strings.HasPrefix(fallback, "¿Lo permito?") {
+		t.Errorf("question %q does not fall back to the human title", fallback)
 	}
 }
 

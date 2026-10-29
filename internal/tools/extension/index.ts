@@ -116,15 +116,29 @@ const APPROVAL_FREE = new Set([
 	"ask_options",
 ]);
 
-/** Longest argument preview the approval prompt carries; well under the bridge's 280-rune cap. */
-const APPROVAL_ARG_LIMIT = 240;
+/**
+ * Title of every approval prompt: one short question a person would ask, the same
+ * for every rule. Naming the tool (`¿Permitir bash?`) told the owner nothing he
+ * could weigh; the consequence is now the first line of the message.
+ */
+const APPROVAL_TITLE = "¿Lo permito?";
+
+/** Fence that opens and closes the command block of the approval message. */
+const APPROVAL_FENCE = "```";
 
 /**
- * Budget for reason plus preview together. The bridge clips a dialog message at
- * 280 runes keeping both ends, so staying below that keeps its clip from cutting
- * the tail of the command this prompt exists to show.
+ * Rune budget of the whole approval message: reason, fence and command. The
+ * bridge clips a dialog message at its own cap, keeping both ends, so a message
+ * composed inside this budget reaches the owner exactly as written and a typical
+ * multi-line command is never cut.
  */
-const APPROVAL_MESSAGE_LIMIT = 260;
+const APPROVAL_MESSAGE_LIMIT = 800;
+
+/** Runes between the reason and the block (one blank line). */
+const APPROVAL_SEPARATOR_RUNES = 2;
+
+/** Longest argument preview used outside the chat message, for one-line renderings. */
+const APPROVAL_ARG_LIMIT = 240;
 
 /** Preview length on the audit line: the journal wants a hint, not the whole command. */
 const LOG_ARG_LIMIT = 160;
@@ -146,9 +160,10 @@ function previewWithTail(rendered: string, limit: number): string {
 }
 
 /**
- * Renders the arguments of a tool call as one short line for the approval prompt.
- * The bridge escapes it and applies its own wider cap, so this only keeps the
- * request small while keeping both ends of a long command visible.
+ * Renders the arguments of a tool call as one short line, for the audit line and
+ * for an input that carries no command (`write`, a package tool). Whitespace is
+ * collapsed because a journal line is one line; the approval message keeps the
+ * command untouched instead, so its line breaks survive.
  */
 function previewArguments(input: unknown, limit: number = APPROVAL_ARG_LIMIT): string {
 	let rendered: string;
@@ -161,26 +176,86 @@ function previewArguments(input: unknown, limit: number = APPROVAL_ARG_LIMIT): s
 	return previewWithTail(rendered, limit);
 }
 
+/** Length of a text in runes, so a cap written in runes is enforced in runes. */
+function runeLength(text: string): number {
+	return Array.from(text).length;
+}
+
 /**
- * Text of the approval prompt: the reason first, then the arguments, sized so the
- * bridge never has to clip the result. The reason is what tells the owner which
- * rule fired (`git push publica en el remoto`), so it goes first and never gets
- * cut.
+ * Command of a `bash` tool call exactly as the owner's agent wrote it, or null
+ * when the call carries none. The line breaks are kept on purpose: a multi-line
+ * script can only be judged line by line.
+ */
+function commandText(input: unknown): string | null {
+	if (typeof input !== "object" || input === null) return null;
+	const command = (input as Json).command;
+	if (typeof command !== "string") return null;
+	const trimmed = command.trim();
+	return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Head of a clipped command, cut back to the last complete line it contains. */
+function wholeLinesFromStart(text: string): string {
+	const cut = text.lastIndexOf("\n");
+	return cut > 0 ? text.slice(0, cut) : text;
+}
+
+/** Tail of a clipped command, starting at the first complete line it contains. */
+function wholeLinesFromEnd(text: string): string {
+	const cut = text.indexOf("\n");
+	return cut >= 0 && cut + 1 < text.length ? text.slice(cut + 1) : text;
+}
+
+/**
+ * Caps a command at limit runes keeping its head AND its tail: the dangerous line
+ * of a long script tends to sit at the end (`... && rm -rf ~/x`), so a head-only
+ * cut would hide exactly what the approval exists to show. Only a command that
+ * does not fit the message is cut at all, and the elided middle becomes one `…`
+ * line, so the part that remains still reads as a command instead of stopping in
+ * the middle of a word.
+ */
+function clipCommand(command: string, limit: number): string {
+	const runes = Array.from(command);
+	if (runes.length <= limit) return command;
+	const head = Math.floor((limit * 2) / 3);
+	const tail = limit - head - 3; // the "…" marker and the two line breaks around it
+	const headText = wholeLinesFromStart(runes.slice(0, head).join(""));
+	const tailText = wholeLinesFromEnd(runes.slice(runes.length - tail).join(""));
+	return `${headText}\n…\n${tailText}`;
+}
+
+/**
+ * Text of the approval prompt: the consequence as one short sentence, then the
+ * command in a fenced code block.
+ *
+ * The fence is what makes a multi-line command legible on a phone: the renderer
+ * keeps its line breaks and its shell characters (backticks, `*`, `_`) literal
+ * instead of reading them as markup. The reason goes first because it says why
+ * the button exists, the command follows because it says what will run, and the
+ * block is sized so the bridge never has to clip it.
  */
 function approvalMessage(reason: string, input: unknown): string {
-	const budget = Math.max(80, APPROVAL_MESSAGE_LIMIT - reason.length - 1);
-	return `${reason}\n${previewArguments(input, budget)}`;
+	const command = commandText(input);
+	const overhead = APPROVAL_SEPARATOR_RUNES + 2 * APPROVAL_FENCE.length + 2;
+	const budget = Math.max(80, APPROVAL_MESSAGE_LIMIT - runeLength(reason) - overhead);
+	const body = command === null ? previewArguments(input, budget) : clipCommand(command, budget);
+	return `${reason}\n\n${APPROVAL_FENCE}\n${body}\n${APPROVAL_FENCE}`;
 }
 
-/** One verdict per tool call: allowed silently, or asked with the rule that fired. */
-type Verdict = { ask: boolean; reason: string };
+/**
+ * One verdict per tool call: allowed silently, or asked with two texts. `reason`
+ * is what the owner reads — a sentence about the consequence, never a binary
+ * name; `detail` is what the journal records — the rule that fired, so `git push`
+ * and `git reset --hard` stay distinguishable in the audit line.
+ */
+type Verdict = { ask: boolean; reason: string; detail: string };
 
 function allow(): Verdict {
-	return { ask: false, reason: "" };
+	return { ask: false, reason: "", detail: "" };
 }
 
-function ask(reason: string): Verdict {
-	return { ask: true, reason };
+function ask(reason: string, detail: string): Verdict {
+	return { ask: true, reason, detail };
 }
 
 /**
@@ -573,42 +648,61 @@ function stripWrapperArgs(program: string, args: string[]): string[] {
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
+ * The sentences the owner reads. Each one names the consequence in the second
+ * person and, unless the program IS the point (`sudo`), never the program: "rm
+ * borra archivos" says nothing a person can weigh on a phone, while "Va a borrar
+ * archivos." says what he is deciding. The program and its flags stay in the
+ * journal, through each rule's `detail`.
+ */
+const REASON_DELETE_FILES = "Va a borrar archivos.";
+const REASON_PERMISSIONS = "Va a cambiar permisos de archivos.";
+const REASON_SYSTEM_STATE = "Va a cambiar el estado del sistema.";
+const REASON_ADMIN_RIGHTS = "Va a pedir permisos de administrador.";
+const REASON_INSTALL = "Va a instalar software en el sistema.";
+const REASON_SCHEDULE = "Va a programar una tarea automática.";
+const REASON_HISTORY = "Va a publicar o reescribir el historial del repositorio.";
+const REASON_DOWNLOADED_CODE = "Va a ejecutar código descargado de internet.";
+const REASON_CONTAINERS = "Va a borrar contenedores o volúmenes.";
+
+/** One gate rule: what the owner reads, and what the journal records. */
+type Rule = { reason: string; detail: string };
+
+/**
  * Programs that ask without reading their arguments: deleting, truncating,
  * changing permissions or ownership, killing processes, touching services, or
- * changing package and scheduled-work state. The value is the reason the owner
- * sees, kept short and specific.
+ * changing package and scheduled-work state.
  */
-const ASK_PROGRAMS: Record<string, string> = {
-	rm: "rm borra archivos",
-	rmdir: "rmdir borra directorios",
-	unlink: "unlink borra un archivo",
-	shred: "shred destruye el contenido de un archivo",
-	truncate: "truncate vacía un archivo",
-	dd: "dd puede sobrescribir cualquier archivo o dispositivo",
-	mkfs: "mkfs formatea un sistema de archivos",
-	fdisk: "fdisk reparte un disco",
-	parted: "parted reparte un disco",
-	wipefs: "wipefs borra firmas de un sistema de archivos",
-	chmod: "chmod cambia permisos",
-	chown: "chown cambia el dueño de un archivo",
-	chgrp: "chgrp cambia el grupo de un archivo",
-	chattr: "chattr cambia atributos del sistema de archivos",
-	kill: "kill mata procesos",
-	pkill: "pkill mata procesos",
-	killall: "killall mata procesos",
-	systemctl: "systemctl cambia servicios del sistema",
-	service: "service cambia servicios del sistema",
-	shutdown: "shutdown apaga el sistema",
-	reboot: "reboot reinicia el sistema",
-	poweroff: "poweroff apaga el sistema",
-	halt: "halt detiene el sistema",
-	apt: "apt instala o quita paquetes del sistema",
-	"apt-get": "apt-get instala o quita paquetes del sistema",
-	aptitude: "aptitude instala o quita paquetes del sistema",
-	dpkg: "dpkg cambia paquetes del sistema",
-	brew: "brew instala o quita paquetes",
-	snap: "snap instala o quita paquetes",
-	crontab: "crontab programa trabajo automático",
+const ASK_PROGRAMS: Record<string, Rule> = {
+	rm: { reason: REASON_DELETE_FILES, detail: "rm borra archivos" },
+	rmdir: { reason: REASON_DELETE_FILES, detail: "rmdir borra directorios" },
+	unlink: { reason: REASON_DELETE_FILES, detail: "unlink borra un archivo" },
+	shred: { reason: REASON_DELETE_FILES, detail: "shred destruye el contenido de un archivo" },
+	truncate: { reason: REASON_DELETE_FILES, detail: "truncate vacía un archivo" },
+	dd: { reason: REASON_DELETE_FILES, detail: "dd puede sobrescribir cualquier archivo o dispositivo" },
+	mkfs: { reason: "Va a formatear un disco.", detail: "mkfs formatea un sistema de archivos" },
+	fdisk: { reason: "Va a repartir un disco.", detail: "fdisk reparte un disco" },
+	parted: { reason: "Va a repartir un disco.", detail: "parted reparte un disco" },
+	wipefs: { reason: "Va a borrar marcas de un disco.", detail: "wipefs borra firmas de un sistema de archivos" },
+	chmod: { reason: REASON_PERMISSIONS, detail: "chmod cambia permisos" },
+	chown: { reason: REASON_PERMISSIONS, detail: "chown cambia el dueño de un archivo" },
+	chgrp: { reason: REASON_PERMISSIONS, detail: "chgrp cambia el grupo de un archivo" },
+	chattr: { reason: "Va a cambiar atributos de archivos.", detail: "chattr cambia atributos del sistema de archivos" },
+	kill: { reason: REASON_SYSTEM_STATE, detail: "kill mata procesos" },
+	pkill: { reason: REASON_SYSTEM_STATE, detail: "pkill mata procesos" },
+	killall: { reason: REASON_SYSTEM_STATE, detail: "killall mata procesos" },
+	systemctl: { reason: REASON_SYSTEM_STATE, detail: "systemctl cambia servicios del sistema" },
+	service: { reason: REASON_SYSTEM_STATE, detail: "service cambia servicios del sistema" },
+	shutdown: { reason: REASON_SYSTEM_STATE, detail: "shutdown apaga el sistema" },
+	reboot: { reason: REASON_SYSTEM_STATE, detail: "reboot reinicia el sistema" },
+	poweroff: { reason: REASON_SYSTEM_STATE, detail: "poweroff apaga el sistema" },
+	halt: { reason: REASON_SYSTEM_STATE, detail: "halt detiene el sistema" },
+	apt: { reason: REASON_INSTALL, detail: "apt instala o quita paquetes del sistema" },
+	"apt-get": { reason: REASON_INSTALL, detail: "apt-get instala o quita paquetes del sistema" },
+	aptitude: { reason: REASON_INSTALL, detail: "aptitude instala o quita paquetes del sistema" },
+	dpkg: { reason: REASON_INSTALL, detail: "dpkg cambia paquetes del sistema" },
+	brew: { reason: REASON_INSTALL, detail: "brew instala o quita paquetes" },
+	snap: { reason: REASON_INSTALL, detail: "snap instala o quita paquetes" },
+	crontab: { reason: REASON_SCHEDULE, detail: "crontab programa trabajo automático" },
 };
 
 /** Package managers whose `-g`/`--global` install reaches outside the project. */
@@ -672,41 +766,45 @@ function classifyGit(args: string[]): Verdict {
 
 	switch (subcommand) {
 		case "push":
-			return ask("git push publica en el remoto");
+			return ask(REASON_HISTORY, "git push publica en el remoto");
 		case "reset":
 			if (subArgs.some((argument) => argument === "--hard" || argument.startsWith("--hard="))) {
-				return ask("git reset --hard descarta cambios locales");
+				return ask("Va a descartar cambios locales.", "git reset --hard descarta cambios locales");
 			}
 			return allow();
 		case "clean":
 			if (subArgs.some((argument) => argument === "--force" || (argument.startsWith("-") && !argument.startsWith("--") && argument.includes("f")))) {
-				return ask("git clean -f borra archivos no rastreados");
+				return ask("Va a borrar archivos no rastreados.", "git clean -f borra archivos no rastreados");
 			}
 			return allow();
 		case "rebase":
-			return ask("git rebase reescribe historia");
+			return ask(REASON_HISTORY, "git rebase reescribe historia");
 		case "filter-branch":
-			return ask("git filter-branch reescribe historia");
+			return ask(REASON_HISTORY, "git filter-branch reescribe historia");
 		case "checkout":
-			if (subArgs.includes("--")) return ask("git checkout -- descarta cambios locales");
+			if (subArgs.includes("--")) return ask("Va a descartar cambios locales.", "git checkout -- descarta cambios locales");
 			return allow();
 		case "restore":
-			return ask("git restore descarta cambios locales");
+			return ask("Va a descartar cambios locales.", "git restore descarta cambios locales");
 		case "commit":
-			if (subArgs.some((argument) => argument === "--amend")) return ask("git commit --amend reescribe el último commit");
+			if (subArgs.some((argument) => argument === "--amend")) {
+				return ask("Va a reescribir el último commit.", "git commit --amend reescribe el último commit");
+			}
 			return allow();
 		case "branch":
 			if (subArgs.some((argument) => argument === "--delete" || (argument.startsWith("-") && !argument.startsWith("--") && /[dD]/.test(argument)))) {
-				return ask("git branch -d borra una rama");
+				return ask("Va a borrar una rama del repositorio.", "git branch -d borra una rama");
 			}
 			return allow();
 		case "tag":
 			if (subArgs.some((argument) => argument === "--delete" || (argument.startsWith("-") && !argument.startsWith("--") && /[dD]/.test(argument)))) {
-				return ask("git tag -d borra una etiqueta");
+				return ask("Va a borrar una etiqueta del repositorio.", "git tag -d borra una etiqueta");
 			}
 			return allow();
 		case "stash":
-			if (subArgs[0] === "drop" || subArgs[0] === "clear") return ask("git stash drop borra un stash");
+			if (subArgs[0] === "drop" || subArgs[0] === "clear") {
+				return ask("Va a borrar cambios guardados.", "git stash drop borra un stash");
+			}
 			return allow();
 		default:
 			return allow();
@@ -723,13 +821,15 @@ function classifyContainer(program: string, args: string[]): Verdict {
 	const subcommand = rest[0] ?? "";
 	const subArgs = rest.slice(1);
 
-	if (subcommand === "rm" || subcommand === "rmi") return ask(`${program} ${subcommand} borra contenedores o imágenes`);
-	if (subcommand === "prune") return ask(`${program} prune borra datos de ${program}`);
-	if (subcommand === "system" && subArgs[0] === "prune") return ask(`${program} system prune borra datos`);
-	if (subcommand === "volume" && subArgs[0] === "rm") return ask(`${program} volume rm borra un volumen`);
+	if (subcommand === "rm" || subcommand === "rmi") {
+		return ask(REASON_CONTAINERS, `${program} ${subcommand} borra contenedores o imágenes`);
+	}
+	if (subcommand === "prune") return ask(REASON_CONTAINERS, `${program} prune borra datos de ${program}`);
+	if (subcommand === "system" && subArgs[0] === "prune") return ask(REASON_CONTAINERS, `${program} system prune borra datos`);
+	if (subcommand === "volume" && subArgs[0] === "rm") return ask(REASON_CONTAINERS, `${program} volume rm borra un volumen`);
 	if (subcommand === "compose" && subArgs[0] === "down") {
 		const removesVolumes = subArgs.some((argument) => argument === "-v" || argument === "--volumes" || argument.startsWith("--volumes="));
-		if (removesVolumes) return ask(`${program} compose down -v borra volúmenes`);
+		if (removesVolumes) return ask(REASON_CONTAINERS, `${program} compose down -v borra volúmenes`);
 	}
 	return allow();
 }
@@ -745,18 +845,29 @@ function classifyContainer(program: string, args: string[]): Verdict {
 function classifyRedirection(redirection: { op: string; target: string }, cwd: string): Verdict {
 	if (redirection.op !== ">" && redirection.op !== ">>") return allow();
 	if (redirection.target.includes("$") || redirection.target.includes("`")) {
-		return ask(`${redirection.op} escribe en una ruta con variables`);
+		return ask("Va a escribir en una ruta que no puedo comprobar.", `${redirection.op} escribe en una ruta con variables`);
 	}
 	const absolutePath = resolveUserPath(redirection.target, cwd);
-	if (absolutePath === null) return ask(`${redirection.op} escribe en una ruta que no puedo resolver`);
-	if (isSensitivePath(absolutePath)) return ask(`${redirection.op} escribe en ${displayPath(absolutePath)}`);
-	if (redirection.op === ">" && existsSync(absolutePath)) return ask(`> sobrescribe ${displayPath(absolutePath)}`);
+	if (absolutePath === null) {
+		return ask("Va a escribir en una ruta que no puedo comprobar.", `${redirection.op} escribe en una ruta que no puedo resolver`);
+	}
+	const shown = displayPath(absolutePath);
+	if (isSensitivePath(absolutePath)) {
+		// `>>` adds instead of destroying, but on a start-up file or a key list
+		// adding a line is the escalation, so the reason says which of the two it is.
+		return redirection.op === ">"
+			? ask(`Va a sobrescribir ${shown}.`, `${redirection.op} escribe en ${shown}, una ruta sensible`)
+			: ask(`Va a añadir contenido a ${shown}.`, `${redirection.op} escribe en ${shown}, una ruta sensible`);
+	}
+	if (redirection.op === ">" && existsSync(absolutePath)) {
+		return ask(`Va a sobrescribir ${shown}.`, `> sobrescribe ${shown}`);
+	}
 	return allow();
 }
 
 /** Verdict for the words of one simple command, ignoring redirections. */
 function classifyWords(input: string[], cwd: string, depth: number): Verdict {
-	if (depth > 4) return ask("anidamiento de comandos demasiado profundo");
+	if (depth > 4) return ask("No puedo revisar un comando tan anidado.", "anidamiento de comandos demasiado profundo");
 
 	const words = [...input];
 	while (words.length > 0 && ENV_ASSIGNMENT.test(words[0])) words.shift();
@@ -767,8 +878,9 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	const program = basename(words[0]);
 	const args = words.slice(1);
 
-	// The escape hatch itself: whatever it runs, the escalation is the risk.
-	if (program === "sudo" || program === "doas") return ask(`${program} escala privilegios`);
+	// The escape hatch itself: whatever it runs, the escalation is the risk, and
+	// this is the one rule where the program is the consequence.
+	if (program === "sudo" || program === "doas") return ask(REASON_ADMIN_RIGHTS, `${program} escala privilegios`);
 
 	if (TRANSPARENT_WRAPPERS.has(program)) {
 		const inner = stripWrapperArgs(program, args);
@@ -784,25 +896,25 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	}
 
 	const alwaysAsk = ASK_PROGRAMS[program];
-	if (alwaysAsk !== undefined) return ask(alwaysAsk);
+	if (alwaysAsk !== undefined) return ask(alwaysAsk.reason, alwaysAsk.detail);
 
 	if (program === "git") return classifyGit(args);
 	if (program === "docker" || program === "podman" || program === "docker-compose") {
 		return classifyContainer(program === "docker-compose" ? "docker" : program, program === "docker-compose" ? ["compose", ...args] : args);
 	}
 	if (GLOBAL_INSTALL_PROGRAMS.has(program) && args.some(isGlobalInstallFlag)) {
-		return ask(`${program} instala un paquete global`);
+		return ask(REASON_INSTALL, `${program} instala un paquete global`);
 	}
 	if (INSTALL_PROGRAMS.has(program) && args.includes("install")) {
-		return ask(`${program} install instala paquetes`);
+		return ask(REASON_INSTALL, `${program} install instala paquetes`);
 	}
-	if (program === "cargo" && args.includes("install")) return ask("cargo install instala un binario");
+	if (program === "cargo" && args.includes("install")) return ask(REASON_INSTALL, "cargo install instala un binario");
 
 	if (program === "find") {
 		const deletesOrRuns = args.some((argument) =>
 			["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"].includes(argument),
 		);
-		if (deletesOrRuns) return ask("find borra o ejecuta comandos");
+		if (deletesOrRuns) return ask(REASON_DELETE_FILES, "find borra o ejecuta comandos");
 		return allow();
 	}
 
@@ -817,12 +929,14 @@ function classifyMove(args: string[], cwd: string): Verdict {
 	if (operands.length < 2) return allow();
 
 	const destination = resolveUserPath(operands[operands.length - 1], cwd);
-	if (destination === null) return ask("mv mueve a una ruta que no puedo resolver");
+	if (destination === null) {
+		return ask("Va a mover archivos a una ruta que no puedo comprobar.", "mv mueve a una ruta que no puedo resolver");
+	}
 
 	// `mv a dir` moves into the directory; only a name that already exists inside
 	// it is an overwrite. `mv a b` with `b` a file replaces `b` outright.
 	const target = isDirectory(destination) ? join(destination, basename(operands[0])) : destination;
-	if (existsSync(target)) return ask(`mv sobrescribe ${displayPath(target)}`);
+	if (existsSync(target)) return ask("Va a sobrescribir un archivo.", `mv sobrescribe ${displayPath(target)}`);
 	return allow();
 }
 
@@ -840,7 +954,7 @@ function classifySimpleCommand(command: SimpleCommand, next: SimpleCommand | und
 	if ((program === "curl" || program === "wget") && next !== undefined && (next.afterOp === "|" || next.afterOp === "|&")) {
 		const reader = programOf(next.words);
 		if (SHELLS.has(reader) || INTERPRETERS.has(reader)) {
-			return ask(`${program} | ${reader} ejecuta código descargado`);
+			return ask(REASON_DOWNLOADED_CODE, `${program} | ${reader} ejecuta código descargado`);
 		}
 	}
 
@@ -852,14 +966,18 @@ function classifySimpleCommand(command: SimpleCommand, next: SimpleCommand | und
  * because `true && rm -rf x` destroys exactly as much as `rm -rf x` does.
  */
 function classifyCommandString(command: string, cwd: string, depth: number): Verdict {
-	if (depth > 4) return ask("anidamiento de comandos demasiado profundo");
+	if (depth > 4) return ask("No puedo revisar un comando tan anidado.", "anidamiento de comandos demasiado profundo");
 
 	const tokens = tokenize(command);
-	if (tokens === null) return ask("no pude interpretar el comando: comillas sin cerrar");
+	if (tokens === null) {
+		return ask("No pude interpretar el comando: tiene comillas sin cerrar.", "no pude interpretar el comando: comillas sin cerrar");
+	}
 
 	const commands = splitCommands(tokens);
 	// A line this long is not something the owner can review on a phone anyway.
-	if (commands.length > 200) return ask("el comando tiene demasiadas partes para revisarlo");
+	if (commands.length > 200) {
+		return ask("No puedo revisar un comando con tantas partes.", "el comando tiene demasiadas partes para revisarlo");
+	}
 
 	for (let index = 0; index < commands.length; index += 1) {
 		const verdict = classifySimpleCommand(commands[index], commands[index + 1], cwd, depth);
@@ -870,9 +988,9 @@ function classifyCommandString(command: string, cwd: string, depth: number): Ver
 
 /** Verdict for the `bash` tool. A missing command is not decidable, so it asks. */
 function classifyBash(input: unknown, cwd: string): Verdict {
-	if (typeof input !== "object" || input === null) return ask("no pude leer el comando");
+	if (typeof input !== "object" || input === null) return ask("No pude leer el comando.", "no pude leer el comando");
 	const command = (input as Json).command;
-	if (typeof command !== "string") return ask("no pude leer el comando");
+	if (typeof command !== "string") return ask("No pude leer el comando.", "no pude leer el comando");
 	return classifyCommandString(command, cwd, 0);
 }
 
@@ -883,12 +1001,15 @@ function classifyBash(input: unknown, cwd: string): Verdict {
  */
 function classifyWrite(input: unknown, cwd: string): Verdict {
 	const raw = readPathField(input);
-	if (raw === null) return ask("no pude leer la ruta del archivo");
+	if (raw === null) return ask("No pude leer la ruta del archivo.", "no pude leer la ruta del archivo");
 
 	const absolutePath = resolveUserPath(raw, cwd);
-	if (absolutePath === null) return ask("no puedo resolver la ruta del archivo");
-	if (isOutsideHome(absolutePath)) return ask(`escribe fuera de tu home: ${displayPath(absolutePath)}`);
-	if (existsSync(absolutePath)) return ask(`sobrescribe ${displayPath(absolutePath)}`);
+	if (absolutePath === null) return ask("No puedo comprobar la ruta del archivo.", "no puedo resolver la ruta del archivo");
+	const shown = displayPath(absolutePath);
+	if (isOutsideHome(absolutePath)) {
+		return ask(`Va a escribir fuera de tu carpeta personal: ${shown}.`, `escribe fuera de $HOME: ${shown}`);
+	}
+	if (existsSync(absolutePath)) return ask(`Va a sobrescribir ${shown}.`, `sobrescribe ${shown}`);
 	return allow();
 }
 
@@ -962,7 +1083,7 @@ function classifyCall(name: string, input: unknown, cwd: string): Verdict {
 	// phone: the packages he loaded are part of the agent he asked for. Only the
 	// names that say they destroy keep their button, and the match never fails open.
 	if (namesDestruction(name)) {
-		return ask(`el nombre de la herramienta ${name} indica que borra o destruye`);
+		return ask(`La herramienta ${name} puede borrar datos.`, `el nombre de la herramienta ${name} indica que borra o destruye`);
 	}
 	return allow();
 }
@@ -970,10 +1091,12 @@ function classifyCall(name: string, input: unknown, cwd: string): Verdict {
 /**
  * Writes one audit line per decision to stderr, which the bridge forwards to the
  * journal as `bridge: pi stderr: …`. A real turn can then be replayed: what ran
- * unasked, what asked, and why.
+ * unasked, what asked, and which rule fired. The line is technical on purpose
+ * (`detail`, never the sentence the owner reads): `git push` and `git reset
+ * --hard` share a chat sentence, and the journal must still tell them apart.
  */
 function logDecision(name: string, verdict: Verdict, input: unknown): void {
-	const decision = verdict.ask ? `ask (${verdict.reason})` : "allow";
+	const decision = verdict.ask ? `ask (${verdict.detail})` : "allow";
 	console.error(`alter-gate: ${decision} ${name} ${previewArguments(input, LOG_ARG_LIMIT)}`);
 }
 
@@ -1138,7 +1261,7 @@ export default function alterTools(pi: ExtensionAPI): void {
 
 		let approved: boolean;
 		try {
-			approved = await ctx.ui.confirm(`¿Permitir ${name}?`, approvalMessage(verdict.reason, event.input));
+			approved = await ctx.ui.confirm(APPROVAL_TITLE, approvalMessage(verdict.reason, event.input));
 		} catch (error) {
 			return {
 				block: true,
