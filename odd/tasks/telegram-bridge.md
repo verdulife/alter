@@ -227,6 +227,30 @@ Tareas nuevas:
 | ID | Tarea | Specs | Estado |
 |---|---|---|---|
 | T11 | Permisos y ámbito: allowlist completa, cwd `$HOME`, carga global, timeout configurable | S1,S6,L9 | inline | este commit |
-| T12 | Identidad: reescribir persona con disciplina Gentleman y verificar el prompt efectivo | L11 | pendiente |
+| T12 | Identidad: persona con disciplina Gentleman y prompt efectivo verificado | L11,L13,L14 | este commit |
 | T13 | Aprobaciones por botones: `tool_call` + `confirm` vía bridge, fail-closed | L10 | pendiente |
 | T14 | Desplegar: parar el servicio viejo, compilar, configurar y probar "hola" real | L12 | pendiente |
+
+**L13** (identidad, T12). Medido antes de diseñar, no supuesto:
+
+- El handler de una extensión cargada con `-e` corre **antes** que el de
+  `gentle-pi`, así que añadir texto a `appendSystemPrompt` nunca gana: es el
+  mismo sitio donde `appendSystemPromptOnce` escribe después.
+- Pi renderiza las `sections` propias **después** de `addendum`, skills y cwd,
+  con independencia del orden de handlers. Por eso la identidad de Alter se
+  inyecta como sección `alter_identity`: es una sección personalizada y queda
+  tras el bloque del Gentleman.
+- Verificación empírica con el `pi` instalado: la respuesta literal fue "Soy
+  Alter, tu secretario personal: el mismo agente con otra voz, disponible por
+  Telegram para leer, ejecutar y verificar lo que necesites."
+- La identidad es el último **bloque de instrucciones**, no los últimos bytes:
+  el catálogo de servidores MCP se añade después. Forzar el byte final exigiría
+  interceptar el payload, rechazado por frágil.
+
+**L14** (defecto propio, corregido). Al mover el cwd del hijo a `$HOME` (T11),
+las rutas relativas de `-e` y `--append-system-prompt` dejaron de resolver: Pi
+fallaba con "Extension path does not exist" y el prompt del persona se pasaba
+como cadena literal. Ningún test lo detectaba porque el fake no resolvía rutas.
+Se corrigen absolutizando ambos y pasando `ALTER_PERSONA_FILE` al hijo. La
+lección: un cambio de entorno de ejecución necesita una aserción sobre la forma
+de los argumentos, no solo sobre su presencia.
