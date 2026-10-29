@@ -53,6 +53,9 @@ touch(join(home, "existente.txt"));
 touch(join(home, "a.txt"));
 touch(join(home, "b.txt"));
 touch(join(outside, "f"));
+// An existing regular file outside home: the shape of `> /tmp/existente.txt`,
+// built inside the scratch directory instead of a shared /tmp path.
+touch(join(outside, "existente.txt"));
 
 const previousHome = process.env.HOME;
 process.env.HOME = home;
@@ -203,6 +206,34 @@ const cases = [
 	{ label: "echo >> archivo existente no sensible", ...bash(`echo x >> ${home}/existente.txt`), expect: "allow" },
 	{ label: "dos comandos permitidos", ...bash("ls -la && git status"), expect: "allow" },
 
+	// --- bash: redirigir a un dispositivo que descarta o repite la salida ---
+	// `2>/dev/null` es como todo script calla el stderr. El clasificador veía un
+	// `>` hacia `/dev` (ruta sensible) y preguntaba siempre: 6 de las 8 preguntas
+	// de la mañana eran esta, y el canal dejaba de servir mientras el dueño no
+	// pudiera contestar. Un dispositivo que descarta o repite no destruye nada.
+	{ label: "ls con stderr a /dev/null", ...bash("ls 2>/dev/null"), expect: "allow" },
+	{
+		label: "journalctl con stderr a /dev/null y tubería",
+		...bash("journalctl --user -u alter.service --since '19:30' --no-pager 2>/dev/null | tail -5"),
+		expect: "allow",
+	},
+	{ label: "echo a /dev/null", ...bash("echo x > /dev/null"), expect: "allow" },
+	{ label: ">> a /dev/null", ...bash("echo x >> /dev/null"), expect: "allow" },
+	{ label: "1> a /dev/null", ...bash("echo x 1>/dev/null"), expect: "allow" },
+	{ label: "2>&1 seguido de >/dev/null", ...bash("echo x 2>&1 >/dev/null"), expect: "allow" },
+	{ label: ">/dev/null seguido de 2>&1", ...bash("echo x >/dev/null 2>&1"), expect: "allow" },
+	{ label: "&> a /dev/null", ...bash("command &>/dev/null"), expect: "allow" },
+	{ label: "a /dev/stdout", ...bash("echo x > /dev/stdout"), expect: "allow" },
+	{ label: "a /dev/stderr", ...bash("echo x 2> /dev/stderr"), expect: "allow" },
+	{ label: "a /dev/tty", ...bash("echo x > /dev/tty"), expect: "allow" },
+	// La regresión que dejaba pasar el journal: tubería, 2>/dev/null y un
+	// programa de solo lectura en el mismo comando.
+	{
+		label: "regresión: tubería + 2>/dev/null + programa de solo lectura",
+		...bash("find ~/.pi -name '*.jsonl' -newermt '-3 hours' -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -8"),
+		expect: "allow",
+	},
+
 	// --- bash: deletion and truncation ---------------------------------
 	{ label: "rm -rf", ...bash("rm -rf build"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "unlink", ...bash("unlink existente.txt"), expect: "ask", reason: "Va a borrar archivos." },
@@ -221,6 +252,19 @@ const cases = [
 
 	// --- bash: overwriting through redirection -------------------------
 	{ label: "> sobre un archivo existente fuera de home", ...bash(`echo x > ${outside}/f`), expect: "ask", reason: `Va a sobrescribir ${outside}/f.` },
+	{
+		label: "> sobre un archivo existente tipo /tmp/existente.txt",
+		...bash(`echo x > ${outside}/existente.txt`),
+		expect: "ask",
+		reason: `Va a sobrescribir ${outside}/existente.txt.`,
+	},
+	{ label: "> sobre ~/.bashrc", ...bash("echo x > ~/.bashrc"), expect: "ask", reason: "Va a sobrescribir ~/.bashrc." },
+	{ label: "> sobre /etc/hosts", ...bash("echo x > /etc/hosts"), expect: "ask", reason: "Va a sobrescribir /etc/hosts." },
+	{ label: "> con variable entrecomillada en la ruta", ...bash('echo x > "$VAR"'), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
+	// La lista de dispositivos es cerrada: otro `/dev` sigue preguntando, y una
+	// variable que no es uno de ellos también.
+	{ label: "> sobre otro dispositivo de /dev", ...bash("echo x > /dev/sda"), expect: "ask", reason: "Va a sobrescribir /dev/sda." },
+	{ label: "> sobre $SINK entrecomillado", ...bash('echo x > "$SINK"'), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
 	{ label: "> sobre un archivo existente en home", ...bash(`echo x > ${home}/existente.txt`), expect: "ask", reason: "Va a sobrescribir ~/existente.txt." },
 	{ label: ">> sobre una ruta sensible", ...bash("echo x >> ~/.ssh/authorized_keys"), expect: "ask", reason: "Va a añadir contenido a ~/.ssh/authorized_keys." },
 	{ label: "> sobre un arranque de shell", ...bash("echo x > .bashrc"), expect: "ask", reason: "Va a sobrescribir ~/.bashrc." },

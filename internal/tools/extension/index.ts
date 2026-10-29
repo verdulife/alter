@@ -357,6 +357,30 @@ function isSensitivePath(absolutePath: string): boolean {
 	return false;
 }
 
+/**
+ * Devices a redirection may target without destroying anything: `/dev/null` throws
+ * the bytes away and `/dev/stdout`, `/dev/stderr` and `/dev/tty` echo them into a
+ * descriptor the owner already sees. None of them stores data, so none of them can
+ * lose it, and `2>/dev/null` is how every script silences stderr: asking for it
+ * turned the gate into a toll booth (six of eight questions in 25 minutes of the
+ * production journal were exactly this). Deliberately a closed list of exact
+ * paths, never a `/dev/*` prefix: `> /dev/sda` must still ask.
+ */
+const DISCARD_DEVICES = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
+
+/**
+ * True when a redirection target resolves to a device that only discards or
+ * repeats output. The target is resolved the same way every other path is, so
+ * `$HOME/../dev/null` lands here too, while a target carrying a variable still
+ * falls through to the rule that asks: a shell-agnostic reader cannot know what
+ * `$SINK` is, and only a literal device name is safe to allow.
+ */
+function isDiscardDevice(target: string, cwd: string): boolean {
+	if (target.includes("$") || target.includes("`")) return false;
+	const absolutePath = resolveUserPath(target, cwd);
+	return absolutePath !== null && DISCARD_DEVICES.has(absolutePath);
+}
+
 /** True when the path sits outside the owner's home: no rule covers it, so it asks. */
 function isOutsideHome(absolutePath: string): boolean {
 	const home = homeDir();
@@ -866,6 +890,10 @@ function classifyContainer(program: string, args: string[]): Verdict {
  */
 function classifyRedirection(redirection: { op: string; target: string }, cwd: string): Verdict {
 	if (redirection.op !== ">" && redirection.op !== ">>") return allow();
+	// A device sink is checked before every other rule, and for every descriptor and
+	// for both `>` and `>>`: `2>/dev/null` writes to `/dev`, which the sensitive list
+	// covers, but only as a sink that keeps nothing.
+	if (isDiscardDevice(redirection.target, cwd)) return allow();
 	if (redirection.target.includes("$") || redirection.target.includes("`")) {
 		return ask("Va a escribir en una ruta que no puedo comprobar.", `${redirection.op} escribe en una ruta con variables`);
 	}
