@@ -79,11 +79,17 @@ func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string
 	}, nil)
 }
 
-// AnswerCallbackQuery clears the client-side spinner after a button press.
-func (c *Client) AnswerCallbackQuery(ctx context.Context, callbackID string) error {
-	return c.call(ctx, "answerCallbackQuery", map[string]any{
-		"callback_query_id": callbackID,
-	}, nil)
+// AnswerCallbackQuery clears the client-side spinner after a button press. A
+// non-empty text is shown by the client as a short toast on top of the button, so
+// the owner sees that the press registered; an empty text sends exactly the
+// payload of a plain acknowledgement. show_alert is never set: a modal dialog on
+// every press would have to be dismissed by hand.
+func (c *Client) AnswerCallbackQuery(ctx context.Context, callbackID, text string) error {
+	payload := map[string]any{"callback_query_id": callbackID}
+	if text != "" {
+		payload["text"] = text
+	}
+	return c.call(ctx, "answerCallbackQuery", payload, nil)
 }
 
 // SendDocument uploads a local file as a document. Rich message media blocks

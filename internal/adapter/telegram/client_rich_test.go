@@ -161,7 +161,7 @@ func TestAnswerCallbackQueryAndChatAction(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := NewClientWithBase("TOKEN", srv.URL)
-	if err := c.AnswerCallbackQuery(context.Background(), "CB1"); err != nil {
+	if err := c.AnswerCallbackQuery(context.Background(), "CB1", ""); err != nil {
 		t.Fatalf("AnswerCallbackQuery: %v", err)
 	}
 	if err := c.SendChatAction(context.Background(), 7, "typing"); err != nil {
@@ -170,6 +170,61 @@ func TestAnswerCallbackQueryAndChatAction(t *testing.T) {
 	want := []string{"/botTOKEN/answerCallbackQuery", "/botTOKEN/sendChatAction"}
 	if len(paths) != 2 || paths[0] != want[0] || paths[1] != want[1] {
 		t.Errorf("paths = %v, want %v", paths, want)
+	}
+}
+
+// TestAnswerCallbackQuerySendsToastTextOnlyWhenGiven pins the acknowledgement
+// payload: a non-empty text travels as the toast Telegram shows on the button,
+// and an empty text keeps the payload exactly as it was before toasts existed.
+// show_alert is never sent, because a modal dialog on every press is not what the
+// owner asked for.
+func TestAnswerCallbackQuerySendsToastTextOnlyWhenGiven(t *testing.T) {
+	var payloads []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		payloads = append(payloads, payload)
+		_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClientWithBase("TOKEN", srv.URL)
+	if err := c.AnswerCallbackQuery(context.Background(), "CB1", ""); err != nil {
+		t.Fatalf("AnswerCallbackQuery without text: %v", err)
+	}
+	if err := c.AnswerCallbackQuery(context.Background(), "CB2", "Aprobado"); err != nil {
+		t.Fatalf("AnswerCallbackQuery with text: %v", err)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("payloads = %d (%v), want two", len(payloads), payloads)
+	}
+
+	// Empty text: the payload is the one the plain acknowledgement always sent.
+	silent := payloads[0]
+	if _, ok := silent["text"]; ok {
+		t.Errorf("silent acknowledgement carries text = %v, want the key omitted", silent["text"])
+	}
+	if got, want := silent["callback_query_id"], "CB1"; got != want {
+		t.Errorf("callback_query_id = %v, want %v", got, want)
+	}
+	if len(silent) != 1 {
+		t.Errorf("silent payload = %v, want only callback_query_id", silent)
+	}
+
+	// Non-empty text: the toast, and still no alert dialog.
+	withToast := payloads[1]
+	if got, want := withToast["text"], "Aprobado"; got != want {
+		t.Errorf("text = %v, want %v", got, want)
+	}
+	if got, want := withToast["callback_query_id"], "CB2"; got != want {
+		t.Errorf("callback_query_id = %v, want %v", got, want)
+	}
+	for _, unwanted := range []string{"show_alert", "parse_mode", "url"} {
+		if _, ok := withToast[unwanted]; ok {
+			t.Errorf("payload carries %q = %v: the acknowledgement stays a plain toast", unwanted, withToast[unwanted])
+		}
 	}
 }
 

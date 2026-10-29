@@ -39,12 +39,20 @@ import (
 // rendered, which is exactly what Telegram would hand back on a press.
 var reAskButtonCallback = regexp.MustCompile(`data="([^"]*)"`)
 
+// askAcknowledgement is one answerCallbackQuery the broker sent: the press whose
+// spinner it stops and the toast text the owner saw, empty for a silent
+// acknowledgement of a press that settles nothing.
+type askAcknowledgement struct {
+	callbackID string
+	text       string
+}
+
 // recordingAskTransport is an in-memory Bot API for the broker: it records every
 // rich message and every acknowledgement, and can fail either call on demand.
 type recordingAskTransport struct {
 	mu      sync.Mutex
 	sent    []string
-	acks    []string
+	acks    []askAcknowledgement
 	sendErr error
 	ackErr  error
 }
@@ -66,13 +74,13 @@ func (r *recordingAskTransport) SendRich(_ context.Context, chatID int64, markdo
 	return telegram.Message{MessageID: 1, Chat: telegram.Chat{ID: chatID}}, nil
 }
 
-func (r *recordingAskTransport) AnswerCallbackQuery(_ context.Context, callbackID string) error {
+func (r *recordingAskTransport) AnswerCallbackQuery(_ context.Context, callbackID, text string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ackErr != nil {
 		return r.ackErr
 	}
-	r.acks = append(r.acks, callbackID)
+	r.acks = append(r.acks, askAcknowledgement{callbackID: callbackID, text: text})
 	return nil
 }
 
@@ -85,7 +93,40 @@ func (r *recordingAskTransport) messages() []string {
 func (r *recordingAskTransport) acknowledgements() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]string(nil), r.acks...)
+	out := make([]string, 0, len(r.acks))
+	for _, ack := range r.acks {
+		out = append(out, ack.callbackID)
+	}
+	return out
+}
+
+// acknowledgementTexts lists the toast text of every acknowledgement, in order.
+// An empty entry is a silent acknowledgement.
+func (r *recordingAskTransport) acknowledgementTexts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.acks))
+	for _, ack := range r.acks {
+		out = append(out, ack.text)
+	}
+	return out
+}
+
+// assertAskAckToast fails unless one press was acknowledged exactly once with the
+// given toast text.
+func assertAskAckToast(t *testing.T, tr *recordingAskTransport, callbackID, wantText string) {
+	t.Helper()
+	acks := tr.acknowledgements()
+	texts := tr.acknowledgementTexts()
+	if len(acks) != 1 || len(texts) != 1 {
+		t.Fatalf("acknowledged = %v with toast texts %q, want exactly one acknowledgement", acks, texts)
+	}
+	if acks[0] != callbackID {
+		t.Errorf("acknowledged press = %q, want %q", acks[0], callbackID)
+	}
+	if texts[0] != wantText {
+		t.Errorf("toast text = %q, want %q", texts[0], wantText)
+	}
 }
 
 // waitMessages blocks until at least want questions were posted and returns
@@ -624,6 +665,82 @@ func TestAskOptionsUnknownCallbackIsAcknowledgedAndIgnored(t *testing.T) {
 		if got.err != nil || got.answer != "guardar" {
 			t.Errorf("answer = %q (err %v), want guardar", got.answer, got.err)
 		}
+	})
+}
+
+// TestResolveAcknowledgesThePressWithAToast pins the visible feedback of a
+// press: the acknowledgement that already stopped the spinner now carries a
+// short Spanish toast saying what the press did, and a press that settles nothing
+// stays silent. One press is acknowledged exactly once either way.
+func TestResolveAcknowledgesThePressWithAToast(t *testing.T) {
+	t.Run("aprobar", func(t *testing.T) {
+		tr := newRecordingAskTransport()
+		broker := newTestAskBroker(t, tr)
+
+		out := startApprove(context.Background(), broker, "¿Ejecutar bash? rm -rf /tmp/x")
+		datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+		broker.Resolve(context.Background(), callbackEvent("cb-allow", datas[approvalIndexAllow]))
+		if got := waitApprove(t, out); got.err != nil || !got.approved {
+			t.Fatalf("Approve = (%v, %v), want an approval", got.approved, got.err)
+		}
+		assertAskAckToast(t, tr, "cb-allow", "Aprobado")
+	})
+
+	t.Run("rechazar", func(t *testing.T) {
+		tr := newRecordingAskTransport()
+		broker := newTestAskBroker(t, tr)
+
+		out := startApprove(context.Background(), broker, "¿Ejecutar bash? rm -rf /tmp/x")
+		datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+		broker.Resolve(context.Background(), callbackEvent("cb-deny", datas[approvalIndexAllow+1]))
+		if got := waitApprove(t, out); got.err != nil || got.approved {
+			t.Fatalf("Approve = (%v, %v), want a rejection", got.approved, got.err)
+		}
+		assertAskAckToast(t, tr, "cb-deny", "Rechazado")
+	})
+
+	t.Run("opción", func(t *testing.T) {
+		tr := newRecordingAskTransport()
+		broker := newTestAskBroker(t, tr)
+
+		out := startAsk(context.Background(), broker, "¿Qué hago con el enlace?", []string{"guardar", "resumir"})
+		datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+		broker.Resolve(context.Background(), callbackEvent("cb-opt", datas[1]))
+		if got := waitAsk(t, out); got.err != nil || got.answer != "resumir" {
+			t.Fatalf("answer = %q (err %v), want resumir", got.answer, got.err)
+		}
+		assertAskAckToast(t, tr, "cb-opt", "resumir")
+	})
+
+	t.Run("opción larga", func(t *testing.T) {
+		tr := newRecordingAskTransport()
+		broker := newTestAskBroker(t, tr)
+
+		// Longer than a toast should be, so the acknowledgement has to cut it.
+		long := strings.Repeat("sí ", 20)
+		out := startAsk(context.Background(), broker, "¿Qué hago?", []string{"guardar", long})
+		datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+		broker.Resolve(context.Background(), callbackEvent("cb-long", datas[1]))
+		// The answer itself is never truncated.
+		if got := waitAsk(t, out); got.err != nil || got.answer != long {
+			t.Fatalf("answer = %q (err %v), want the full label", got.answer, got.err)
+		}
+		want := string([]rune(long)[:askAckMaxRunes]) + "…"
+		assertAskAckToast(t, tr, "cb-long", want)
+	})
+
+	t.Run("obsoleta", func(t *testing.T) {
+		tr := newRecordingAskTransport()
+		broker := newTestAskBroker(t, tr)
+
+		// A button from an old message: the spinner still stops, but there is
+		// nothing to confirm, so the acknowledgement carries no text.
+		broker.Resolve(context.Background(), callbackEvent("cb-stale", askCallbackData(randomAskID(t), 0)))
+		assertAskAckToast(t, tr, "cb-stale", "")
 	})
 }
 

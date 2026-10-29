@@ -79,11 +79,24 @@ const askApprovalAllowStyle = "success"
 // approvalIndexAllow is the button index that approves.
 const approvalIndexAllow = 0
 
+// The acknowledgements the owner sees as a toast on the press. They confirm that
+// the press registered; they are not a second message, so they never edit the
+// question or add a round trip.
+const (
+	askAckApproved = "Aprobado"
+	askAckRejected = "Rechazado"
+
+	// askAckMaxRunes bounds the toast of an ask_options press. A toast is a few
+	// words on a button, so a long option is cut rather than shown in full.
+	askAckMaxRunes = 40
+)
+
 // bridgeAskTransport is the Bot API surface the broker needs: one rich message
-// to carry the buttons and one acknowledgement to stop the client spinner.
+// to carry the buttons and one acknowledgement to stop the client spinner and
+// show the toast of the press.
 type bridgeAskTransport interface {
 	SendRich(ctx context.Context, chatID int64, markdown string) (telegram.Message, error)
-	AnswerCallbackQuery(ctx context.Context, callbackID string) error
+	AnswerCallbackQuery(ctx context.Context, callbackID, text string) error
 }
 
 // bridgeAskBroker implements tools.OptionAsker over the owner chat. It holds at
@@ -101,11 +114,28 @@ type bridgeAskBroker struct {
 }
 
 // bridgePendingAsk is one question waiting for a press. reply carries the chosen
-// option index; it is buffered so Resolve never blocks the poll loop.
+// option index; it is buffered so Resolve never blocks the poll loop. labels and
+// kind are kept only so a press can be acknowledged with what it chose: neither
+// one changes what the press means.
 type bridgePendingAsk struct {
 	id      string
+	labels  []string
 	options int
+	kind    askKind
 	reply   chan int
+}
+
+// ackText is the toast the owner sees after pressing the button of this question.
+// A resolved press always says what it did; a press on a question that is no
+// longer pending never reaches this point.
+func (p *bridgePendingAsk) ackText(index int) string {
+	if p.kind == askKindApproval {
+		if index == approvalIndexAllow {
+			return askAckApproved
+		}
+		return askAckRejected
+	}
+	return truncateAskText(p.labels[index], askAckMaxRunes)
 }
 
 // newBridgeAskBroker builds a broker that posts to one owner chat.
@@ -174,7 +204,13 @@ func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []st
 	if err != nil {
 		return 0, err
 	}
-	p := &bridgePendingAsk{id: id, options: len(options), reply: make(chan int, 1)}
+	p := &bridgePendingAsk{
+		id:      id,
+		labels:  append([]string(nil), options...),
+		options: len(options),
+		kind:    kind,
+		reply:   make(chan int, 1),
+	}
 
 	b.mu.Lock()
 	if b.pending != nil {
@@ -207,34 +243,38 @@ func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []st
 
 // Resolve settles the pending question from one inbound event. A press always
 // stops the client spinner, including a press that matches nothing: a stale
-// button in an old message must not look broken to the owner. Only a press
-// carrying the pending question's id and a valid option index settles it, so a
-// late press can never answer a later question.
+// button in an old message must not look broken to the owner. A press that does
+// settle the question also carries a short toast saying what it chose. Only a
+// press carrying the pending question's id and a valid option index settles it,
+// so a late press can never answer a later question.
 func (b *bridgeAskBroker) Resolve(ctx context.Context, ev telegram.Event) {
 	if ev.Kind != telegram.EventCallback {
 		return
 	}
-	if ev.CallbackID != "" {
-		if err := b.client.AnswerCallbackQuery(ctx, ev.CallbackID); err != nil {
-			// Cosmetic only: the answer still reaches the waiting turn.
-			b.logger.Printf("bridge: answer callback: %v", err)
-		}
-	}
 
 	id, index, ok := parseAskCallback(ev.CallbackData)
-	if !ok {
-		return
-	}
 
 	b.mu.Lock()
 	p := b.pending
 	var reply chan int
-	if p != nil && p.id == id && index < p.options {
+	ackText := ""
+	if ok && p != nil && p.id == id && index < p.options {
 		// Consumed: one press settles one question, and the slot is free at once.
 		b.pending = nil
 		reply = p.reply
+		ackText = p.ackText(index)
 	}
 	b.mu.Unlock()
+
+	// Exactly one acknowledgement per press: it is what stops the spinner, and the
+	// text it carries is the only feedback the owner gets besides the answer
+	// arriving. A press that settles nothing is acknowledged without it.
+	if ev.CallbackID != "" {
+		if err := b.client.AnswerCallbackQuery(ctx, ev.CallbackID, ackText); err != nil {
+			// Cosmetic only: the answer still reaches the waiting turn.
+			b.logger.Printf("bridge: answer callback: %v", err)
+		}
+	}
 
 	if reply == nil {
 		return
