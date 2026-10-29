@@ -23,6 +23,9 @@ import (
 const (
 	envFakeScenario = "BRIDGE_FAKE_SCENARIO"
 	envFakeCwdFile  = "BRIDGE_FAKE_CWD_FILE"
+	// envFakeEnvFile makes the fake report the environment it actually
+	// received, which is how a test proves Config.Env reaches the child.
+	envFakeEnvFile = "BRIDGE_FAKE_ENV_FILE"
 )
 
 // fakeSpawns records the args of every process the Session spawned, in order.
@@ -100,6 +103,19 @@ func TestFakePiProcess(t *testing.T) {
 			os.Exit(1)
 		}
 		if err := os.WriteFile(file, []byte(wd), 0o600); err != nil {
+			os.Exit(1)
+		}
+	}
+	if file := os.Getenv(envFakeEnvFile); file != "" {
+		report, err := json.Marshal(map[string]string{
+			"ALTER_TOOLS_URL":    os.Getenv("ALTER_TOOLS_URL"),
+			"ALTER_TOOLS_TOKEN":  os.Getenv("ALTER_TOOLS_TOKEN"),
+			envInheritedForChild: os.Getenv(envInheritedForChild),
+		})
+		if err != nil {
+			os.Exit(1)
+		}
+		if err := os.WriteFile(file, report, 0o600); err != nil {
 			os.Exit(1)
 		}
 	}
@@ -333,6 +349,81 @@ func TestProcessDeathBeforeSettleIsRetriedOnce(t *testing.T) {
 	}
 	if spawns.count() != 2 {
 		t.Errorf("expected exactly one retry (2 spawns), got %d", spawns.count())
+	}
+}
+
+// envInheritedForChild is a variable the parent test exports so the fake can
+// prove the inherited environment still reaches the child.
+const envInheritedForChild = "BRIDGE_TEST_INHERITED"
+
+// TestConfigEnvReachesChildOnTopOfInheritedEnvironment proves the child sees a
+// variable set through Config.Env (the tools URL and token travel that way) and
+// still inherits the environment of the bridge process.
+func TestConfigEnvReachesChildOnTopOfInheritedEnvironment(t *testing.T) {
+	reportFile := filepath.Join(t.TempDir(), "env.json")
+	t.Setenv(envFakeEnvFile, reportFile)
+	t.Setenv(envInheritedForChild, "from-parent")
+
+	s := newTestSession(t, Config{
+		Env: map[string]string{
+			"ALTER_TOOLS_URL":   "http://127.0.0.1:4321",
+			"ALTER_TOOLS_TOKEN": "secret-token",
+		},
+	}, nil, "", "echo")
+	if _, err := s.Prompt(context.Background(), "hola"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	s.Close()
+
+	raw, err := os.ReadFile(reportFile)
+	if err != nil {
+		t.Fatalf("fake pi did not report its environment: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode report: %v", err)
+	}
+
+	if got["ALTER_TOOLS_URL"] != "http://127.0.0.1:4321" {
+		t.Errorf("ALTER_TOOLS_URL in the child = %q, want the Config.Env value", got["ALTER_TOOLS_URL"])
+	}
+	if got["ALTER_TOOLS_TOKEN"] != "secret-token" {
+		t.Errorf("ALTER_TOOLS_TOKEN in the child = %q, want the Config.Env value", got["ALTER_TOOLS_TOKEN"])
+	}
+	if got[envInheritedForChild] != "from-parent" {
+		t.Errorf("%s in the child = %q, want the inherited value (Config.Env must not replace os.Environ)", envInheritedForChild, got[envInheritedForChild])
+	}
+}
+
+// TestChildEnvAppendsConfigEnvInSortedOrder pins the deterministic order of the
+// environment Config.Env adds, so the child environment does not depend on Go's
+// map iteration order.
+func TestChildEnvAppendsConfigEnvInSortedOrder(t *testing.T) {
+	s := NewSession(Config{Env: map[string]string{
+		"ALTER_ZULU": "3",
+		"ALTER_ALFA": "1",
+		"ALTER_MIKE": "2",
+	}})
+
+	env := s.childEnv(nil)
+	if len(env) < 3 {
+		t.Fatalf("childEnv(nil) returned %d entries, want the inherited environment plus 3", len(env))
+	}
+	tail := env[len(env)-3:]
+	want := []string{"ALTER_ALFA=1", "ALTER_MIKE=2", "ALTER_ZULU=3"}
+	for i := range want {
+		if tail[i] != want[i] {
+			t.Errorf("childEnv(nil)[%d] = %q, want %q (sorted order)", len(env)-3+i, tail[i], want[i])
+		}
+	}
+}
+
+// TestNoConfigEnvLeavesTheInheritedEnvironmentAlone proves the empty case still
+// inherits everything: an unset Env must not hand the child an empty environment.
+func TestNoConfigEnvLeavesTheInheritedEnvironmentAlone(t *testing.T) {
+	s := NewSession(Config{})
+	if env := s.childEnv(nil); env != nil {
+		t.Errorf("childEnv() = %d entries, want nil so cmd.Env stays inherited", len(env))
 	}
 }
 

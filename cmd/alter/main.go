@@ -37,6 +37,13 @@ import (
 func main() {
 	logger := log.New(os.Stderr, "alter: ", log.LstdFlags)
 
+	// Load .env before reading configuration, so the runtime starts without a
+	// shell wrapper (`set -a; source .env; set +a`). Exported variables still win
+	// over the file, and a missing file is not an error.
+	if err := config.LoadDotEnv(".env"); err != nil {
+		logger.Printf("runtime: .env: %v", err)
+	}
+
 	cfg := config.Load()
 	if cfg.TelegramToken == "" {
 		logger.Fatal("TELEGRAM_TOKEN is required")
@@ -195,29 +202,41 @@ func main() {
 
 	cmdSvc := commandService{tasks: taskSvc, reminders: reminderSvc}
 
-	// Inbound free text: with the Pi Agent enabled the AgentFlow capability
-	// pipeline is the primary route (Pi decides conversational reply vs Plan
-	// JSON; a Plan executes registered capabilities: list_tasks, create_task,
-	// complete_task, cancel_task, create_reminder). With ALTER_PI_ENABLED=false
-	// there is no AgentFlow and no natural handler: the behavior is exactly the
-	// pre-slice one (slash commands + help fallback).
-	var naturalHandler telegram.NaturalHandler
-	if agentFlow != nil {
-		naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
-		logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities)")
-	} else {
-		logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true)")
-	}
-
-	inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {
-		return telegram.Handle(ctx, cmdSvc, text, naturalHandler)
-	}, logger)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 2)
-	go func() { errCh <- inbound.Run(ctx) }()
+	if cfg.BridgeEnabled {
+		// Bridge mode (S1): the direct Telegram ↔ Pi channel is the single
+		// free-text entry path, so the legacy AgentFlow route is not wired at
+		// all. Pi keeps the conversation and owns the answer.
+		bridgeRuntime, err := newBridgeRuntime(cfg, logger)
+		if err != nil {
+			logger.Fatalf("runtime: bridge: %v", err)
+		}
+		logger.Printf("runtime: inbound free text = Telegram <-> Pi bridge (session=%q)", cfg.BridgeSessionID)
+		go func() { errCh <- bridgeRuntime.Run(ctx) }()
+	} else {
+		// Inbound free text: with the Pi Agent enabled the AgentFlow capability
+		// pipeline is the primary route (Pi decides conversational reply vs Plan
+		// JSON; a Plan executes registered capabilities: list_tasks, create_task,
+		// complete_task, cancel_task, create_reminder). With ALTER_PI_ENABLED=false
+		// there is no AgentFlow and no natural handler: the behavior is exactly the
+		// pre-slice one (slash commands + help fallback).
+		var naturalHandler telegram.NaturalHandler
+		if agentFlow != nil {
+			naturalHandler = telegram.NewAgentFlowHandler(agentFlow).Handle
+			logger.Printf("runtime: inbound free text = AgentFlow (Pi + capabilities)")
+		} else {
+			logger.Printf("runtime: natural language interpretation disabled (set ALTER_PI_ENABLED=true)")
+		}
+
+		inbound := telegram.NewAdapter(client, func(ctx context.Context, text string) (string, error) {
+			return telegram.Handle(ctx, cmdSvc, text, naturalHandler)
+		}, logger)
+		go func() { errCh <- inbound.Run(ctx) }()
+	}
+
 	go func() { errCh <- sched.Run(ctx) }()
 
 	// Rebuild the derived semantic index in the background: the runtime starts

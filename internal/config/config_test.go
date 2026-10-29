@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -173,5 +174,24 @@ func TestLoadSearchMalformedFallsBack(t *testing.T) {
 	}
 	if cfg.SearchLimit != 5 {
 		t.Errorf("SearchLimit = %d, want 5 on malformed env", cfg.SearchLimit)
+	}
+}
+
+// TestBridgeToolsDefaultIncludesDeterministicTools pins the allowlist Pi
+// receives when ALTER_BRIDGE_TOOLS is unset. --tools REPLACES Pi's whole tool
+// selection instead of extending it, so a default listing only the read-only
+// tools would silently disable every deterministic vault write (S7).
+func TestBridgeToolsDefaultIncludesDeterministicTools(t *testing.T) {
+	clearBridgeEnv(t)
+
+	got := Load().BridgeTools
+	want := "read,grep,find,ls,save_note,append_note,send_file,ask_options"
+	if got != want {
+		t.Fatalf("BridgeTools = %q, want %q", got, want)
+	}
+	for _, forbidden := range []string{"bash", "edit", "write"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("BridgeTools = %q must never contain %q (S7)", got, forbidden)
+		}
 	}
 }

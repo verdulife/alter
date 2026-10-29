@@ -45,8 +45,8 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	if cfg.BridgeSessionID != "telegram" {
 		t.Errorf("BridgeSessionID = %q, want telegram", cfg.BridgeSessionID)
 	}
-	if cfg.BridgeTools != "read,grep,find,ls" {
-		t.Errorf("BridgeTools = %q, want read,grep,find,ls", cfg.BridgeTools)
+	if cfg.BridgeTools != "read,grep,find,ls,save_note,append_note,send_file,ask_options" {
+		t.Errorf("BridgeTools = %q, want the read-only tools plus the deterministic ones", cfg.BridgeTools)
 	}
 	if got := len(cfg.BridgePromptFiles); got != 0 {
 		t.Errorf("BridgePromptFiles = %v, want empty", cfg.BridgePromptFiles)

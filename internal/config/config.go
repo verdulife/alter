@@ -102,8 +102,12 @@ const (
 
 	defaultTelegramAPIBase = "https://api.telegram.org"
 	defaultBridgeSessionID = "telegram"
-	defaultBridgeTools     = "read,grep,find,ls"
-	defaultBridgeTimeout   = 120 * time.Second
+	// defaultBridgeTools is the Pi tool allowlist used when ALTER_BRIDGE_TOOLS is
+	// unset. --tools REPLACES Pi's whole selection instead of extending it, so the
+	// deterministic bridge tools must be listed here explicitly: a default with
+	// only the read-only tools would silently disable every vault write (S7).
+	defaultBridgeTools   = "read,grep,find,ls,save_note,append_note,send_file,ask_options"
+	defaultBridgeTimeout = 120 * time.Second
 )
 
 // Load returns the application configuration from environment variables

@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +63,11 @@ type Config struct {
 	// VaultDir is the working directory of the process: cwd = vault root is how
 	// Pi reads the vault while staying read-only.
 	VaultDir string
+	// Env holds extra environment variables for the child process, applied on
+	// top of the inherited environment. The bridge tools server hands Pi its URL
+	// and token this way (ALTER_TOOLS_URL / ALTER_TOOLS_TOKEN). Keys are applied
+	// in sorted order so the child environment is deterministic.
+	Env map[string]string
 }
 
 // Option configures a Session. It exists mainly as the test seam.
@@ -203,6 +210,9 @@ func (s *Session) start() error {
 	if s.cfg.VaultDir != "" {
 		cmd.Dir = s.cfg.VaultDir
 	}
+	if env := s.childEnv(cmd.Env); env != nil {
+		cmd.Env = env
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("bridge: pi: stdin pipe: %w", err)
@@ -224,6 +234,33 @@ func (s *Session) start() error {
 	s.stdout = stdout
 	s.sc = sc
 	return nil
+}
+
+// childEnv applies Config.Env on top of base. base is the environment the
+// command already carries: nil (the production factory) means the inherited
+// os.Environ(), so in production this is exactly append(os.Environ(), ...). A
+// test factory that prepared its own Env keeps it instead of having it silently
+// replaced. The extra keys are appended in sorted order, so the child
+// environment never depends on Go's map iteration order.
+func (s *Session) childEnv(base []string) []string {
+	if len(s.cfg.Env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(s.cfg.Env))
+	for k := range s.cfg.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	if base == nil {
+		base = os.Environ()
+	}
+	env := make([]string, 0, len(base)+len(keys))
+	env = append(env, base...)
+	for _, k := range keys {
+		env = append(env, k+"="+s.cfg.Env[k])
+	}
+	return env
 }
 
 // restart kills any running process and starts a fresh one.
