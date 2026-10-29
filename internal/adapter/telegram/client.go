@@ -11,9 +11,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -125,17 +127,32 @@ func (c *Client) call(ctx context.Context, method string, payload map[string]any
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	defer resp.Body.Close()
 
 	return decodeEnvelope(resp, method, out)
+}
+
+// redactToken removes the bot token from an error before it reaches a log.
+// net/http wraps transport failures in *url.Error, whose message embeds the
+// request URL, and every Bot API URL carries /bot<token>/. Logging that raw
+// error writes a live credential to the journal (seen in production).
+func (c *Client) redactToken(err error) error {
+	if err == nil || c.token == "" {
+		return err
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, c.token) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(msg, c.token, "<redacted>"))
 }
 
 // decodeEnvelope validates the {ok, result} envelope shared by every Bot API

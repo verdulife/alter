@@ -123,11 +123,11 @@ func (c *Client) DownloadFile(ctx context.Context, filePath string, w io.Writer)
 	url := fmt.Sprintf("%s/file/bot%s/%s", c.baseURL, c.token, strings.TrimLeft(filePath, "/"))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -167,7 +167,7 @@ func (c *Client) callMultipart(ctx context.Context, method string, fields map[st
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body.Bytes()))
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
@@ -176,7 +176,7 @@ func (c *Client) callMultipart(ctx context.Context, method string, fields map[st
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return c.redactToken(err)
 	}
 	defer resp.Body.Close()
 
