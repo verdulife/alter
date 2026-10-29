@@ -267,3 +267,20 @@ Política del gate: `bash`, `write` y `edit` siempre piden confirmación; `read`
 `grep`, `find`, `ls`, `save_note`, `append_note`, `send_file` y `ask_options`
 nunca; cualquier otra herramienta (incluidas las de paquetes) también pregunta,
 para que nada se cuele por no estar en la lista.
+
+**L16** (verificación independiente de T13, commit `1da4653`). Fail-closed real,
+slot compartido sin cruces y dispatch de turnos correcto (probado: cancelar con
+una aprobación pendiente devuelve el control en 0 s, sin deadlock; tres mensajes
+producen tres entregas; una pulsación durante el turno se consume). Tres
+hallazgos que sí exigen trabajo:
+
+1. **El preview del comando oculta la cola.** Se recorta a 240/280 caracteres, así
+   que un `rm -rf` al final de un comando largo no se ve. La aprobación dejaría de
+   informar justo cuando más importa.
+2. **`turns.Wait()` y `turnMu` no tienen test.** Quitarlos deja la suite entera en
+   verde: las dos garantías estructurales de L15 no están ancladas.
+3. **Advisories**: un id vacío produce una respuesta que Pi no puede casar (el turno
+   muere por timeout, pero cierra); un handler que ignore el contexto puede exceder
+   el deadline; y si la extensión no carga, el gate desaparece sin más que un log.
+
+Ninguno bloquea el código de T13; los tres se cierran antes de T14.

@@ -47,6 +47,15 @@ const (
 	// command cannot be allowed to fill the conversation.
 	bridgeDialogTitleLimit   = 120
 	bridgeDialogMessageLimit = 280
+
+	// bridgeDialogEllipsis marks the elided middle of a clipped dialog text.
+	bridgeDialogEllipsis = "…"
+
+	// bridgeDialogHeadShare is the fraction of a clipped text given to the head;
+	// the rest goes to the tail. It is the same split the Pi extension applies to
+	// the argument preview, so the two caps agree instead of fighting.
+	bridgeDialogHeadShare = 2
+	bridgeDialogShareOf   = 3
 )
 
 // The two variables that configure the files Pi needs. They appear in the
@@ -152,6 +161,11 @@ type bridgeRuntime struct {
 	// for them before it takes the session and the tools server away.
 	turns sync.WaitGroup
 
+	// turnGate, when set, runs inside the turn goroutine right after it owns the
+	// turn slot (test seam): it lets a test hold a turn open, so it can prove that
+	// Run waits for it and that turnMu serializes the turns behind it.
+	turnGate func(ctx context.Context)
+
 	chatID   int64
 	toolsURL string
 	logger   *log.Logger
@@ -176,6 +190,12 @@ func withBridgeCommandFactory(f func(name string, args ...string) *exec.Cmd) bri
 // poller, the tools server and the session stop in that order.
 func withBridgeTeardownHook(hook func(stage string)) bridgeRuntimeOption {
 	return func(r *bridgeRuntime) { r.onTeardown = hook }
+}
+
+// withTurnGate holds a turn open from inside the turn goroutine (test seam), so a
+// test can observe teardown waiting for it and the slot serializing the next one.
+func withTurnGate(gate func(ctx context.Context)) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.turnGate = gate }
 }
 
 // withInboundFileLimit overrides the inbound attachment ceiling (test seam). It
@@ -368,7 +388,7 @@ func (r *bridgeRuntime) onDialog(ctx context.Context, req bridge.DialogRequest) 
 }
 
 // dialogQuestion renders a dialog's title and message as the text of the button
-// prompt. The text is escaped and truncated because it carries model-controlled
+// prompt. The text is escaped and clipped because it carries model-controlled
 // arguments (the command about to run): markup from a tool call must never become
 // buttons or formatting in the owner's chat.
 func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
@@ -378,12 +398,34 @@ func (r *bridgeRuntime) dialogQuestion(req bridge.DialogRequest) string {
 	}
 
 	var out strings.Builder
-	out.WriteString(escapeAskText(truncateAskText(title, bridgeDialogTitleLimit)))
+	out.WriteString(escapeAskText(clipDialogText(title, bridgeDialogTitleLimit)))
 	if message := strings.TrimSpace(req.Message); message != "" {
 		out.WriteString("\n\n")
-		out.WriteString(escapeAskText(truncateAskText(message, bridgeDialogMessageLimit)))
+		out.WriteString(escapeAskText(clipDialogText(message, bridgeDialogMessageLimit)))
 	}
 	return out.String()
+}
+
+// clipDialogText caps text at limit runes while keeping BOTH its head and its
+// tail: the dangerous part of a long command usually sits at the end
+// (`... && rm -rf ~/x`), so a head-only cut would hide exactly what the approval
+// exists to show. Two thirds go to the head and one third to the tail, the same
+// split the Pi extension applies to the argument preview; because that preview is
+// shorter than this cap, this clipping never re-cuts the tail the extension kept.
+// The elided middle is marked with an ellipsis, so the owner knows it is partial.
+func clipDialogText(text string, limit int) string {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
+		return text
+	}
+	head := limit * bridgeDialogHeadShare / bridgeDialogShareOf
+	tail := limit - head - len([]rune(bridgeDialogEllipsis))
+	if tail <= 0 {
+		// A limit too small to hold both ends is not a case this prompt uses; fall
+		// back to the head-only cut rather than dropping the text entirely.
+		return truncateAskText(text, limit)
+	}
+	return string(runes[:head]) + bridgeDialogEllipsis + string(runes[len(runes)-tail:])
 }
 
 // handleText starts one text turn through the shared turn pipeline.
@@ -405,6 +447,9 @@ func (r *bridgeRuntime) runTurn(ctx context.Context, chatID int64, prompt string
 		defer r.turns.Done()
 		r.turnMu.Lock()
 		defer r.turnMu.Unlock()
+		if r.turnGate != nil {
+			r.turnGate(ctx)
+		}
 		if err := r.promptTurn(ctx, chatID, prompt); err != nil {
 			// The poller no longer waits for this turn, so its failure is logged
 			// here instead of travelling back to the poll loop.

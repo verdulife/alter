@@ -967,8 +967,9 @@ type dialogHarness struct {
 // startDialogBridge composes and runs the real wiring against the ask fake, so a
 // dialog started by Pi travels the whole route: reader → broker → Telegram →
 // poller → child. A non-positive timeout keeps the 20 s used by the other slice
-// tests; a short one drives the fail-closed path.
-func startDialogBridge(t *testing.T, scenario string, timeout time.Duration) *dialogHarness {
+// tests; a short one drives the fail-closed path. Options adjust the runtime
+// before it starts (the turn seam needs them).
+func startDialogBridge(t *testing.T, scenario string, timeout time.Duration, opts ...bridgeRuntimeOption) *dialogHarness {
 	t.Helper()
 
 	bot, srv := newFakeAskBot(t)
@@ -990,7 +991,7 @@ func startDialogBridge(t *testing.T, scenario string, timeout time.Duration) *di
 	}
 
 	rt, err := newBridgeRuntime(cfg, log.New(logs, "", 0),
-		withBridgeCommandFactory(fakePiFactory(spawns)))
+		append([]bridgeRuntimeOption{withBridgeCommandFactory(fakePiFactory(spawns))}, opts...)...)
 	if err != nil {
 		t.Fatalf("newBridgeRuntime: %v", err)
 	}
@@ -1228,8 +1229,9 @@ func TestBridgeApprovalWithoutAnswerBlocksTheTurn(t *testing.T) {
 }
 
 // TestDialogQuestionEscapesAndTruncates pins the rendering of the question text
-// itself: markup from the tool arguments is escaped, and a long command is cut so
-// one approval cannot fill the chat.
+// itself: markup from the tool arguments is escaped, and a long command is
+// clipped so one approval cannot fill the chat — but the cut keeps both ends, so
+// the dangerous tail is never the part that disappears.
 func TestDialogQuestionEscapesAndTruncates(t *testing.T) {
 	r := &bridgeRuntime{logger: discardLogger()}
 
@@ -1245,8 +1247,12 @@ func TestDialogQuestionEscapesAndTruncates(t *testing.T) {
 	if strings.Contains(question, "<tg-button>") {
 		t.Errorf("question %q lets tool arguments inject markup", question)
 	}
-	if !strings.HasSuffix(question, "…") {
-		t.Errorf("question %q does not mark the truncated arguments", question)
+	// Head and tail are both kept, with the elided middle marked.
+	if !strings.Contains(question, bridgeDialogEllipsis) {
+		t.Errorf("question %q does not mark the clipped middle", question)
+	}
+	if !strings.HasSuffix(question, "&lt;tg-button&gt;x&lt;/tg-button&gt;") {
+		t.Errorf("question %q dropped the end of the command: the tail is the part the owner must see", question)
 	}
 	if got, limit := len([]rune(question)), bridgeDialogTitleLimit+bridgeDialogMessageLimit+4; got > limit {
 		t.Errorf("question is %d runes, want at most %d", got, limit)
@@ -1255,5 +1261,60 @@ func TestDialogQuestionEscapesAndTruncates(t *testing.T) {
 	short := r.dialogQuestion(bridge.DialogRequest{Method: "confirm", Title: "¿Ejecutar edit?", Message: "a && b"})
 	if !strings.Contains(short, "a &amp;&amp; b") {
 		t.Errorf("question %q does not escape the ampersand", short)
+	}
+	if strings.Contains(short, bridgeDialogEllipsis) {
+		t.Errorf("question %q marks a cut although nothing was cut", short)
+	}
+}
+
+// TestDialogQuestionKeepsTheTailOfALongCommand is the L16 finding: a long command
+// whose dangerous part is at the end (`... && rm -rf ~/x`) must not reach the
+// owner as a harmless head. The Go clip keeps the last characters, and its split
+// matches the one the Pi extension applies before the message arrives here, so the
+// narrower bridge cap cannot re-cut the tail the extension preserved.
+func TestDialogQuestionKeepsTheTailOfALongCommand(t *testing.T) {
+	r := &bridgeRuntime{logger: discardLogger()}
+
+	tail := " && rm -rf ~/x"
+	command := `{"command":"` + strings.Repeat("echo relleno && ", 200) + tail + `"}`
+	question := r.dialogQuestion(bridge.DialogRequest{
+		Method:  "confirm",
+		Title:   "¿Ejecutar bash?",
+		Message: command,
+	})
+
+	if !strings.HasSuffix(question, "rm -rf ~/x"+"\"}") {
+		t.Errorf("question %q does not end with the dangerous command tail", question)
+	}
+	if !strings.Contains(question, bridgeDialogEllipsis) {
+		t.Errorf("question %q does not mark the clipped middle", question)
+	}
+
+	// The shape of the clip: head, marker, tail. A short text is never cut.
+	if got := clipDialogText("corto", 280); got != "corto" {
+		t.Errorf("clipDialogText(%q) = %q, want it untouched", "corto", got)
+	}
+	head := strings.Repeat("H", 300)
+	body := head + strings.Repeat("M", 300) + "TAIL!"
+	clipped := clipDialogText(body, bridgeDialogMessageLimit)
+	if got, want := len([]rune(clipped)), bridgeDialogMessageLimit; got != want {
+		t.Errorf("clipped length = %d runes, want exactly %d", got, want)
+	}
+	wantHead := bridgeDialogMessageLimit * 2 / 3
+	if !strings.HasPrefix(clipped, head[:wantHead]) {
+		t.Errorf("clipped text %q does not keep the first %d runes of the head", clipped, wantHead)
+	}
+	if !strings.HasSuffix(clipped, "TAIL!") {
+		t.Errorf("clipped text %q does not keep the tail", clipped)
+	}
+	if !strings.Contains(clipped, bridgeDialogEllipsis) || strings.Contains(clipped, strings.Repeat("M", 200)) {
+		t.Errorf("clipped text %q does not elide the middle", clipped)
+	}
+
+	// The extension's own cap is narrower than the bridge's, so a preview it
+	// already clipped passes through the bridge unchanged: same split, no re-cut.
+	preview := clipDialogText(body, 240)
+	if got := clipDialogText(preview, bridgeDialogMessageLimit); got != preview {
+		t.Errorf("bridge re-cut the extension preview: %q, want %q", got, preview)
 	}
 }

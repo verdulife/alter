@@ -152,12 +152,29 @@ const APPROVAL_FREE = new Set([
 	"ask_options",
 ]);
 
-/** Longest argument preview the approval prompt carries, matching the bridge cap. */
+/** Longest argument preview the approval prompt carries; well under the bridge's 280-rune cap. */
 const APPROVAL_ARG_LIMIT = 240;
 
 /**
+ * Cuts a long preview down to its head AND its tail. The dangerous part of a
+ * long command tends to sit at the end (`... && rm -rf ~/x`), so a head-only cut
+ * would hide exactly what the approval exists to show. Two thirds go to the head
+ * and one third to the tail; the bridge applies the same split with a wider cap,
+ * so its own truncation can never re-cut the tail preserved here.
+ */
+function previewWithTail(rendered: string, limit: number): string {
+	if (rendered.length <= limit) {
+		return rendered;
+	}
+	const head = Math.floor((limit * 2) / 3);
+	const tail = limit - head - 1; // one character for the ellipsis
+	return `${rendered.slice(0, head)}…${rendered.slice(rendered.length - tail)}`;
+}
+
+/**
  * Renders the arguments of a tool call as one short line for the approval prompt.
- * The bridge escapes and truncates it again, so this only keeps the request small.
+ * The bridge escapes it and applies its own wider cap, so this only keeps the
+ * request small while keeping both ends of a long command visible.
  */
 function previewArguments(input: unknown): string {
 	let rendered: string;
@@ -167,7 +184,7 @@ function previewArguments(input: unknown): string {
 		rendered = "[argumentos no representables]";
 	}
 	rendered = (rendered ?? "").replace(/\s+/g, " ").trim();
-	return rendered.length > APPROVAL_ARG_LIMIT ? `${rendered.slice(0, APPROVAL_ARG_LIMIT)}…` : rendered;
+	return previewWithTail(rendered, APPROVAL_ARG_LIMIT);
 }
 
 /** Failed tool result: the model sees the reason and must not retry blindly. */
