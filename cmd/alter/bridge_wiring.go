@@ -213,12 +213,10 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	// Start-up guard (T10): Pi's persona and, above all, its tools extension must
 	// exist before anything is composed. A missing extension would leave the
 	// bridge answering while Pi cannot write anything — a silent, confusing
-	// failure — so refuse to start and say which path is wrong. Only bridge mode
-	// checks: the legacy path has no assets to load.
-	if cfg.BridgeEnabled {
-		if err := verifyBridgeAssets(cfg); err != nil {
-			return nil, err
-		}
+	// failure — so refuse to start and say which path is wrong. The bridge is the
+	// only runtime, so the guard always runs.
+	if err := verifyBridgeAssets(cfg); err != nil {
+		return nil, err
 	}
 
 	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes}

@@ -574,7 +574,6 @@ func TestBridgeAbsolutizesConfiguredAssets(t *testing.T) {
 	extensions := []string{relativeToCwd(t, toolsExtAbs), relativeToCwd(t, extraExtAbs)}
 
 	h := startBridgeWith(t, func(cfg *config.Config) {
-		cfg.BridgeEnabled = true
 		cfg.BridgePromptFiles = prompts
 		cfg.BridgeExtensions = extensions
 	}, "stream", 0, telegram.Update{

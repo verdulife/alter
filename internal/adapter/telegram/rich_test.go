@@ -40,6 +40,24 @@ func TestRichFitsRejectsOversizedPayloads(t *testing.T) {
 	}
 }
 
+func TestEscapeHTML(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"hello", "hello"},
+		{"<b>bold</b>", "&lt;b&gt;bold&lt;/b&gt;"},
+		{"a & b", "a &amp; b"},
+		{`"quoted"`, "&quot;quoted&quot;"},
+		{"it's", "it&#39;s"},
+		{"<script>alert(1)</script>", "&lt;script&gt;alert(1)&lt;/script&gt;"},
+	}
+	for _, tt := range tests {
+		if got := escapeHTML(tt.input); got != tt.want {
+			t.Errorf("escapeHTML(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestMarkdownToHTMLEscapesAndFormats(t *testing.T) {
 	got := MarkdownToHTML("# Título\n\n**negrita** y *cursiva* y `codigo`\n\n[enlace](https://t.me/?a=1&b=2)\n\n<script>alert(1)</script>")
 	for _, want := range []string{

@@ -1,10 +1,9 @@
-// Package telegram implements the Telegram adapters for alter: an inbound
-// transport (polling Bot API updates and replying to commands) and an outbound
-// notification transport (domain.Channel).
+// Package telegram is the transport layer of the bridge: the Bot API client
+// (rich messages, HTML fallback, files, callbacks) and the poller that turns
+// updates from the owner chat into normalized Events.
 //
-// Dependency direction: this package depends only on internal/domain (for the
-// Channel contract) and standard library HTTP. It never imports the scheduler
-// or storage packages.
+// Dependency direction: standard library only. It knows nothing about Pi, the
+// vault or a database; the bridge composes it.
 package telegram
 
 import (
@@ -68,14 +67,7 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// APIClient is the minimal Telegram Bot API surface the adapter needs. It is a
-// seam so tests can substitute a fake transport.
-type APIClient interface {
-	GetUpdates(ctx context.Context, offset int) ([]Update, error)
-	SendMessage(ctx context.Context, chatID int64, text string) error
-}
-
-// Client is an HTTP-backed APIClient for the Telegram Bot API.
+// Client is an HTTP-backed client for the subset of the Bot API the bridge uses.
 type Client struct {
 	token   string
 	baseURL string

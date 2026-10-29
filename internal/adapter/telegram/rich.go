@@ -31,6 +31,18 @@ var (
 	reLink    = regexp.MustCompile(`\[([^\]\n]+)\]\(([^)\s]+)\)`)
 )
 
+// escapeHTML escapes the five XML-significant characters so user-supplied text
+// can be safely embedded in Telegram HTML messages (<b>, <i>, etc.). It is the
+// first step of every HTML fallback: a model reply must never inject tags.
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
+}
+
 // RichFits reports whether markdown can be sent as a rich message without
 // exceeding Telegram's documented limits: 32768 UTF-8 characters, 500 blocks
 // (approximated by non-empty lines, the finest granularity available to us) and

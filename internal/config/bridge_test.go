@@ -14,7 +14,6 @@ func clearBridgeEnv(t *testing.T) {
 	for _, k := range []string{
 		"ALTER_TELEGRAM_API_BASE",
 		"ALTER_VAULT_DIR",
-		"ALTER_BRIDGE_ENABLED",
 		"ALTER_BRIDGE_WORKDIR",
 		"ALTER_BRIDGE_SESSION_ID",
 		"ALTER_BRIDGE_TOOLS",
@@ -43,9 +42,6 @@ func TestLoadBridgeDefaults(t *testing.T) {
 	// Pi works in $HOME, not in the vault: the bridge is the owner's shell.
 	if cfg.WorkDir != home {
 		t.Errorf("WorkDir = %q, want $HOME %q", cfg.WorkDir, home)
-	}
-	if cfg.BridgeEnabled {
-		t.Error("BridgeEnabled = true, want false by default")
 	}
 	if cfg.BridgeSessionID != "telegram" {
 		t.Errorf("BridgeSessionID = %q, want telegram", cfg.BridgeSessionID)
@@ -90,7 +86,6 @@ func TestLoadVaultDirFromEnv(t *testing.T) {
 
 func TestLoadBridgeFromEnv(t *testing.T) {
 	clearBridgeEnv(t)
-	t.Setenv("ALTER_BRIDGE_ENABLED", "true")
 	t.Setenv("ALTER_BRIDGE_SESSION_ID", "owner")
 	t.Setenv("ALTER_BRIDGE_TOOLS", "read,grep,save_note")
 	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", "/a/persona.md;/b/format.md")
@@ -98,9 +93,6 @@ func TestLoadBridgeFromEnv(t *testing.T) {
 	t.Setenv("ALTER_BRIDGE_TIMEOUT", "45s")
 
 	cfg := Load()
-	if !cfg.BridgeEnabled {
-		t.Error("BridgeEnabled = false, want true")
-	}
 	if cfg.BridgeSessionID != "owner" {
 		t.Errorf("BridgeSessionID = %q, want owner", cfg.BridgeSessionID)
 	}
@@ -121,15 +113,11 @@ func TestLoadBridgeFromEnv(t *testing.T) {
 
 func TestLoadBridgeMalformedFallsBack(t *testing.T) {
 	clearBridgeEnv(t)
-	t.Setenv("ALTER_BRIDGE_ENABLED", "yes-please")
 	t.Setenv("ALTER_BRIDGE_TIMEOUT", "soon")
 	t.Setenv("ALTER_BRIDGE_PROMPT_FILES", " ; /b.md ; ")
 	t.Setenv("ALTER_BRIDGE_EXTENSIONS", " ; ")
 
 	cfg := Load()
-	if cfg.BridgeEnabled {
-		t.Error("BridgeEnabled = true, want false on malformed env")
-	}
 	if cfg.BridgeTimeout != 300*time.Second {
 		t.Errorf("BridgeTimeout = %v, want 300s on malformed env", cfg.BridgeTimeout)
 	}
@@ -161,13 +149,13 @@ func TestLoadBridgeDefaultsSurviveOneSidedOverride(t *testing.T) {
 func TestLoadDotEnv(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".env")
-	body := "# comment\n\nTELEGRAM_TOKEN=from-file\nexport ALTER_DB_PATH=\"/tmp/x.db\"\nQUOTED='single'\nSPACED = padded \n"
+	body := "# comment\n\nTELEGRAM_TOKEN=from-file\nexport ALTER_BRIDGE_SESSION_ID=\"file-session\"\nQUOTED='single'\nSPACED = padded \n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
 
 	// A real environment value must win over the file.
-	t.Setenv("ALTER_DB_PATH", "/tmp/from-env")
+	t.Setenv("ALTER_BRIDGE_SESSION_ID", "from-env")
 	for _, k := range []string{"TELEGRAM_TOKEN", "QUOTED", "SPACED"} {
 		t.Setenv(k, "")
 	}
@@ -179,8 +167,8 @@ func TestLoadDotEnv(t *testing.T) {
 	if got := os.Getenv("TELEGRAM_TOKEN"); got != "from-file" {
 		t.Errorf("TELEGRAM_TOKEN = %q, want from-file", got)
 	}
-	if got := os.Getenv("ALTER_DB_PATH"); got != "/tmp/from-env" {
-		t.Errorf("ALTER_DB_PATH = %q, want /tmp/from-env (env must win)", got)
+	if got := os.Getenv("ALTER_BRIDGE_SESSION_ID"); got != "from-env" {
+		t.Errorf("ALTER_BRIDGE_SESSION_ID = %q, want from-env (env must win)", got)
 	}
 	if got := os.Getenv("QUOTED"); got != "single" {
 		t.Errorf("QUOTED = %q, want single", got)

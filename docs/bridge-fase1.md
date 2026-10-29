@@ -46,6 +46,28 @@ entrada de texto libre; Pi es el motor.
 - **Un solo chat.** Solo se atiende el chat del dueño (`TELEGRAM_CHAT_ID`); el
   resto de chats y de tipos de evento se ignoran.
 
+## Un solo runtime, sin base de datos
+
+El binario `alter` es una sola cosa: el puente Telegram ↔ Pi más el vault. No hay
+segunda ruta de entrada, ni SQLite, ni scheduler, ni búsqueda semántica; el
+registro de capacidades y el camino antiguo de comandos se han eliminado, no
+desactivado.
+
+- **Sin base de datos.** No se abre ningún fichero SQLite y `ALTER_DB_PATH` ya no
+existe: al arrancar no se crea nada en disco. `go.mod` no tiene dependencias
+externas.
+- **Sin trabajo programado.** El scheduler y sus servicios desaparecen con la base
+de datos. Tareas, recordatorios y eventos vivirán como notas markdown con
+frontmatter **en el vault**, y esa migración es un slice posterior: aquí no hay
+todavía esquema ni escritura de tareas.
+- **Un único camino de arranque.** `ALTER_BRIDGE_ENABLED` deja de ser un
+interruptor. Si sigue en el entorno con un valor que antes apagaba el bridge, el
+proceso escribe una línea diciendo que se ignora y arranca igual: el bridge no se
+puede desactivar porque no hay nada más.
+- **Arranque fail-closed.** Si falta `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` o alguno
+de los dos ficheros que Pi necesita, el proceso muere con un solo mensaje que
+nombra la variable a corregir.
+
 ## Variables de entorno
 
 Se leen del entorno y, antes, de `.env` en el directorio de trabajo: lo exportado
@@ -55,7 +77,7 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 |---|---|---|
 | `TELEGRAM_TOKEN` | — (obligatorio) | Token del bot. Sin él el proceso no arranca. |
 | `TELEGRAM_CHAT_ID` | — (obligatorio) | Chat del dueño: único destinatario y única fuente aceptada. |
-| `ALTER_BRIDGE_ENABLED` | `false` | `true` activa el bridge como **única** ruta de texto libre. |
+| `ALTER_BRIDGE_ENABLED` | ignorada | Ya no es un interruptor: el bridge es siempre el runtime. Un valor distinto de "true" produce una línea de aviso al arrancar y nada más. |
 | `ALTER_BRIDGE_SESSION_ID` | `telegram` | Sesión de Pi que se reanuda entre mensajes. |
 | `ALTER_BRIDGE_TOOLS` | vacío (sin `--tools`) | Allowlist **opcional** de `--tools`. Vacío no pasa el flag, así que Pi conserva su selección completa por defecto. Si lo rellenas, **reemplaza** la selección entera: nombra también `save_note`, `append_note`, `send_file` y `ask_options` o Pi no podrá usarlas. |
 | `ALTER_BRIDGE_PROMPT_FILES` | `alter-persona.md` | Ficheros markdown para `--append-system-prompt`, en orden. Separador `;`. |
@@ -67,7 +89,6 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `ALTER_PI_BIN` | `pi` | Binario de Pi. Un servicio (systemd/cron) casi siempre necesita ruta absoluta porque su `PATH` no incluye fnm. |
 | `ALTER_PI_PROVIDER` | vacío | `--provider`; vacío deja que Pi use su configuración. |
 | `ALTER_PI_MODEL` | vacío | `--model` (`provider/id[:thinking]`). |
-| `ALTER_DB_PATH` | `alter.db` | SQLite de tareas, triggers y eventos. |
 
 Las rutas de `ALTER_BRIDGE_PROMPT_FILES` y `ALTER_BRIDGE_EXTENSIONS` son
 **relativas al repositorio**, así que arrancar desde la raíz del repositorio
@@ -81,7 +102,6 @@ en `$HOME`, donde no existen.
 ```bash
 cd /ruta/al/alter
 # .env con TELEGRAM_TOKEN y TELEGRAM_CHAT_ID, o exportados en la shell
-ALTER_BRIDGE_ENABLED=true \
 ALTER_PI_BIN="$HOME/.local/opt/fnm/.../bin/pi" \
 ALTER_PI_PROVIDER=anthropic \
 ALTER_PI_MODEL='claude-sonnet-4-5' \
@@ -95,10 +115,10 @@ go build -o alter ./cmd/alter
 ./alter
 ```
 
-Al arrancar se ve en el log qué ruta de texto libre está activa
-(`inbound free text = Telegram <-> Pi bridge`). El Scheduler sigue corriendo en
-paralelo; `ALTER_PI_ENABLED` decide si sus notificaciones las redacta Pi o el
-mensaje plano de Telegram.
+Al arrancar se ve en el log el único runtime que existe
+(`runtime: alter 0.1.0 started (vault=…, workdir=…, session=…)`). No hay nada más
+corriendo en paralelo: sin base de datos y sin scheduler, el proceso solo atiende
+el chat del dueño.
 
 **Guardia de arranque.** Con el bridge activo, antes de levantar el servidor de
 tools y antes de poder lanzar Pi, se verifica que cada fichero de
@@ -111,8 +131,9 @@ runtime: bridge: extension "internal/tools/extension/index.ts" is not readable (
 ```
 
 Es deliberado: sin la extensión Pi arranca igual y contesta, pero no puede escribir
-nada. Ese fallo silencioso es peor que no arrancar. Con el bridge desactivado no se
-comprueba nada: el camino antiguo no tiene ficheros que cargar.
+nada. Ese fallo silencioso es peor que no arrancar. La guardia corre siempre: el
+bridge es el único camino que queda, así que no hay un modo en el que no haya
+ficheros que cargar.
 
 ## Los dos ficheros que Pi necesita
 
@@ -196,9 +217,9 @@ chat ID.
 
 ## Limitaciones conocidas
 
-- **Los comandos con barra ya no se atienden.** Con `ALTER_BRIDGE_ENABLED=true` el
-  adaptador de comandos (`/recordar`, `/tareas`, ayuda…) no se cablea: el bridge es
-  la única ruta de entrada. Si necesitas comandos, arranca sin bridge.
+- **Los comandos con barra ya no se atienden.** El adaptador de comandos
+  (`/recordar`, `/tareas`, ayuda…) se eliminó junto con el runtime de base de
+datos: todo texto libre va a Pi y no hay forma de volver atrás.
 - **Una sola pregunta pendiente.** Solo puede haber un `ask_options` en vuelo; una
   segunda pregunta simultánea devuelve error en vez de encolarse, porque el dueño
   solo puede contestar la que está mirando. Sin respuesta en 10 minutos, la tool

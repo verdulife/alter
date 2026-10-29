@@ -128,21 +128,6 @@ func TestBridgeStartupAcceptsConfiguredAssets(t *testing.T) {
 	}
 }
 
-// TestBridgeStartupSkipsAssetCheckWhenDisabled pins the other half of the guard:
-// a runtime that is not a bridge must not care about bridge assets.
-func TestBridgeStartupSkipsAssetCheckWhenDisabled(t *testing.T) {
-	dir := t.TempDir()
-	cfg := smokeConfig(dir, []string{filepath.Join(dir, "no-existe.md")}, []string{filepath.Join(dir, "no-existe.ts")})
-	cfg.BridgeEnabled = false
-
-	rt, err := newBridgeRuntime(cfg, discardLogger(),
-		withBridgeCommandFactory(fakePiFactory(&argsRecorder{})))
-	if err != nil {
-		t.Fatalf("newBridgeRuntime: %v, want no asset check outside bridge mode", err)
-	}
-	closeRuntime(rt)
-}
-
 // smokeConfig is the bridge configuration the start-up guard tests compose: a
 // complete Telegram setup whose assets are whatever the case under test needs.
 func smokeConfig(vaultDir string, prompts, exts []string) config.Config {
@@ -151,7 +136,6 @@ func smokeConfig(vaultDir string, prompts, exts []string) config.Config {
 		TelegramChatID:    testOwnerID,
 		TelegramAPIBase:   "http://127.0.0.1:9",
 		VaultDir:          vaultDir,
-		BridgeEnabled:     true,
 		BridgeSessionID:   "smoke-session",
 		BridgeTools:       bridgeToolsAllowlist,
 		BridgePromptFiles: prompts,
