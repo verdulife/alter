@@ -715,8 +715,11 @@ type Rule = { reason: string; detail: string };
 
 /**
  * Programs that ask without reading their arguments: deleting, truncating,
- * changing permissions or ownership, killing processes, touching services, or
- * changing package and scheduled-work state.
+ * changing permissions or ownership, stopping a service, or installing a package.
+ * The programs whose verdict depends on the subcommand they are given, or on the
+ * program they run (`systemctl`, `apt`, `dpkg`, `crontab`, `kill`, `find`), have
+ * their own reader further down: each one allows an explicit list of reads and
+ * keeps asking for everything it does not recognise.
  */
 const ASK_PROGRAMS: Record<string, Rule> = {
 	rm: { reason: REASON_DELETE_FILES, detail: "rm borra archivos" },
@@ -733,22 +736,15 @@ const ASK_PROGRAMS: Record<string, Rule> = {
 	chown: { reason: REASON_PERMISSIONS, detail: "chown cambia el dueño de un archivo" },
 	chgrp: { reason: REASON_PERMISSIONS, detail: "chgrp cambia el grupo de un archivo" },
 	chattr: { reason: "Va a cambiar atributos de archivos.", detail: "chattr cambia atributos del sistema de archivos" },
-	kill: { reason: REASON_SYSTEM_STATE, detail: "kill mata procesos" },
 	pkill: { reason: REASON_SYSTEM_STATE, detail: "pkill mata procesos" },
 	killall: { reason: REASON_SYSTEM_STATE, detail: "killall mata procesos" },
-	systemctl: { reason: REASON_SYSTEM_STATE, detail: "systemctl cambia servicios del sistema" },
 	service: { reason: REASON_SYSTEM_STATE, detail: "service cambia servicios del sistema" },
 	shutdown: { reason: REASON_SYSTEM_STATE, detail: "shutdown apaga el sistema" },
 	reboot: { reason: REASON_SYSTEM_STATE, detail: "reboot reinicia el sistema" },
 	poweroff: { reason: REASON_SYSTEM_STATE, detail: "poweroff apaga el sistema" },
 	halt: { reason: REASON_SYSTEM_STATE, detail: "halt detiene el sistema" },
-	apt: { reason: REASON_INSTALL, detail: "apt instala o quita paquetes del sistema" },
-	"apt-get": { reason: REASON_INSTALL, detail: "apt-get instala o quita paquetes del sistema" },
-	aptitude: { reason: REASON_INSTALL, detail: "aptitude instala o quita paquetes del sistema" },
-	dpkg: { reason: REASON_INSTALL, detail: "dpkg cambia paquetes del sistema" },
 	brew: { reason: REASON_INSTALL, detail: "brew instala o quita paquetes" },
 	snap: { reason: REASON_INSTALL, detail: "snap instala o quita paquetes" },
-	crontab: { reason: REASON_SCHEDULE, detail: "crontab programa trabajo automático" },
 };
 
 /** Package managers whose `-g`/`--global` install reaches outside the project. */
@@ -960,17 +956,273 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	}
 	if (program === "cargo" && args.includes("install")) return ask(REASON_INSTALL, "cargo install instala un binario");
 
-	if (program === "find") {
-		const deletesOrRuns = args.some((argument) =>
-			["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"].includes(argument),
-		);
-		if (deletesOrRuns) return ask(REASON_DELETE_FILES, "find borra o ejecuta comandos");
-		return allow();
-	}
+	if (program === "systemctl") return classifySystemctl(args);
+	if (program === "apt" || program === "apt-get" || program === "aptitude") return classifyApt(program, args);
+	if (program === "dpkg") return classifyDpkg(args);
+	if (program === "crontab") return classifyCrontab(args);
+	if (program === "kill") return classifyKill(args);
+	if (program === "find") return classifyFind(args);
 
 	if (program === "mv") return classifyMove(args, cwd);
 
 	return allow();
+}
+
+/**
+ * First operand of a program whose flags may come before its subcommand. The
+ * flags are skipped, and so is the value of the ones that take one, so
+ * `apt-get -y install x` still reveals `install` and `systemctl --user status x`
+ * still reveals `status` instead of stopping at the flag. Null when the arguments
+ * carry no operand at all.
+ */
+function firstOperand(args: string[], valueFlags: Set<string>): string | null {
+	const rest = [...args];
+	while (rest.length > 0 && rest[0].startsWith("-")) {
+		const flag = rest.shift() as string;
+		if (valueFlags.has(flag)) rest.shift();
+	}
+	return rest[0] ?? null;
+}
+
+/**
+ * Programs whose run leaves the machine as it was: the closed allowlist `find` may
+ * execute through `-exec`/`-execdir`/`-ok`/`-okdir` without asking. Anything else
+ * (`rm`, `mv`, `chmod`, a shell, a script of its own) keeps asking, and so does an
+ * empty program, which is a line this reader cannot decide.
+ */
+const FIND_READ_ONLY_PROGRAMS = new Set(["ls", "cat", "grep", "stat", "file", "wc", "head", "tail", "du", "echo"]);
+
+/** `find` predicates that run another program. */
+const FIND_EXEC_FLAGS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/** `find` predicates that destroy a match or write a file of their own. */
+const FIND_WRITE_FLAGS = new Set(["-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]);
+
+/**
+ * Verdict for `find`.
+ *
+ * `-exec`, `-execdir`, `-ok` and `-okdir` run a program the gate never sees as a
+ * program of its own, so the verdict is read from the program that follows the
+ * predicate: a read-only one is a read, and everything else keeps the ask that
+ * `find` always had. That is what makes `find . -name '*.go' -exec ls -l {} +`
+ * pass while `find . -name x -exec rm {} \;` still asks. `-delete` and the
+ * predicates that write a file keep asking unconditionally.
+ */
+function classifyFind(args: string[]): Verdict {
+	let index = 0;
+	while (index < args.length) {
+		const argument = args[index];
+		if (FIND_WRITE_FLAGS.has(argument)) {
+			return ask(REASON_DELETE_FILES, `find ${argument} borra o escribe archivos`);
+		}
+		if (!FIND_EXEC_FLAGS.has(argument)) {
+			index += 1;
+			continue;
+		}
+		// The program is the word right after the predicate, so a path form
+		// (`/bin/ls`) is compared by its name, exactly as `programOf` does.
+		const program = basename(args[index + 1] ?? "");
+		if (!FIND_READ_ONLY_PROGRAMS.has(program)) {
+			return ask(REASON_DELETE_FILES, `find ${argument} ejecuta ${program || "un programa que no puedo leer"}`);
+		}
+		// Skip the rest of the predicate up to its `;` or `+` and keep reading: one
+		// line can carry several `-exec` predicates and every one of them runs.
+		index += 2;
+		while (index < args.length && args[index] !== ";" && args[index] !== "+") index += 1;
+		index += 1;
+	}
+	return allow();
+}
+
+/** `systemctl` flags that take a value, so the value is not read as the subcommand. */
+const SYSTEMCTL_VALUE_FLAGS = new Set([
+	"-H",
+	"--host",
+	"-M",
+	"--machine",
+	"-p",
+	"--property",
+	"-t",
+	"--type",
+	"--state",
+	"-n",
+	"--lines",
+	"-o",
+	"--output",
+	"-s",
+	"--signal",
+	"--kill-whom",
+	"--root",
+	"--job-mode",
+	"-E",
+	"--environment",
+]);
+
+/** `systemctl` subcommands that only report the state of the system. */
+const SYSTEMCTL_READ_SUBCOMMANDS = new Set([
+	"status",
+	"is-active",
+	"is-enabled",
+	"is-failed",
+	"is-system-running",
+	"show",
+	"cat",
+	"help",
+	"list-units",
+	"list-unit-files",
+	"list-timers",
+	"list-sockets",
+	"list-jobs",
+	"list-dependencies",
+	"list-sessions",
+	"list-machines",
+]);
+
+/**
+ * Verdict for `systemctl`: the subcommand decides, not the program. `status`,
+ * `is-active`, `list-units` and the rest of the read list only report, while
+ * `start`, `stop`, `restart`, `enable`, `mask`, `daemon-reload` and everything else
+ * change the system and keep asking.
+ */
+function classifySystemctl(args: string[]): Verdict {
+	const subcommand = firstOperand(args, SYSTEMCTL_VALUE_FLAGS);
+	if (subcommand === null) {
+		// Only the version banner is a read on its own. A bare `systemctl` lists units
+		// too, but with no subcommand there is nothing the allowlist can be applied to.
+		if (args.includes("--version")) return allow();
+		return ask(REASON_SYSTEM_STATE, "systemctl sin subcomando: no reconozco la operación");
+	}
+	if (SYSTEMCTL_READ_SUBCOMMANDS.has(subcommand)) return allow();
+	return ask(REASON_SYSTEM_STATE, `systemctl ${subcommand} cambia servicios del sistema`);
+}
+
+/** `apt`/`apt-get` flags that take a value, so `-o X=1` does not hide the subcommand. */
+const APT_VALUE_FLAGS = new Set(["-o", "--option", "-t", "--target-release", "-c", "--config-file", "-a", "--host-architecture"]);
+
+/** `apt` subcommands that only read the package index. */
+const APT_READ_SUBCOMMANDS = new Set([
+	"list",
+	"search",
+	"show",
+	"policy",
+	"showpkg",
+	"showsrc",
+	"depends",
+	"rdepends",
+	"changelog",
+	"version",
+]);
+
+/**
+ * Verdict for `apt`/`apt-get`/`aptitude`: only the subcommands that read the index
+ * run unasked. `install`, `remove`, `purge`, `upgrade`, `dist-upgrade`,
+ * `autoremove`, `clean` and anything unrecognised keep asking, and the flags before
+ * the subcommand (`apt-get -y install x`) never hide it.
+ */
+function classifyApt(program: string, args: string[]): Verdict {
+	const subcommand = firstOperand(args, APT_VALUE_FLAGS);
+	if (subcommand !== null && APT_READ_SUBCOMMANDS.has(subcommand)) return allow();
+	const detail =
+		subcommand === null
+			? `${program} sin subcomando: no reconozco la operación`
+			: `${program} ${subcommand} instala o quita paquetes del sistema`;
+	return ask(REASON_INSTALL, detail);
+}
+
+/** `dpkg` actions that only read the database or the contents of a package file. */
+const DPKG_READ_ACTIONS = new Set([
+	"-l",
+	"--list",
+	"-L",
+	"--listfiles",
+	"-s",
+	"--status",
+	"-S",
+	"--search",
+	"-p",
+	"--print-avail",
+	"-c",
+	"--contents",
+	"-I",
+	"--info",
+	"--get-selections",
+	"--print-architecture",
+	"--version",
+	"--help",
+]);
+
+/** Letters a read-only `dpkg` short cluster may carry (`-l`, `-L`, `-s`, `-S`, `-p`, `-c`). */
+const DPKG_READ_LETTERS = new Set(["l", "L", "s", "S", "p", "c"]);
+
+/**
+ * Verdict for `dpkg`: the action is a flag, so it is read as one. `-l`/`--list`,
+ * `-L`/`--listfiles`, `-s`/`--status` and the other reads run unasked; `-i`, `-r`,
+ * `-P`, `--configure` and anything unrecognised keep asking.
+ */
+function classifyDpkg(args: string[]): Verdict {
+	const action = args.find((argument) => argument.startsWith("-"));
+	if (action !== undefined) {
+		if (DPKG_READ_ACTIONS.has(action)) return allow();
+		const letters = shortFlagLetters(action);
+		if (letters !== null && letters.every((letter) => DPKG_READ_LETTERS.has(letter))) return allow();
+	}
+	const detail = action === undefined ? "dpkg sin acción: no reconozco la operación" : `dpkg ${action} cambia paquetes del sistema`;
+	return ask(REASON_INSTALL, detail);
+}
+
+/** Letters of a short flag cluster (`-lL` → `["l", "L"]`), or null when it is not one. */
+function shortFlagLetters(argument: string): string[] | null {
+	if (!/^-[A-Za-z]+$/.test(argument)) return null;
+	return Array.from(argument.slice(1));
+}
+
+/**
+ * Verdict for `crontab`: `-l` lists the current table and changes nothing, so it is
+ * the only form that runs unasked. `-e` opens the editor, `-r` removes the table and
+ * a file argument replaces it, so all three keep asking.
+ */
+function classifyCrontab(args: string[]): Verdict {
+	let lists = false;
+	let changes = false;
+	for (let index = 0; index < args.length; index += 1) {
+		const argument = args[index];
+		if (argument === "-u" || argument === "--user") {
+			index += 1; // the table the operation applies to is not the operation
+			continue;
+		}
+		if (argument === "--list") {
+			lists = true;
+			continue;
+		}
+		const letters = argument.startsWith("-") ? shortFlagLetters(argument) : null;
+		if (letters === null) {
+			// A file argument replaces the table, and a long flag I do not know could
+			// be anything: both keep asking.
+			changes = true;
+			continue;
+		}
+		for (const letter of letters) {
+			if (letter === "l") lists = true;
+			else changes = true; // `e`, `r`, `i` and anything the allowlist does not name
+		}
+	}
+	if (lists && !changes) return allow();
+	return ask(REASON_SCHEDULE, "crontab cambia o reemplaza tareas programadas");
+}
+
+/**
+ * Verdict for `kill`: `-l` lists signal names and `-0` (or `-s 0`) only probes
+ * whether a process exists, so both are reads. Any other flag or a bare operand
+ * sends a real signal, which changes system state and keeps asking. `pkill` and
+ * `killall` are untouched: they have no probe form here.
+ */
+function classifyKill(args: string[]): Verdict {
+	const first = args[0];
+	if (first === undefined) return ask(REASON_SYSTEM_STATE, "kill sin argumentos: no reconozco la operación");
+	if (first === "-l" || first === "--list" || first === "-L" || first === "--table" || first === "-0") return allow();
+	// `kill -s 0 pid` and `kill -n 0 pid` probe exactly like `kill -0 pid`.
+	if ((first === "-s" || first === "--signal" || first === "-n") && (args[1] ?? "") === "0") return allow();
+	return ask(REASON_SYSTEM_STATE, "kill envía una señal a procesos");
 }
 
 /** Verdict for `mv`: moving onto an existing file overwrites it without asking. */

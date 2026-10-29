@@ -87,18 +87,21 @@ Qué pide `bash`, sobre el comando entero y no solo sobre su primera palabra
 igual que `git push`):
 
 - borrar o truncar: `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`, `mkfs`,
-  `find -delete`/`-exec`;
+  `find -delete`, y `find -exec`/`-ok` salvo cuando el programa ejecutado es de
+  lectura (`ls`, `cat`, `grep`, `stat`…);
 - sobrescribir por redirección: `>` sobre un archivo que ya existe, y `>` o `>>`
   sobre una ruta sensible (`~/.ssh`, `~/.bashrc`, los arranques de shell, `/etc`,
   `/usr`…). `>>` añade y no destruye, así que solo pregunta por esas rutas; una
   ruta con variables (`$HOME/…`) no se puede resolver y también pregunta;
 - `mv` cuyo destino ya existe;
 - permisos y propiedad: `chmod`, `chown`, `chgrp`, `chattr`;
-- procesos y servicios: `kill`, `pkill`, `killall`, `systemctl`, `service`,
-  `shutdown`, `reboot`, `poweroff`;
+- procesos y servicios: `kill`, `pkill`, `killall`, `service`, `systemctl`,
+  `shutdown`, `reboot`, `poweroff`. Las consultas no preguntan: `kill -0`,
+  `kill -l`, `systemctl status`/`is-active`/`list-units`/`show`/`cat`;
 - la puerta de atrás de los privilegios: `sudo`, `doas`;
 - estado del sistema y paquetes: `apt`, `apt-get`, `dpkg`, `brew`, `snap`,
-  `npm i -g`, `pip install`, `cargo install`, `crontab`;
+  `npm i -g`, `pip install`, `cargo install`, `crontab`. Consultar no pregunta:
+  `apt list`/`search`/`show`/`policy`, `dpkg -l`/`-L`/`-s`, `crontab -l`;
 - git que publica o reescribe: `push`, `reset --hard`, `clean -f`, `rebase`,
   `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
   `stash drop`, `filter-branch`;

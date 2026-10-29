@@ -291,6 +291,46 @@ const cases = [
 	{ label: "cargo install", ...bash("cargo install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
 	{ label: "crontab", ...bash("crontab -r"), expect: "ask", reason: "Va a programar una tarea automática." },
 
+	// --- bash: lecturas que antes preguntaban ---------------------------
+	// La puerta está para lo que destruye, publica o escala, y estos cinco grupos
+	// son de solo lectura pero lo bastante frecuentes como para reconstruir el
+	// peaje. Se permiten solo por lista cerrada: el programa o el subcomando tiene
+	// que estar en ella, y todo lo que no esté sigue preguntando.
+	{ label: "find -exec ls +", ...bash("find . -name '*.go' -exec ls -l {} +"), expect: "allow" },
+	{ label: "find -exec grep cerrado con ;", ...bash("find . -name '*.go' -exec grep -l x {} \\;"), expect: "allow" },
+	{ label: "find -ok stat", ...bash("find . -type f -ok stat {} \\;"), expect: "allow" },
+	{ label: "find -exec rm", ...bash("find . -name x -exec rm {} \\;"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "find -execdir chmod", ...bash("find . -name x -execdir chmod 777 {} +"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "find -exec sh", ...bash("find . -name x -exec sh -c 'rm x' {} \\;"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "systemctl --user status", ...bash("systemctl --user status alter.service"), expect: "allow" },
+	{ label: "systemctl --no-pager list-units", ...bash("systemctl --no-pager list-units"), expect: "allow" },
+	{ label: "systemctl is-active", ...bash("systemctl is-active alter.service"), expect: "allow" },
+	{ label: "systemctl --version", ...bash("systemctl --version"), expect: "allow" },
+	{ label: "systemctl --user start", ...bash("systemctl --user start alter.service"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "systemctl daemon-reload", ...bash("systemctl daemon-reload"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "crontab -l", ...bash("crontab -l"), expect: "allow" },
+	{ label: "crontab -u root -l", ...bash("crontab -u root -l"), expect: "allow" },
+	{ label: "crontab -e", ...bash("crontab -e"), expect: "ask", reason: "Va a programar una tarea automática." },
+	{ label: "crontab con archivo", ...bash("crontab tareas.txt"), expect: "ask", reason: "Va a programar una tarea automática." },
+	{ label: "apt list", ...bash("apt list --installed"), expect: "allow" },
+	{ label: "apt search", ...bash("apt search ripgrep"), expect: "allow" },
+	{ label: "apt show", ...bash("apt show alter"), expect: "allow" },
+	{ label: "apt-get policy", ...bash("apt-get policy x"), expect: "allow" },
+	{ label: "apt-get -y install", ...bash("apt-get -y install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "apt-get -o ... remove", ...bash("apt-get -o Debug::NoLocking=1 remove x"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "apt-get dist-upgrade", ...bash("apt-get dist-upgrade"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "dpkg -l", ...bash("dpkg -l"), expect: "allow" },
+	{ label: "dpkg -L con paquete", ...bash("dpkg -L alter"), expect: "allow" },
+	{ label: "dpkg --list", ...bash("dpkg --list"), expect: "allow" },
+	{ label: "dpkg -s", ...bash("dpkg -s alter"), expect: "allow" },
+	{ label: "dpkg -i", ...bash("dpkg -i x.deb"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "kill -0 como sonda", ...bash("kill -0 123"), expect: "allow" },
+	{ label: "kill -l", ...bash("kill -l"), expect: "allow" },
+	{ label: "kill -s 0", ...bash("kill -s 0 123"), expect: "allow" },
+	{ label: "kill -9", ...bash("kill -9 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "kill -s TERM", ...bash("kill -s TERM 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "pkill", ...bash("pkill node"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+
 	// --- bash: git that publishes or rewrites --------------------------
 	{ label: "git push", ...bash("git push"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
 	{ label: "git -C x push --force", ...bash("git -C x push --force"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
