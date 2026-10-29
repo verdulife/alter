@@ -1,24 +1,29 @@
 /**
  * Pi extension: Alter's identity block, the approval gate for destructive tools
- * and the four deterministic Alter tools (S7, T12 and T13 of the phase-1 Telegram
- * bridge).
+ * and the two deterministic Alter tools (S7, T12, T13 and T17 of the phase-1
+ * Telegram bridge).
  *
  * The gate intercepts `tool_call`: `bash`, `write` and `edit` ask the owner before
- * they run, the read-only tools and the four Alter tools never do, and everything
+ * they run, the read-only tools and the two Alter tools never do, and everything
  * else is asked about too. The question is `ctx.ui.confirm()`, which in RPC mode
  * the bridge turns into two Telegram buttons; no answer means blocked.
  *
- * The four tools forward every vault mutation and every message to the owner to
- * the bridge's loopback tools server:
+ * The two tools exist for what Pi's own toolset cannot reach, not as a second way
+ * to do what it already does: they deliver a vault file to the owner's chat and
+ * ask the owner to choose between options. Everything else, writing the vault
+ * included, goes through Pi's own `bash`, `read`, `write`, `edit`, `grep`, `find`
+ * and `ls`, so there is no note-writing tool here (T17).
+ *
+ * The two tools POST to the bridge's loopback tools server, which they find
+ * through two variables:
  *
  *   ALTER_TOOLS_URL    base URL, for example http://127.0.0.1:43117
  *   ALTER_TOOLS_TOKEN  per-process secret sent as the X-Alter-Token header
  *
- * Both variables are set by the bridge in Pi's environment; the model never
- * chooses them and never sees the token. They are additive on top of Pi's own
- * tools: the bridge no longer restricts the toolset (S7), so `bash`, `read`,
- * `write`, `edit`, `grep`, `find`, `ls` and whatever the loaded packages provide
- * are still there.
+ * Both are set by the bridge in Pi's environment; the model never chooses them
+ * and never sees the token. They are additive on top of Pi's own tools: the
+ * bridge does not restrict the toolset (S7), so `bash`, `read`, `write`, `edit`,
+ * `grep`, `find`, `ls` and whatever the loaded packages provide are still there.
  *
  * The extension is loaded by the bridge with `-e`, next to the persona file that
  * `--append-system-prompt` injects.
@@ -48,47 +53,6 @@ type ToolResult = {
  * `parameters` expect a TypeBox `TSchema` and this file must not import TypeBox;
  * the server is the authority that validates the payload.
  */
-const SAVE_NOTE_PARAMETERS: any = {
-	type: "object",
-	properties: {
-		title: {
-			type: "string",
-			description: "Título de la nota. Se convierte en el H1 y en el nombre del archivo; no admite '/' ni '..'.",
-		},
-		body: {
-			type: "string",
-			description: "Cuerpo en markdown, sin el H1 (el frontmatter y el título los añade el vault).",
-		},
-		folder: {
-			type: "string",
-			description: "Carpeta destino relativa al vault, por ejemplo 'alter'. Vacío = raíz del vault.",
-		},
-		tags: {
-			type: "array",
-			items: { type: "string" },
-			description: "Etiquetas opcionales para el frontmatter YAML.",
-		},
-	},
-	required: ["title", "body"],
-	additionalProperties: false,
-};
-
-const APPEND_NOTE_PARAMETERS: any = {
-	type: "object",
-	properties: {
-		note: {
-			type: "string",
-			description: "Ruta de una nota existente, relativa al vault, por ejemplo 'alter/ideas.md'.",
-		},
-		line: {
-			type: "string",
-			description: "Línea markdown que se añade al final de la nota.",
-		},
-	},
-	required: ["note", "line"],
-	additionalProperties: false,
-};
-
 const SEND_FILE_PARAMETERS: any = {
 	type: "object",
 	properties: {
@@ -138,7 +102,7 @@ const APPROVAL_REQUIRED = new Set(["bash", "write", "edit"]);
 
 /**
  * Tools that never need approval: the read-only built-ins, which cannot change
- * anything, and the four deterministic Alter tools, which the bridge validates
+ * anything, and the two deterministic Alter tools, which the bridge validates
  * against the vault and the owner chat on its own.
  */
 const APPROVAL_FREE = new Set([
@@ -146,8 +110,6 @@ const APPROVAL_FREE = new Set([
 	"grep",
 	"find",
 	"ls",
-	"save_note",
-	"append_note",
 	"send_file",
 	"ask_options",
 ]);
@@ -369,40 +331,6 @@ export default function alterTools(pi: ExtensionAPI): void {
 			};
 		}
 		return undefined;
-	});
-
-	pi.registerTool({
-		name: "save_note",
-		label: "Guardar nota",
-		description:
-			"Guarda una nota markdown nueva en el vault del dueño y devuelve su ruta relativa. El vault añade el frontmatter YAML (title, tags, date) y el H1 con el título.",
-		parameters: SAVE_NOTE_PARAMETERS,
-		async execute(_toolCallId, params, signal) {
-			const payload: Json = { title: params.title, body: params.body };
-			if (params.folder) payload.folder = params.folder;
-			if (Array.isArray(params.tags) && params.tags.length > 0) payload.tags = params.tags;
-
-			const reply = await callTools("save_note", payload, signal);
-			if (!reply.ok) return failed(reply.error);
-
-			const path = text(reply.data, "path");
-			return ok(`Nota guardada en el vault: ${path}`, { path });
-		},
-	});
-
-	pi.registerTool({
-		name: "append_note",
-		label: "Añadir línea",
-		description:
-			"Añade una línea al final de una nota que ya existe en el vault. Si la nota no existe o la ruta sale del vault, falla y no crea nada.",
-		parameters: APPEND_NOTE_PARAMETERS,
-		async execute(_toolCallId, params, signal) {
-			const reply = await callTools("append_note", { note: params.note, line: params.line }, signal);
-			if (!reply.ok) return failed(reply.error);
-
-			const path = text(reply.data, "path");
-			return ok(`Línea añadida a ${path}`, { path });
-		},
 	});
 
 	pi.registerTool({

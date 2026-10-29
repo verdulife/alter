@@ -29,9 +29,15 @@ error: un agente sin `bash` no es un agente contenido, es un agente inútil.
 ## Capacidades
 
 Tiene exactamente las herramientas de una sesión de terminal: `bash`, `edit`,
-`write`, `read`, `grep`, `find`, `ls`, más las cuatro deterministas de Alter
-(`save_note`, `append_note`, `send_file`, `ask_options`) y las que aporten los
-paquetes cargados (memoria, web, subagentes).
+`write`, `read`, `grep`, `find`, `ls`, más las que aporten los paquetes cargados
+(memoria, web, subagentes).
+
+Solo dos tools son propias de Alter, y lo son porque una terminal no puede
+hacerlo: `send_file`, para mandarte un archivo del vault, y `ask_options`, para
+preguntarte con botones. El vault no tiene vía propia de escritura: Pi lo escribe
+con `write` y `edit`, como cualquier otro directorio. Una segunda forma de
+escribir los mismos archivos no añadía capacidad, solo un contrato más que
+mantener y una ruta más que contener.
 
 Carga la configuración global de Pi: gentle-pi, gentle-engram, pi-btw,
 pi-web-access y sus skills. No hay "carga limpia".
@@ -80,8 +86,8 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
    un contenido que Pi lea (`fetch_content`, un PDF, un archivo del usuario)
    podría intentar dirigir sus herramientas. El gate de confirmación es la
    defensa principal, no la única: conviene revisar qué se aprueba.
-5. **TOCTOU en el vault**: la contención de rutas se comprueba y luego se
-   escribe. Con `bash` disponible, esa defensa deja de ser una frontera real.
+5. **TOCTOU en el vault**: la contención de rutas de `send_file` se comprueba y
+   luego se lee. Con `bash` disponible, esa defensa deja de ser una frontera real.
 
 ## Lo que Alter no hace
 
@@ -110,6 +116,13 @@ Quedan tres cambios, en este orden:
    confirmación y la entrega al bridge; el bridge convierte cada
    `extension_ui_request` de tipo `confirm`/`select` en botones y responde con la
    pulsación o con `cancelled`.
+
+Y una corrección de alcance, **T17**: con `bash`, `write` y `edit` disponibles,
+`save_note` y `append_note` eran una segunda forma de escribir los mismos
+archivos. Se retiran. Quedan dos tools deterministas, `send_file` y
+`ask_options`, porque son lo único que Pi no puede hacer por sí mismo. El vault
+sigue siendo el almacén: lo escribe Pi, y la contención de rutas sigue viva donde
+importa, en la única tool que lee del vault por nombre.
 
 Y uno que no es diseño, sino despliegue: **T14 — Sustituir el servicio**. El
 `alter.service` actual ejecuta un binario del 16 de octubre. Mientras siga vivo,

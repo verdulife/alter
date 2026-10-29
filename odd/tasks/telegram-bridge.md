@@ -284,3 +284,22 @@ hallazgos que sí exigen trabajo:
    el deadline; y si la extensión no carga, el gate desaparece sin más que un log.
 
 Ninguno bloquea el código de T13; los tres se cierran antes de T14.
+
+**L18** (T17, superficie de tools). Se retiran `save_note` y `append_note`: con
+`write`/`edit` eran una segunda vía de escritura del mismo archivo. Quedan
+`send_file` y `ask_options`, las dos únicas que un shell no puede suplir.
+
+Pérdida declarada: el caso "directorio symlinkeado + hoja que aún no existe" ya no
+es alcanzable desde ningún endpoint, porque `send_file` exige un fichero existente
+y nada de este paquete crea hojas. La lógica de contención es la misma; lo que
+desaparece es su única ruta pública. El caso equivalente con la hoja existente
+sigue probado.
+
+**L19** (decisión de skills y directorio, 2026-10-29). Las skills no pueden ser
+globales: estarían disponibles en sesiones ajenas a Alter. Y no deben cargarse
+siempre: eso gasta contexto en cada petición. Solución: el directorio de trabajo
+de Pi pasa a ser el repositorio, y las skills viven en `.agents/skills/` del
+proyecto, que Pi descubre desde el cwd hacia arriba parando en la raíz del repo.
+Solo existen para Alter, están versionadas y su contenido no entra en contexto
+hasta que el modelo las invoca. El acceso a todo el sistema no se pierde: `bash`
+trabaja con rutas absolutas y el vault sigue en `$HOME/vault`.

@@ -68,7 +68,9 @@ const (
 // bridgeAsset is one file Pi needs before the bridge can start: a markdown file
 // appended to its system prompt, or an extension it must load. Both are silent
 // failures when absent — Pi would answer with no persona and, worse, with no
-// write tools at all — so start-up verifies them instead of trusting the paths.
+// `send_file` and no `ask_options`, so the chat could neither receive a vault
+// file nor answer a question with buttons — so start-up verifies them instead of
+// trusting the paths.
 type bridgeAsset struct {
 	// kind is the human name of the asset in the error line.
 	kind string
@@ -140,9 +142,10 @@ type bridgeRuntime struct {
 	poller *telegram.Poller
 	tools  *tools.Server
 	sess   *bridge.Session
-	// store is the vault both Pi and the tools server write through. Inbound
-	// attachments land in it, so it is the only place that decides a stored
-	// name or a size limit.
+	// store is the vault inbound attachments land in, so it is the only place
+	// that decides a stored name or a size limit. Pi writes it with its own
+	// `write`/`edit`, and the tools server only reads the root to keep `send_file`
+	// inside it.
 	store *vault.Store
 	// inboundMax is the inbound attachment ceiling, shared by the pre-download
 	// check and the store so both enforce the same number.
@@ -212,9 +215,10 @@ func withInboundFileLimit(max int64) bridgeRuntimeOption {
 func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRuntimeOption) (*bridgeRuntime, error) {
 	// Start-up guard (T10): Pi's persona and, above all, its tools extension must
 	// exist before anything is composed. A missing extension would leave the
-	// bridge answering while Pi cannot write anything — a silent, confusing
-	// failure — so refuse to start and say which path is wrong. The bridge is the
-	// only runtime, so the guard always runs.
+	// bridge answering while Pi can neither send a vault file nor ask a question
+	// with buttons — a silent, confusing failure — so refuse to start and say
+	// which path is wrong. The bridge is the only runtime, so the guard always
+	// runs.
 	if err := verifyBridgeAssets(cfg); err != nil {
 		return nil, err
 	}
@@ -224,8 +228,10 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		opt(r)
 	}
 
-	// S6: every note and attachment write goes through the vault store rooted at
-	// the configured vault. The vault is only the store: Pi's cwd is WorkDir.
+	// S6: inbound attachments are written through the vault store rooted at the
+	// configured vault, and the tools server is given that same root so
+	// `send_file` can refuse any path that leaves it. Pi writes the vault with its
+	// own tools; the vault is only the store, Pi's cwd is WorkDir.
 	store := vault.New(cfg.VaultDir, r.inboundMax)
 
 	client := telegram.NewClientWithBase(cfg.TelegramToken, cfg.TelegramAPIBase)

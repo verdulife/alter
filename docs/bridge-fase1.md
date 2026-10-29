@@ -23,13 +23,15 @@ entrada de texto libre; Pi es el motor.
 - **Preguntas con opciones (S3, S7).** La tool `ask_options` publica una pregunta
   con botones `callback_data`. La pulsación llega por el poller, resuelve la
   espera y **nunca** se convierte en un prompt para Pi.
-- **Tools deterministas (S7).** Pi tiene la **misma caja de herramientas que en
-  una sesión de terminal** (T11): `bash`, `edit`, `write`, `read`, `grep`, `find`,
-  `ls`, más las cuatro deterministas de Alter (`save_note`, `append_note`,
-  `send_file`, `ask_options`), servidas por un servidor HTTP en `127.0.0.1:0` con
-  token efímero por proceso, más todo lo que aporten los paquetes cargados
-  (memoria, web, subagentes). Ya no hay allowlist forzada ni restricción de solo
-  lectura: la contención es la identidad y, más adelante, las aprobaciones (T13).
+- **Tools deterministas (S7, T17).** Pi tiene la **misma caja de herramientas que
+  en una sesión de terminal** (T11): `bash`, `edit`, `write`, `read`, `grep`,
+  `find`, `ls`, más todo lo que aporten los paquetes cargados (memoria, web,
+  subagentes). Solo dos tools son propias de Alter, servidas por un servidor HTTP
+  en `127.0.0.1:0` con token efímero por proceso: `send_file`, para entregar al
+  dueño un archivo del vault, y `ask_options`, para preguntar con botones. Las
+  notas no tienen tool propia: Pi escribe el vault con `write` y `edit`, que es lo
+  que ya sabe hacer. Ya no hay allowlist forzada ni restricción de solo lectura: la
+  contención es la identidad y las aprobaciones (T13).
 - **Carga global de Pi (T11).** El bridge **no** desactiva el descubrimiento: no se
   pasan `--no-extensions`, `--no-skills`, `--no-prompt-templates`, `--no-themes`
   ni `--no-context-files`, así que Pi carga la misma configuración global que en
@@ -38,7 +40,7 @@ entrada de texto libre; Pi es el motor.
   son **aditivos** a lo descubierto, no un reemplazo.
 - **Directorio de trabajo (T11).** Pi arranca con `cwd` = `ALTER_BRIDGE_WORKDIR`,
   que por defecto es `$HOME`. Ve todo lo que ves tú. El vault ya **no** es el `cwd`:
-  es solo el almacén en el que escriben las tools deterministas.
+  es solo el almacén que Pi escribe con `write`/`edit` y del que `send_file` lee.
 - **Sesión persistente.** Un único proceso `pi --mode rpc` con sesión nombrada, así
   que la conversación conserva el hilo entre mensajes.
 - **Timeout amplio.** El tope por turno son 300 s por defecto
@@ -79,12 +81,12 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `TELEGRAM_CHAT_ID` | — (obligatorio) | Chat del dueño: único destinatario y única fuente aceptada. |
 | `ALTER_BRIDGE_ENABLED` | ignorada | Ya no es un interruptor: el bridge es siempre el runtime. Un valor distinto de "true" produce una línea de aviso al arrancar y nada más. |
 | `ALTER_BRIDGE_SESSION_ID` | `telegram` | Sesión de Pi que se reanuda entre mensajes. |
-| `ALTER_BRIDGE_TOOLS` | vacío (sin `--tools`) | Allowlist **opcional** de `--tools`. Vacío no pasa el flag, así que Pi conserva su selección completa por defecto. Si lo rellenas, **reemplaza** la selección entera: nombra también `save_note`, `append_note`, `send_file` y `ask_options` o Pi no podrá usarlas. |
+| `ALTER_BRIDGE_TOOLS` | vacío (sin `--tools`) | Allowlist **opcional** de `--tools`. Vacío no pasa el flag, así que Pi conserva su selección completa por defecto. Si lo rellenas, **reemplaza** la selección entera: nombra también `send_file` y `ask_options` o Pi no podrá usarlas. |
 | `ALTER_BRIDGE_PROMPT_FILES` | `alter-persona.md` | Ficheros markdown para `--append-system-prompt`, en orden. Separador `;`. |
 | `ALTER_BRIDGE_EXTENSIONS` | `internal/tools/extension/index.ts` | Extensiones cargadas con `-e`. Separador `;`. |
 | `ALTER_BRIDGE_TIMEOUT` | `300s` | Tope de un turno completo (spawn + modelo + tools + respuesta). |
 | `ALTER_BRIDGE_WORKDIR` | `$HOME` | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. |
-| `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: solo el almacén que usan las tools y los archivos entrantes. No es el `cwd` de Pi. |
+| `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: el almacén que Pi escribe con `write`/`edit` y donde caen los archivos entrantes. No es el `cwd` de Pi. |
 | `ALTER_TELEGRAM_API_BASE` | `https://api.telegram.org` | Base URL del Bot API (S8). |
 | `ALTER_PI_BIN` | `pi` | Binario de Pi. Un servicio (systemd/cron) casi siempre necesita ruta absoluta porque su `PATH` no incluye fnm. |
 | `ALTER_PI_PROVIDER` | vacío | `--provider`; vacío deja que Pi use su configuración. |
@@ -130,10 +132,10 @@ variable que la configuró:
 runtime: bridge: extension "internal/tools/extension/index.ts" is not readable (configured by ALTER_BRIDGE_EXTENSIONS): stat ...: no such file or directory
 ```
 
-Es deliberado: sin la extensión Pi arranca igual y contesta, pero no puede escribir
-nada. Ese fallo silencioso es peor que no arrancar. La guardia corre siempre: el
-bridge es el único camino que queda, así que no hay un modo en el que no haya
-ficheros que cargar.
+Es deliberado: sin la extensión Pi arranca igual y contesta, pero no puede mandar
+un archivo del vault ni preguntar con botones. Ese fallo silencioso es peor que no
+arrancar. La guardia corre siempre: el bridge es el único camino que queda, así que
+no hay un modo en el que no haya ficheros que cargar.
 
 ## Los dos ficheros que Pi necesita
 
@@ -143,10 +145,10 @@ ficheros que cargar.
    prompt por defecto: correcto pero fuera del canal (mensajes largos, código,
    formato que no se lee en el móvil).
 2. **`internal/tools/extension/index.ts`** — la extensión que registra
-   `save_note`, `append_note`, `send_file` y `ask_options` contra el servidor de
-   tools del bridge (`ALTER_TOOLS_URL` + `ALTER_TOOLS_TOKEN`, inyectados por el
-   bridge en el entorno de Pi, nunca por el modelo). Sin ella Pi conserva sus
-   tools nativas, pero no guarda notas, no manda ficheros y no pregunta con
+   `send_file` y `ask_options` contra el servidor de tools del bridge
+   (`ALTER_TOOLS_URL` + `ALTER_TOOLS_TOKEN`, inyectados por el bridge en el entorno
+   de Pi, nunca por el modelo). Sin ella Pi conserva sus tools nativas y puede
+   escribir el vault con `write`/`edit`, pero no manda ficheros ni pregunta con
    botones.
 
 Ambos se cargan siempre de forma explícita con `-e` y `--append-system-prompt`,
@@ -174,7 +176,8 @@ chat ID.
 - Vault sobre directorios temporales: nombres seguros, frontmatter, límites de
   tamaño y contención de rutas (incluidos symlinks).
 - Servidor de tools: token obligatorio, errores de negocio como 4xx, timeout y
-  cancelación de `ask_options`.
+  cancelación de `ask_options`, contención de rutas en `send_file` (incluidos
+  symlinks) y que las dos rutas de escritura retiradas en T17 ya no existen.
 - Bridge completo contra un RPC falso: drafts, entrega final, línea humana cuando
   Pi no devuelve texto, reintento tras un `getUpdates` fallido, y orden de
   apagado (poller → tools → sesión).

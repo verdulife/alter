@@ -19,8 +19,6 @@ import (
 )
 
 const (
-	saveNotePath   = "/tools/save_note"
-	appendNotePath = "/tools/append_note"
 	sendFilePath   = "/tools/send_file"
 	askOptionsPath = "/tools/ask_options"
 )
@@ -256,92 +254,38 @@ func vaultEntries(t *testing.T, root string) []string {
 	return out
 }
 
-func TestSaveNoteWritesTheNoteAndReturnsTheRelativePath(t *testing.T) {
+// TestRemovedWriteRoutesAreGone is T17: Pi writes the vault with its own
+// `write`/`edit`, so the two deterministic note routes are no longer a second
+// way to write the same files. An authenticated request to either one must be a
+// 404 that creates or changes nothing.
+func TestRemovedWriteRoutesAreGone(t *testing.T) {
 	h := newHarness(t)
+	note := filepath.Join("alter", "ideas.md")
+	writeVaultFile(t, h.dir, note, "# Ideas\n")
+	before := vaultEntries(t, h.dir)
 
-	res := h.post(t, saveNotePath, map[string]any{
-		"title":  "Nota de prueba",
-		"body":   "Cuerpo de la nota.",
-		"folder": "alter",
-		"tags":   []string{"alter", "t7"},
-	})
-	if res.status != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %q)", res.status, res.raw)
-	}
-	want := filepath.Join("alter", "nota-de-prueba.md")
-	if got := res.str(t, "path"); got != want {
-		t.Errorf("path = %q, want %q", got, want)
-	}
-
-	content := readFile(t, filepath.Join(h.dir, want))
-	for _, fragment := range []string{"title: Nota de prueba", "# Nota de prueba", "Cuerpo de la nota.", "- alter", "- t7"} {
-		if !strings.Contains(content, fragment) {
-			t.Errorf("note does not contain %q:\n%s", fragment, content)
-		}
-	}
-}
-
-func TestSaveNoteRejectsAFolderThatEscapesTheVault(t *testing.T) {
-	h := newHarness(t)
-
-	res := h.post(t, saveNotePath, map[string]any{
-		"title":  "Escapa",
-		"body":   "no debería escribirse",
-		"folder": "..",
-	})
-	res.errorText(t)
-
-	if entries := vaultEntries(t, h.dir); len(entries) != 0 {
-		t.Errorf("vault has %v after a rejected save, want it empty", entries)
-	}
-	if _, err := os.Stat(filepath.Join(h.parent, "escapa.md")); err == nil {
-		t.Errorf("rejected save wrote %s", filepath.Join(h.parent, "escapa.md"))
-	}
-}
-
-func TestSaveNoteRejectsATitleThatEscapesTheVault(t *testing.T) {
-	h := newHarness(t)
-
-	res := h.post(t, saveNotePath, map[string]any{
-		"title": "../../evil",
-		"body":  "no debería escribirse",
-	})
-	res.errorText(t)
-
-	if entries := vaultEntries(t, h.dir); len(entries) != 0 {
-		t.Errorf("vault has %v after a rejected save, want it empty", entries)
-	}
-	if _, err := os.Stat(filepath.Join(h.parent, "evil.md")); err == nil {
-		t.Errorf("rejected save wrote %s", filepath.Join(h.parent, "evil.md"))
-	}
-}
-
-func TestAppendNoteAddsOneLineToAnExistingNote(t *testing.T) {
-	h := newHarness(t)
-	rel := filepath.Join("alter", "ideas.md")
-	path := writeVaultFile(t, h.dir, rel, "# Ideas\n\n- primera")
-
-	res := h.post(t, appendNotePath, map[string]any{"note": rel, "line": "- segunda"})
-	if res.status != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %q)", res.status, res.raw)
-	}
-	if got := res.str(t, "path"); got != rel {
-		t.Errorf("path = %q, want %q", got, rel)
-	}
-	if got, want := readFile(t, path), "# Ideas\n\n- primera\n- segunda\n"; got != want {
-		t.Errorf("note = %q, want %q", got, want)
-	}
-}
-
-func TestAppendNoteRejectsAPathOutsideTheVault(t *testing.T) {
-	h := newHarness(t)
-	outside := writeVaultFile(t, h.parent, "fuera.md", "intacto\n")
-
-	res := h.post(t, appendNotePath, map[string]any{"note": "../fuera.md", "line": "- inyectada"})
-	res.errorText(t)
-
-	if got := readFile(t, outside); got != "intacto\n" {
-		t.Errorf("file outside the vault was modified: %q", got)
+	for _, tc := range []struct {
+		endpoint string
+		payload  map[string]any
+	}{
+		{"/tools/save_note", map[string]any{"title": "Nota", "body": "cuerpo", "folder": "alter"}},
+		{"/tools/append_note", map[string]any{"note": note, "line": "- línea"}},
+	} {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			status, raw := postWithHeader(t, h.base+tc.endpoint, h.server.Token(), tc.payload)
+			if status != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 for a removed route (body %q)", status, raw)
+			}
+			if len(h.files.calls) != 0 || h.asker.calls != 0 {
+				t.Errorf("removed route reached sender=%d asker=%d", len(h.files.calls), h.asker.calls)
+			}
+			if got := readFile(t, filepath.Join(h.dir, note)); got != "# Ideas\n" {
+				t.Errorf("removed route changed the note: %q", got)
+			}
+			if after := vaultEntries(t, h.dir); strings.Join(after, ",") != strings.Join(before, ",") {
+				t.Errorf("vault has %v after a removed route, want %v", after, before)
+			}
+		})
 	}
 }
 
@@ -490,8 +434,6 @@ func TestAskOptionsBoundsTheWaitWithItsOwnDeadline(t *testing.T) {
 
 func TestEveryEndpointRequiresTheToken(t *testing.T) {
 	requests := map[string]any{
-		saveNotePath:   map[string]any{"title": "Token", "body": "cuerpo"},
-		appendNotePath: map[string]any{"note": filepath.Join("alter", "ideas.md"), "line": "- inyectada"},
 		sendFilePath:   map[string]any{"path": filepath.Join("alter", "informe.pdf"), "caption": "x"},
 		askOptionsPath: map[string]any{"question": "¿Sigo?", "options": []string{"sí", "no"}},
 	}
@@ -507,8 +449,7 @@ func TestEveryEndpointRequiresTheToken(t *testing.T) {
 		for _, token := range tokens {
 			t.Run(endpoint+"/"+token.name, func(t *testing.T) {
 				h := newHarness(t)
-				notePath := writeVaultFile(t, h.dir, filepath.Join("alter", "ideas.md"), "# Ideas\n")
-				writeVaultFile(t, h.dir, filepath.Join("alter", "informe.pdf"), "%PDF-1.4")
+				filePath := writeVaultFile(t, h.dir, filepath.Join("alter", "informe.pdf"), "%PDF-1.4")
 
 				res := h.do(t, endpoint, token.value, payload)
 				if res.status != http.StatusForbidden {
@@ -518,8 +459,8 @@ func TestEveryEndpointRequiresTheToken(t *testing.T) {
 					t.Errorf("body %q has no error field", res.raw)
 				}
 
-				if got := readFile(t, notePath); got != "# Ideas\n" {
-					t.Errorf("rejected request modified a note: %q", got)
+				if got := readFile(t, filePath); got != "%PDF-1.4" {
+					t.Errorf("rejected request changed the vault file: %q", got)
 				}
 				if len(h.files.calls) != 0 {
 					t.Errorf("rejected request called the sender %d times", len(h.files.calls))
@@ -527,8 +468,8 @@ func TestEveryEndpointRequiresTheToken(t *testing.T) {
 				if h.asker.calls != 0 {
 					t.Errorf("rejected request called the asker %d times", h.asker.calls)
 				}
-				if entries := vaultEntries(t, h.dir); len(entries) != 3 {
-					t.Errorf("vault has %v after a rejected request, want the seeded folder and files only", entries)
+				if entries := vaultEntries(t, h.dir); len(entries) != 2 {
+					t.Errorf("vault has %v after a rejected request, want the seeded folder and file only", entries)
 				}
 			})
 		}
@@ -536,8 +477,9 @@ func TestEveryEndpointRequiresTheToken(t *testing.T) {
 }
 
 func TestStartBindsLoopbackOnly(t *testing.T) {
+	vaultDir := t.TempDir()
 	srv, err := New(Config{
-		Vault:  vault.New(t.TempDir(), 0),
+		Vault:  vault.New(vaultDir, 0),
 		Files:  &fakeSender{},
 		Asker:  &fakeAsker{answer: "sí"},
 		Logger: log.New(io.Discard, "", 0),
@@ -566,8 +508,9 @@ func TestStartBindsLoopbackOnly(t *testing.T) {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	body := strings.NewReader(`{"title":"Desde el puerto","body":"cuerpo"}`)
-	req, err := http.NewRequest(http.MethodPost, url+saveNotePath, body)
+	writeVaultFile(t, vaultDir, "informe.pdf", "%PDF-1.4")
+	body := strings.NewReader(`{"path":"informe.pdf"}`)
+	req, err := http.NewRequest(http.MethodPost, url+sendFilePath, body)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -585,7 +528,7 @@ func TestStartBindsLoopbackOnly(t *testing.T) {
 	if err := srv.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := client.Post(url+saveNotePath, "application/json", strings.NewReader(`{}`)); err == nil {
+	if _, err := client.Post(url+sendFilePath, "application/json", strings.NewReader(`{}`)); err == nil {
 		t.Error("the server still accepts connections after Close")
 	}
 }

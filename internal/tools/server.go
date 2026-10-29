@@ -1,7 +1,7 @@
-// Package tools exposes the deterministic tools that let Pi write into the
-// vault and reach the owner (S7). Pi itself never receives bash, edit or write:
-// the bridge owns this local HTTP server and every mutation goes through one of
-// its four endpoints.
+// Package tools exposes the two deterministic tools that do something Pi's own
+// toolset cannot (S7): deliver a file from the vault to the owner's chat and ask
+// the owner to choose between options. Pi writes the vault with its own `bash`,
+// `edit` and `write`, so this server has no note-writing endpoint at all.
 //
 // The server listens on loopback only and requires the per-process token
 // generated at construction in the X-Alter-Token header, so no other local
@@ -42,8 +42,9 @@ const DefaultAskTimeout = 10 * time.Minute
 // is a normal result, not an error: the model can keep talking.
 const noAnswer = "sin respuesta"
 
-// maxRequestBytes bounds one JSON request body (a note body is the largest
-// field a tool call carries).
+// maxRequestBytes bounds one JSON request body. Nothing a tool sends is close to
+// this today (a path and a caption are the largest fields), so the cap only
+// exists to stop a wedged or hostile local caller from streaming forever.
 const maxRequestBytes = 8 << 20
 
 // shutdownTimeout bounds the graceful drain performed by Close.
@@ -80,7 +81,10 @@ type OptionAsker interface {
 
 // Config is the explicit configuration of the tools server.
 type Config struct {
-	// Vault is the store every note write goes through (S6).
+	// Vault is the store whose root contains every path a tool may touch. Pi
+	// writes the vault with its own `write`/`edit`, so nothing here writes
+	// through the store any more; it is still wired because `send_file` must
+	// resolve the path it is given against the vault root and reject escapes.
 	Vault *vault.Store
 	// Files delivers vault files to the owner.
 	Files FileSender
@@ -128,8 +132,6 @@ func New(cfg Config) (*Server, error) {
 
 	s := &Server{cfg: cfg, token: token}
 	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("POST /tools/save_note", s.handleSaveNote)
-	s.mux.HandleFunc("POST /tools/append_note", s.handleAppendNote)
 	s.mux.HandleFunc("POST /tools/send_file", s.handleSendFile)
 	s.mux.HandleFunc("POST /tools/ask_options", s.handleAskOptions)
 	// The token is checked before routing, so an unauthenticated request can
@@ -226,82 +228,6 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-func (s *Server) handleSaveNote(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Title  string   `json:"title"`
-		Body   string   `json:"body"`
-		Folder string   `json:"folder"`
-		Tags   []string `json:"tags"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-
-	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		writeError(w, http.StatusBadRequest, "title is required")
-		return
-	}
-	// The title becomes the file name, so it must not carry path syntax. The
-	// vault slugifies it, but rejecting the input is clearer for the model.
-	if strings.ContainsAny(title, `/\`) || strings.Contains(title, "..") {
-		writeError(w, http.StatusBadRequest, "title %q must not contain path separators or \"..\"", req.Title)
-		return
-	}
-	folder := strings.TrimSpace(req.Folder)
-	if folder != "" {
-		if _, err := s.resolvePath(folder, false); err != nil {
-			writeError(w, http.StatusBadRequest, "folder %q is not usable: %v", req.Folder, err)
-			return
-		}
-	}
-
-	path, err := s.cfg.Vault.SaveNote(vault.Note{
-		Folder: folder,
-		Title:  title,
-		Body:   req.Body,
-		Tags:   req.Tags,
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "save note: %v", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, struct {
-		Path string `json:"path"`
-	}{Path: s.relative(path)})
-}
-
-func (s *Server) handleAppendNote(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Note string `json:"note"`
-		Line string `json:"line"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-	note := strings.TrimSpace(req.Note)
-	if note == "" {
-		writeError(w, http.StatusBadRequest, "note is required")
-		return
-	}
-	if strings.TrimSpace(req.Line) == "" {
-		writeError(w, http.StatusBadRequest, "line is required")
-		return
-	}
-
-	if _, err := s.resolvePath(note, true); err != nil {
-		writePathError(w, err)
-		return
-	}
-	if err := s.cfg.Vault.AppendLine(note, req.Line); err != nil {
-		writeError(w, http.StatusInternalServerError, "append to note: %v", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, struct {
-		Path string `json:"path"`
-	}{Path: note})
-}
-
 func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path    string `json:"path"`
@@ -315,7 +241,7 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	full, err := s.resolvePath(req.Path, true)
+	full, err := s.resolvePath(req.Path)
 	if err != nil {
 		writePathError(w, err)
 		return
@@ -404,12 +330,11 @@ func (s *Server) relative(path string) string {
 
 // resolvePath turns a vault-relative path into an absolute one, refusing
 // anything that leaves the root. Containment is checked against the
-// symlink-resolved form of the nearest existing ancestor, with the components
-// that do not exist yet appended and verified to stay inside: a link inside the
-// vault that points outside is an escape like any other, even when the leaf
-// below it is still missing. With requireFile the path must be an existing
-// non-directory file.
-func (s *Server) resolvePath(rel string, requireFile bool) (string, error) {
+// symlink-resolved form of the path: a link inside the vault that points
+// outside is an escape like any other. The path must name an existing
+// non-directory file, because the only caller is send_file and there is nothing
+// left to send for a path that does not exist.
+func (s *Server) resolvePath(rel string) (string, error) {
 	// A leading separator is read as "vault-relative", matching how models write
 	// paths; the containment check below still rejects a real escape.
 	clean := filepath.Clean(strings.TrimPrefix(rel, string(filepath.Separator)))
@@ -449,14 +374,9 @@ func (s *Server) resolvePath(rel string, requireFile bool) (string, error) {
 		if !os.IsNotExist(err) {
 			return "", err
 		}
-		if requireFile {
-			return "", fmt.Errorf("%w: %q", errMissing, rel)
-		}
-		// The leaf does not exist yet: SaveNote creates it, and the resolved form
-		// above already proved it stays in the vault.
-		return resolved, nil
+		return "", fmt.Errorf("%w: %q", errMissing, rel)
 	}
-	if requireFile && info.IsDir() {
+	if info.IsDir() {
 		return "", fmt.Errorf("%w: %q", errNotFile, rel)
 	}
 	return resolved, nil

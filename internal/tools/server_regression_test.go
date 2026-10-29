@@ -77,31 +77,14 @@ func postWithHeader(t *testing.T, url, token string, payload any) (int, string) 
 	return resp.StatusCode, strings.TrimSpace(buf.String())
 }
 
-// TestSaveNoteRejectsAFolderThatEscapesThroughASymlinkedDirectory is S7: a
-// symlinked directory inside the vault must not become a write path to the
-// outside, not even when the leaf below it does not exist yet.
-func TestSaveNoteRejectsAFolderThatEscapesThroughASymlinkedDirectory(t *testing.T) {
-	h := newHarness(t)
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(h.dir, "enlace")); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	before := hashTree(t, h.dir)
-
-	res := h.post(t, saveNotePath, map[string]any{"title": "Escapa", "body": "cuerpo", "folder": "enlace/sub"})
-	if res.status == http.StatusOK {
-		t.Errorf("status = 200 for a folder reaching outside the vault (body %q)", res.raw)
-	}
-	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
-		t.Errorf("save_note wrote %v outside the vault root %s", entries, h.dir)
-	}
-	if after := hashTree(t, h.dir); after != before {
-		t.Errorf("vault changed after a rejected save")
-	}
-}
-
 // TestSendFileRejectsASymlinkedDirectory is S7/S4: the sender is never reached
 // for a path that leaves the vault through an internal symlink.
+//
+// T17 removed the note routes, so the old "symlinked directory plus a leaf that
+// does not exist yet" variant has no endpoint left to exercise: nothing in this
+// package creates a leaf any more, and send_file only accepts paths that already
+// exist. The containment it guarded (an internal symlink must never become a way
+// out of the vault) is what this test still proves, now with a leaf that exists.
 func TestSendFileRejectsASymlinkedDirectory(t *testing.T) {
 	h := newHarness(t)
 	outside := t.TempDir()
@@ -131,10 +114,9 @@ func TestTokenVariantsReachNoHandler(t *testing.T) {
 	good := h.server.Token()
 
 	for _, tok := range []string{"", strings.Repeat("a", len(good)), good[:len(good)-1], good + "a", strings.ToUpper(good)} {
-		for _, endpoint := range []string{saveNotePath, appendNotePath, sendFilePath, askOptionsPath} {
+		for _, endpoint := range []string{sendFilePath, askOptionsPath} {
 			status, raw := postWithHeader(t, h.base+endpoint, tok, map[string]any{
-				"title": "Token", "body": "x", "note": "alter/ideas.md", "line": "- x",
-				"path": "alter/informe.pdf", "question": "¿Sigo?", "options": []string{"sí", "no"},
+				"path": "alter/informe.pdf", "caption": "x", "question": "¿Sigo?", "options": []string{"sí", "no"},
 			})
 			if status != http.StatusForbidden {
 				t.Errorf("%s with token %q: status = %d, want 403 (body %s)", endpoint, tok, status, raw)
