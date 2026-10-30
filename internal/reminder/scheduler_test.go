@@ -81,7 +81,7 @@ func assertCommand(t *testing.T, got command, wantName string, wantArgs ...strin
 // bareSystemd builds a scheduler whose transient units carry no extra
 // environment, for the tests that only look at the systemctl side.
 func bareSystemd(binary string, run RunFunc) *Systemd {
-	return newSystemd(binary, "", "", run)
+	return newSystemd(binary, "", "", "", run)
 }
 
 // writeEnvFile creates a dotenv file the scheduler can point a transient unit at.
@@ -97,11 +97,13 @@ func writeEnvFile(t *testing.T, content string) string {
 // TestCreateBuildsSystemdRunArgv pins the exact argv of a timer creation: a
 // transient user timer that runs this binary's `remind fire <slug>` and carries
 // the environment a firing needs, because a transient unit does not inherit the
-// service's.
+// service's. The working directory travels with it too: the dotenv file the
+// firing loads is the one relative to the bridge's directory, and a transient
+// unit would otherwise run in $HOME.
 func TestCreateBuildsSystemdRunArgv(t *testing.T) {
 	envFile := writeEnvFile(t, "TELEGRAM_TOKEN=no-es-un-token-real\n")
 	rec := &recorder{}
-	scheduler := newSystemd("/home/owner/bin/alter", "/home/owner/.local/bin:/usr/bin", envFile, rec.run)
+	scheduler := newSystemd("/home/owner/bin/alter", "/home/owner/.local/bin:/usr/bin", envFile, "/home/owner/alter", rec.run)
 
 	if err := scheduler.Create(context.Background(), "llamar-a-mama", fixedAt()); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -113,8 +115,36 @@ func TestCreateBuildsSystemdRunArgv(t *testing.T) {
 		"--unit=alter-remind-llamar-a-mama",
 		"--setenv=PATH=/home/owner/.local/bin:/usr/bin",
 		"--property=EnvironmentFile="+envFile,
+		"--property=WorkingDirectory=/home/owner/alter",
 		"/home/owner/bin/alter",
 		"remind", "fire", "llamar-a-mama",
+	)
+}
+
+// TestCreateSkipsAnEmptyWorkingDirectory pins the guard around the working
+// directory: a scheduler built without one emits exactly the argv it emitted
+// before the property existed, so a caller with no directory to pass keeps the
+// previous behaviour instead of sending systemd an empty path.
+func TestCreateSkipsAnEmptyWorkingDirectory(t *testing.T) {
+	rec := &recorder{}
+	scheduler := newSystemd("/bin/alter", "/bin", "", "", rec.run)
+
+	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	for _, arg := range rec.onlyCall(t).args {
+		if strings.Contains(arg, "WorkingDirectory") {
+			t.Errorf("argv = %q, want no WorkingDirectory= when there is no directory to pass", rec.calls[0].args)
+		}
+	}
+	assertCommand(t, rec.calls[0], "systemd-run",
+		"--user",
+		"--on-calendar=2026-11-03 12:00:00",
+		"--unit=alter-remind-regar-las-plantas",
+		"--setenv=PATH=/bin",
+		"/bin/alter",
+		"remind", "fire", "regar-las-plantas",
 	)
 }
 
@@ -123,7 +153,7 @@ func TestCreateBuildsSystemdRunArgv(t *testing.T) {
 // EnvironmentFile= argument appears when none is configured.
 func TestCreatePassesThePathWithoutAnEnvFile(t *testing.T) {
 	rec := &recorder{}
-	scheduler := newSystemd("/bin/alter", "/home/owner/.local/bin:/bin", "", rec.run)
+	scheduler := newSystemd("/bin/alter", "/home/owner/.local/bin:/bin", "", "", rec.run)
 
 	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -145,7 +175,7 @@ func TestCreatePassesThePathWithoutAnEnvFile(t *testing.T) {
 // own default, so nothing is passed instead.
 func TestCreateKeepsTheSystemdPATHWhenThereIsNoneToPass(t *testing.T) {
 	rec := &recorder{}
-	scheduler := newSystemd("/bin/alter", "", "", rec.run)
+	scheduler := newSystemd("/bin/alter", "", "", "", rec.run)
 
 	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -172,7 +202,7 @@ func TestCreateKeepsTheSystemdPATHWhenThereIsNoneToPass(t *testing.T) {
 func TestCreateSkipsAnEnvFileThatIsNotThere(t *testing.T) {
 	rec := &recorder{}
 	missing := filepath.Join(t.TempDir(), "no-existe.env")
-	scheduler := newSystemd("/bin/alter", "/bin", missing, rec.run)
+	scheduler := newSystemd("/bin/alter", "/bin", missing, "", rec.run)
 
 	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
 		t.Fatalf("Create: %v", err)

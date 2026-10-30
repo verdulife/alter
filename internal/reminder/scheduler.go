@@ -63,7 +63,9 @@ type RunFunc func(ctx context.Context, name string, args ...string) ([]byte, err
 // what the systemd user manager has, which is nearly nothing. A firing has to
 // find the binary it runs and the token it notifies with, so both travel with
 // the unit: the PATH through --setenv and the dotenv file through
-// EnvironmentFile=.
+// EnvironmentFile=. It also does not inherit the service's working directory, so
+// the directory the bridge works in travels with the unit too: the dotenv file
+// the firing loads on its own is the one relative to it.
 type Systemd struct {
 	binary string
 	// path is the PATH the transient unit receives. It is a constructor input so
@@ -72,21 +74,26 @@ type Systemd struct {
 	// envFile is the dotenv file the transient unit loads, empty when the caller
 	// has none.
 	envFile string
+	// workDir is the directory the transient unit runs in, empty when the caller
+	// has none. It is the bridge's own working directory, which is what makes the
+	// fallback that reads <WorkDir>/.env find the file.
+	workDir string
 	run     RunFunc
 }
 
 // NewSystemd returns a Scheduler that starts binary when a timer fires. binary,
-// path and envFile are passed in rather than guessed, so the caller decides which
-// executable systemd runs and with which environment. An empty envFile is a
-// scheduler whose timers carry only path.
-func NewSystemd(binary, path, envFile string) *Systemd {
-	return newSystemd(binary, path, envFile, execCommand)
+// path, envFile and workDir are passed in rather than guessed, so the caller
+// decides which executable systemd runs and where, and with which environment. An
+// empty envFile is a scheduler whose timers carry only path, and an empty workDir
+// is one whose timers keep the systemd default directory.
+func NewSystemd(binary, path, envFile, workDir string) *Systemd {
+	return newSystemd(binary, path, envFile, workDir, execCommand)
 }
 
 // newSystemd builds the implementation around a command runner. Tests use it to
 // assert the exact argv without running a command.
-func newSystemd(binary, path, envFile string, run RunFunc) *Systemd {
-	return &Systemd{binary: binary, path: path, envFile: envFile, run: run}
+func newSystemd(binary, path, envFile, workDir string, run RunFunc) *Systemd {
+	return &Systemd{binary: binary, path: path, envFile: envFile, workDir: workDir, run: run}
 }
 
 // Create schedules one firing of the reminder at at with
@@ -94,8 +101,8 @@ func newSystemd(binary, path, envFile string, run RunFunc) *Systemd {
 // calendar value is the reminder's wall-clock time in the host zone, because
 // systemd reads OnCalendar= as local time: sending the instant's own offset
 // would move the alarm by the offset difference. The unit also carries the PATH
-// it needs to find the binary and, when one is configured and exists, the dotenv
-// file it needs to notify.
+// it needs to find the binary, the dotenv file it needs to notify when one is
+// configured and exists, and the directory it runs in.
 func (s *Systemd) Create(ctx context.Context, slug string, at time.Time) error {
 	when := at.In(time.Local).Format(calendarLayout)
 	args := []string{
@@ -115,6 +122,13 @@ func (s *Systemd) Create(ctx context.Context, slug string, at time.Time) error {
 	// carry the credentials.
 	if s.envFile != "" && fileIsReadable(s.envFile) {
 		args = append(args, "--property=EnvironmentFile="+s.envFile)
+	}
+	// Without this the unit runs in $HOME, not in the directory the service works
+	// in, so the second layer that reads <WorkDir>/.env on its own would never find
+	// the file. An empty directory is not passed: an empty WorkingDirectory= would
+	// make systemd-run refuse the unit.
+	if s.workDir != "" {
+		args = append(args, "--property=WorkingDirectory="+s.workDir)
 	}
 	args = append(args, s.binary, "remind", "fire", slug)
 	_, err := s.runCommand(ctx, "systemd-run", args...)

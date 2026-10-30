@@ -211,9 +211,10 @@ func newRemindRunner(cfg config.Config, stdout, stderr io.Writer) *remindRunner 
 	return &remindRunner{
 		vaultDir: cfg.VaultDir,
 		binary:   binary,
-		// The transient unit does not inherit this environment, so the PATH and the
-		// dotenv file the firing needs travel with it.
-		scheduler: reminder.NewSystemd(binary, os.Getenv("PATH"), envFile),
+		// The transient unit does not inherit this environment nor this working
+		// directory, so the PATH, the dotenv file and the directory the firing reads
+		// that file from travel with it.
+		scheduler: reminder.NewSystemd(binary, os.Getenv("PATH"), envFile, cfg.WorkDir),
 		stdout:    stdout,
 		stderr:    stderr,
 		now:       time.Now,
