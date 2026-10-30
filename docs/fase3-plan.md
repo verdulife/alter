@@ -98,3 +98,27 @@ recurrente nunca "termina".
 - Notificaciones fuera de Telegram.
 - Reintentos con backoff.
 - Unidades de sistema persistentes (se migra si hace falta).
+
+## Estado: verificado en producción (2026-10-30)
+
+Los seis criterios se comprobaron contra el sistema real, no con dobles:
+
+| Criterio | Evidencia |
+|---|---|
+| Aviso a su hora | recordatorio de prueba a las 14:45:00; el dueño lo recibió en el móvil |
+| No se repite | `last_fired` escrito, timer eliminado, `list-timers` sin unidades `alter-remind-*` |
+| Puesta al día | `llamar-a-mama`, vencido antes de arrancar, disparado por el catch-up y recibido |
+| Recurrente | avanzó a 2026-11-06 sin escribir `last_fired`, con el timer reprogramado |
+| Huérfano | fichero borrado, `sync` eliminó su timer |
+| Entorno del disparo | la unit lleva `PATH` y `EnvironmentFile`; sin ellos el aviso se perdía |
+
+Un fallo real se encontró justo aquí: las units de `systemd-run` no heredan el
+entorno del servicio, así que el primer disparo marcó el recordatorio pero no
+pudo avisar (`pi` no estaba en el `PATH`, y faltaba `TELEGRAM_TOKEN`). La lógica
+era correcta; lo que faltaba era el entorno. Se corrigió en dos capas: la unit
+declara `--setenv=PATH` y `--property=EnvironmentFile`, y `fire`/`notify` cargan
+el `.env` por su cuenta como segunda red.
+
+Deuda conocida: esa segunda red lee `<WorkDir>/.env`, pero una unit transient
+corre con `$HOME` como directorio de trabajo, así que solo actúa la primera capa.
+Hacerlo determinista pide `ALTER_ENV_FILE` o `WorkingDirectory=` en la unit.
