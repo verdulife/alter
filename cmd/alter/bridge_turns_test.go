@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -166,47 +167,61 @@ func TestRunWaitsForAnInFlightTurn(t *testing.T) {
 
 // TestQueuedTurnWaitsForTheInFlightTurn pins turnMu: a message that arrives while
 // another turn is running must wait for it instead of interleaving. Turn one is
-// parked on the approval, which the test controls, so the queued turn must show no
-// sign of life — not even its typing action — until turn one has answered.
+// held open by the turn seam, which the test controls, so the queued turn must show
+// no sign of life — not even its typing action — until the release.
 func TestQueuedTurnWaitsForTheInFlightTurn(t *testing.T) {
-	h := startDialogBridge(t, "dialog-confirm", 120*time.Second)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+
+	var gates atomic.Int32
+	h := startDialogBridge(t, "echo-prompt", 0, withTurnGate(func(context.Context) {
+		// Only the first turn parks: the queued one has to run on its own once the
+		// slot is free.
+		if gates.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}))
 	h.sendText(1, 1, "uno")
 
-	q1 := h.waitRich(t, 1)[0]
-	if !strings.Contains(q1, "Aprobar") {
-		t.Fatalf("first question = %q, want the approval buttons", q1)
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the first turn never reached the turn slot: the seam was not reached")
 	}
 
-	// Turn one is parked on the button, so it still owns the turn slot.
+	// Turn one owns the turn slot, so the queued turn must wait for it.
 	h.sendText(2, 2, "dos")
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if _, _, _, typing := h.bot.snapshot(); len(typing) > 1 {
 			t.Fatalf("typing actions = %d: the queued turn started while the first one was still in flight", len(typing))
 		}
-		if len(h.rich()) != 1 {
+		if len(h.rich()) != 0 {
 			t.Fatalf("deliveries = %v: the queued turn delivered while the first one was still in flight", h.rich())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Settling turn one lets the queued turn start, and only then: its typing
-	// action and its question follow the first turn's delivery.
-	pushUpdates(h.bot.fakeBot, callbackUpdate(3, "cb-1", askButtonData(t, q1)[0]))
-	three := h.waitRich(t, 3)
-	if !strings.HasPrefix(three[1], `{"confirmed":true`) {
-		t.Errorf("delivery[1] = %q, want the first turn's answer", three[1])
+	// Releasing turn one lets the queued turn start, and only then: each turn's own
+	// answer follows the first turn's delivery, in the order the messages arrived.
+	releaseOnce()
+	two := h.waitRich(t, 2)
+	if two[0] != "uno" {
+		t.Errorf("delivery[0] = %q, want the first turn's answer", two[0])
 	}
-	if !strings.Contains(three[2], "Aprobar") {
-		t.Errorf("delivery[2] = %q, want the queued turn's question", three[2])
+	if two[1] != "dos" {
+		t.Errorf("delivery[1] = %q, want the queued turn's answer", two[1])
 	}
 	if _, _, _, typing := h.bot.snapshot(); len(typing) != 2 {
 		t.Errorf("typing actions = %d, want exactly 2: one per turn, the second only after the first finished", len(typing))
 	}
 
 	time.Sleep(300 * time.Millisecond)
-	if got := len(h.rich()); got != 3 {
-		t.Errorf("deliveries after settling = %d (%v), want exactly 3: no turn lost or repeated", got, h.rich())
+	if got := len(h.rich()); got != 2 {
+		t.Errorf("deliveries after the release = %d (%v), want exactly 2: no turn lost or repeated", got, h.rich())
 	}
 	if err := h.stop(t); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run returned %v, want context.Canceled", err)

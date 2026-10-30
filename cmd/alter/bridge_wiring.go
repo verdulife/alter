@@ -26,6 +26,12 @@ const (
 	// bridgeTypingAction is the transient chat state shown while Pi thinks.
 	bridgeTypingAction = "typing"
 
+	// bridgeTypingInterval caps how often one turn refreshes the typing indicator.
+	// Telegram honours one chat action for about five seconds, so a turn that lasts
+	// minutes — the normal case — has to repeat it well inside that window; without
+	// the refresh the owner saw the indicator vanish while Pi was still working.
+	bridgeTypingInterval = 4 * time.Second
+
 	// bridgeDraftInterval caps how often one turn publishes a streaming draft.
 	// Pi emits one text_delta per tiny burst, so without a cap every burst would
 	// be one Bot API request. The final message always carries the whole answer,
@@ -213,6 +219,10 @@ type bridgeRuntime struct {
 	// log and derive the new id from it. The live id belongs to the session, which
 	// owns the spawn; this is only the configured base.
 	sessionBase string
+	// typingInterval is how often a running turn refreshes the typing indicator.
+	// The field is the test seam for the refresher; production always uses
+	// bridgeTypingInterval.
+	typingInterval time.Duration
 	// resetSession performs the reset a /reset asks for (test seam): the real one
 	// is Session.Reset, and a test can make it fail to pin the error line.
 	resetSession func(ctx context.Context, sessionID string) error
@@ -253,6 +263,13 @@ func withSessionReset(f func(ctx context.Context, sessionID string) error) bridg
 	return func(r *bridgeRuntime) { r.resetSession = f }
 }
 
+// withTypingInterval replaces how often a turn refreshes the typing indicator (test
+// seam), so a test can watch the refresh inside a turn that would otherwise last
+// four seconds per tick.
+func withTypingInterval(interval time.Duration) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.typingInterval = interval }
+}
+
 // newBridgeRuntime composes the bridge: vault store → tools server → Pi session
 // (carrying the tools URL and token in its environment) → poller for the owner
 // chat. Nothing is spawned until the first prompt, and the tools server is bound
@@ -268,7 +285,7 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		return nil, err
 	}
 
-	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes}
+	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes, typingInterval: bridgeTypingInterval}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -391,7 +408,8 @@ func (r *bridgeRuntime) teardown(stage string) {
 // same turn pipeline; a button press only settles the pending question (an
 // ask_options question or a tool approval), so it is answered here and
 // deliberately never handed to Pi: a press is not free text and must not become
-// a prompt (S1).
+// a prompt (S1). A typed message may settle that same question instead of
+// starting a turn, which is why handleText always asks the broker first.
 func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) error {
 	chatID := ev.ChatID
 	if chatID == 0 {
@@ -512,10 +530,25 @@ func clipDialogText(text string, limit int) string {
 }
 
 // handleText routes one text message: /reset is the only text the bridge consumes
-// itself, so it can never reach Pi as a prompt; everything else runs a turn.
+// as a command, so it can never reach Pi as a prompt. Every other message first
+// gets the chance to answer the pending question — a question with options takes
+// the text as its answer, an approval only takes an unambiguous word — and only
+// a message that settles nothing (or that cancelled an approval) runs a turn.
 func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text string) error {
 	if isBridgeReset(text) {
 		return r.resetConversation(ctx, chatID)
+	}
+	if r.asks != nil {
+		if outcome := r.asks.ResolveText(text); outcome.settled() {
+			// The tool call that just returned is invisible to the owner, so the
+			// chat always learns what his message did to the question.
+			if err := r.reply(ctx, chatID, askTextConfirmation(outcome)); err != nil {
+				return err
+			}
+			if !outcome.passesTextOn() {
+				return nil
+			}
+		}
 	}
 	return r.runTurn(ctx, chatID, text)
 }
@@ -587,10 +620,11 @@ func (r *bridgeRuntime) runTurn(ctx context.Context, chatID int64, prompt string
 
 // promptTurn is the body of one turn.
 func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt string) error {
-	if err := r.client.SendChatAction(ctx, chatID, bridgeTypingAction); err != nil {
-		// Cosmetic only: the typing indicator must never fail a turn.
-		r.logger.Printf("bridge: chat action: %v", err)
-	}
+	// The indicator is refreshed for the whole turn, approvals and questions
+	// included: those waits happen inside the turn, and a single chat action would
+	// leave the owner looking at nothing while Pi works.
+	stopTyping := r.keepTypingAlive(ctx, chatID)
+	defer stopTyping()
 
 	throttle := &draftThrottle{min: bridgeDraftInterval, now: time.Now}
 	final, err := r.sess.PromptStream(ctx, prompt, func(accumulated string) {
@@ -613,6 +647,87 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 		return r.reply(ctx, chatID, bridgeEmptyReply)
 	}
 	return r.reply(ctx, chatID, final)
+}
+
+// bridgeChatAction is the Bot API surface the typing refresher needs: one transient
+// chat state.
+type bridgeChatAction interface {
+	SendChatAction(ctx context.Context, chatID int64, action string) error
+}
+
+// typingRefresher keeps one chat action alive for as long as a turn runs. Telegram
+// honours a chat action for about five seconds, so a turn that lasts minutes needs
+// a refresh well inside that window or the indicator vanishes while Pi is still
+// working.
+type typingRefresher struct {
+	sender bridgeChatAction
+	chatID int64
+	action string
+	every  time.Duration
+	logger *log.Logger
+}
+
+// start emits the action at once — so the indicator appears before Pi is prompted —
+// and repeats it every interval until stop is called or ctx ends. A failed request
+// is logged and never stops the refresh, and never fails or waits on the turn: the
+// indicator is cosmetic. The returned stop is safe to call more than once and waits
+// for the goroutine, so a finished turn leaves nothing behind; a cancelled ctx ends
+// the goroutine by itself.
+func (t typingRefresher) start(ctx context.Context) (stop func()) {
+	t.send(ctx)
+
+	every := t.every
+	if every <= 0 {
+		every = bridgeTypingInterval
+	}
+
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				t.send(ctx)
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stopCh) })
+		<-done
+	}
+}
+
+// send emits one chat action. A failure is logged only: the turn must never fail
+// because a cosmetic request did not arrive.
+func (t typingRefresher) send(ctx context.Context) {
+	if err := t.sender.SendChatAction(ctx, t.chatID, t.action); err != nil && t.logger != nil {
+		t.logger.Printf("bridge: chat action: %v", err)
+	}
+}
+
+// keepTypingAlive starts the typing refresher of one turn and returns the function
+// that stops it.
+func (r *bridgeRuntime) keepTypingAlive(ctx context.Context, chatID int64) (stop func()) {
+	interval := r.typingInterval
+	if interval <= 0 {
+		interval = bridgeTypingInterval
+	}
+	return typingRefresher{
+		sender: r.client,
+		chatID: chatID,
+		action: bridgeTypingAction,
+		every:  interval,
+		logger: r.logger,
+	}.start(ctx)
 }
 
 // reply delivers the final markdown with the richest representation Telegram

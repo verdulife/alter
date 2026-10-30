@@ -1218,3 +1218,216 @@ func assertNoGoroutineGrowth(t *testing.T, before int) {
 type askNoopFileSender struct{}
 
 func (askNoopFileSender) SendFile(context.Context, string, string) error { return nil }
+
+// A typed message and a button press are two ways to answer the same pending
+// question. The tests below pin what the text does to the question (answer it,
+// approve, reject, cancel), that the two paths never both settle one question,
+// and that nothing stays blocked for the ten minutes of the ask deadline.
+
+// TestResolveTextAnswersAnOptionsQuestion pins the chat contract of a neutral
+// question: any text answers it, and the text itself is what the tool receives.
+func TestResolveTextAnswersAnOptionsQuestion(t *testing.T) {
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	out := startAsk(context.Background(), broker, "¿Qué hago con el enlace?", []string{"guardar", "resumir"})
+	datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+	if len(datas) != 2 {
+		t.Fatalf("buttons = %v, want 2", datas)
+	}
+
+	const typed = "resúmelo en dos líneas y guárdalo"
+	if got := broker.ResolveText(typed); got != askTextAnswered {
+		t.Fatalf("outcome = %v, want askTextAnswered", got)
+	}
+	got := waitAsk(t, out)
+	if got.err != nil {
+		t.Fatalf("AskOptions returned %v, want the typed answer", got.err)
+	}
+	if got.answer != typed {
+		t.Errorf("answer = %q, want the typed text %q", got.answer, typed)
+	}
+
+	// The text consumed the slot: the buttons of that question settle nothing any
+	// more, and the press stops its spinner as silently as any stale press.
+	broker.Resolve(context.Background(), callbackEvent("cb-late", datas[1]))
+	if acks := tr.acknowledgements(); len(acks) != 1 || acks[0] != "cb-late" {
+		t.Errorf("acknowledged = %v, want only the late press so its spinner stops", acks)
+	}
+	if texts := tr.acknowledgementTexts(); len(texts) != 1 || texts[0] != "" {
+		t.Errorf("toast texts = %q, want the silent toast of a press that settles nothing", texts)
+	}
+	if n := len(tr.messages()); n != 1 {
+		t.Errorf("questions posted = %d, want still one", n)
+	}
+
+	// And the slot is free: the next question is asked, and a typed answer settles
+	// it too.
+	next := startAsk(context.Background(), broker, "¿Y ahora?", []string{"uno", "dos"})
+	tr.waitMessages(t, 2)
+	if got := broker.ResolveText("el segundo"); got != askTextAnswered {
+		t.Fatalf("outcome for the second question = %v, want askTextAnswered", got)
+	}
+	if got := waitAsk(t, next); got.err != nil || got.answer != "el segundo" {
+		t.Errorf("second answer = %q (err %v), want the typed text", got.answer, got.err)
+	}
+}
+
+// TestResolveTextSettlesAnApprovalOnlyWithAnUnambiguousWord pins the closed set of
+// words an approval accepts, ignoring case and surrounding whitespace.
+func TestResolveTextSettlesAnApprovalOnlyWithAnUnambiguousWord(t *testing.T) {
+	for _, tc := range []struct {
+		text     string
+		outcome  askTextOutcome
+		approved bool
+	}{
+		{text: "sí", outcome: askTextApproved, approved: true},
+		{text: "si", outcome: askTextApproved, approved: true},
+		{text: "  SÍ  ", outcome: askTextApproved, approved: true},
+		{text: "Vale", outcome: askTextApproved, approved: true},
+		{text: "ok", outcome: askTextApproved, approved: true},
+		{text: "Adelante", outcome: askTextApproved, approved: true},
+		{text: "claro", outcome: askTextApproved, approved: true},
+		{text: "no", outcome: askTextRejected, approved: false},
+		{text: "Nop", outcome: askTextRejected, approved: false},
+		{text: "cancela", outcome: askTextRejected, approved: false},
+		{text: "rechaza", outcome: askTextRejected, approved: false},
+		{text: "  PARA ", outcome: askTextRejected, approved: false},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			tr := newRecordingAskTransport()
+			broker := newTestAskBroker(t, tr)
+
+			out := startApprove(context.Background(), broker, "¿Ejecutar bash? rm -rf /tmp/x")
+			tr.waitMessages(t, 1)
+
+			if got := broker.ResolveText(tc.text); got != tc.outcome {
+				t.Fatalf("outcome for %q = %v, want %v", tc.text, got, tc.outcome)
+			}
+			if tc.outcome.passesTextOn() {
+				t.Errorf("outcome %v lets the approval word run on as a message", tc.outcome)
+			}
+
+			got := waitApprove(t, out)
+			if got.err != nil {
+				t.Fatalf("Approve returned %v, want the typed answer to decide", got.err)
+			}
+			if got.approved != tc.approved {
+				t.Errorf("approved = %v after typing %q, want %v", got.approved, tc.text, tc.approved)
+			}
+			if acks := tr.acknowledgements(); len(acks) != 0 {
+				t.Errorf("acknowledged = %v, want none: no button was pressed", acks)
+			}
+		})
+	}
+}
+
+// TestResolveTextCancelsAnApprovalOnAnUnrelatedMessage is the fail-closed rule for
+// a pending approval: anything outside the closed set of words cancels it as a
+// rejection — never an approval — settles it, and lets the text go on as an
+// ordinary message.
+func TestResolveTextCancelsAnApprovalOnAnUnrelatedMessage(t *testing.T) {
+	for _, text := range []string{
+		"oye, ¿qué tiempo hace?",
+		"sí, pero mañana mejor",
+		"vale la pena mirarlo",
+		"para mañana lo vemos",
+		"hazlo con cuidado",
+	} {
+		t.Run(text, func(t *testing.T) {
+			tr := newRecordingAskTransport()
+			broker := newTestAskBroker(t, tr)
+
+			out := startApprove(context.Background(), broker, "¿Ejecutar bash? rm -rf /tmp/x")
+			datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+
+			got := broker.ResolveText(text)
+			if got != askTextApprovalCancelled {
+				t.Fatalf("outcome for %q = %v, want askTextApprovalCancelled", text, got)
+			}
+			if !got.settled() {
+				t.Errorf("outcome %v does not settle the question: it would block for the whole ask deadline", got)
+			}
+			if !got.passesTextOn() {
+				t.Errorf("outcome %v swallows the message: it must still run as an ordinary one", got)
+			}
+
+			approval := waitApprove(t, out)
+			if approval.err != nil {
+				t.Fatalf("Approve returned %v, want a failure-closed rejection", approval.err)
+			}
+			if approval.approved {
+				t.Errorf("approved = true after the unrelated message %q: ambiguity must fail closed", text)
+			}
+
+			// The approval's buttons are dead now: a press settles nothing, so the
+			// press path and the text path can never both answer one question.
+			broker.Resolve(context.Background(), callbackEvent("cb-late", datas[approvalIndexAllow]))
+			if acks := tr.acknowledgements(); len(acks) != 1 || acks[0] != "cb-late" {
+				t.Errorf("acknowledged = %v, want the stale press acknowledged on its own", acks)
+			}
+		})
+	}
+}
+
+// TestResolveTextWithNothingPendingLeavesTheTextAsAMessage proves the text path is
+// invisible when no question waits: the message is ordinary again, and a blank
+// message never answers a live question.
+func TestResolveTextWithNothingPendingLeavesTheTextAsAMessage(t *testing.T) {
+	tr := newRecordingAskTransport()
+	broker := newTestAskBroker(t, tr)
+
+	if got := broker.ResolveText("hola, ¿qué tal?"); got != askTextNoQuestion {
+		t.Fatalf("outcome = %v, want askTextNoQuestion", got)
+	}
+	for _, text := range []string{"sí", "no", "ok"} {
+		if got := broker.ResolveText(text); got != askTextNoQuestion {
+			t.Errorf("outcome for %q with nothing pending = %v, want askTextNoQuestion", text, got)
+		}
+	}
+	if n := len(tr.messages()); n != 0 {
+		t.Errorf("questions posted = %d, want none", n)
+	}
+
+	// A blank message is not an answer: the question keeps waiting, and only its
+	// own button settles it.
+	out := startAsk(context.Background(), broker, "¿Sigo?", []string{"sí", "no"})
+	datas := askButtonData(t, tr.waitMessages(t, 1)[0])
+	if got := broker.ResolveText("   "); got != askTextNoQuestion {
+		t.Errorf("outcome for a blank message = %v, want askTextNoQuestion", got)
+	}
+	if _, err := broker.AskOptions(context.Background(), "¿Otra?", []string{"a", "b"}); !errors.Is(err, errAskBusy) {
+		t.Errorf("error = %v, want errAskBusy: a blank message must not settle the question", err)
+	}
+	broker.Resolve(context.Background(), callbackEvent("cb-1", datas[0]))
+	if got := waitAsk(t, out); got.err != nil || got.answer != "sí" {
+		t.Errorf("answer = %q (err %v), want sí", got.answer, got.err)
+	}
+}
+
+// TestAskTextConfirmationSaysWhatHappened pins the reply the owner receives after
+// typing an answer: every settled outcome gets its own Spanish line, and an
+// ordinary message gets none.
+func TestAskTextConfirmationSaysWhatHappened(t *testing.T) {
+	for _, tc := range []struct {
+		outcome  askTextOutcome
+		want     string
+		wantWord string
+	}{
+		{outcome: askTextAnswered, want: bridgeAskTakenAsAnswerReply, wantWord: "respuesta"},
+		{outcome: askTextApproved, want: bridgeAskTakenAsApprovalReply, wantWord: "aprob"},
+		{outcome: askTextRejected, want: bridgeAskTakenAsRejectionReply, wantWord: "rechaz"},
+		{outcome: askTextApprovalCancelled, want: bridgeAskApprovalCancelledReply, wantWord: "cancel"},
+	} {
+		got := askTextConfirmation(tc.outcome)
+		if got != tc.want {
+			t.Errorf("confirmation for %v = %q, want %q", tc.outcome, got, tc.want)
+		}
+		if !strings.Contains(strings.ToLower(got), tc.wantWord) {
+			t.Errorf("confirmation %q does not say what happened (%q)", got, tc.wantWord)
+		}
+	}
+	if got := askTextConfirmation(askTextNoQuestion); got != "" {
+		t.Errorf("confirmation for an ordinary message = %q, want none", got)
+	}
+}

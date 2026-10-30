@@ -93,10 +93,16 @@ func runFakePiScenario(scenario string) {
 	// dialogReply keeps the extension_ui_response the bridge wrote back in the
 	// dialog scenarios, so the final text reports exactly what Pi received.
 	var dialogReply string
+	// prompts counts the prompts this child received and lastPrompt keeps the
+	// newest one, so a scenario can answer with the text it was given and a test
+	// can prove which message reached Pi.
+	prompts := 0
+	var lastPrompt string
 	for in.Scan() {
 		var cmd struct {
-			Type string `json:"type"`
-			ID   string `json:"id"`
+			Type    string `json:"type"`
+			ID      string `json:"id"`
+			Message string `json:"message"`
 		}
 		if json.Unmarshal(in.Bytes(), &cmd) != nil {
 			continue
@@ -107,6 +113,8 @@ func runFakePiScenario(scenario string) {
 			dialogReply = string(in.Bytes())
 			emit(`{"type":"agent_settled"}`)
 		case "prompt":
+			prompts++
+			lastPrompt = cmd.Message
 			if scenario == "handled" {
 				// Pi consumed the prompt without starting a run: no text follows.
 				emit(`{"type":"response","command":"prompt","success":true,"id":"` + cmd.ID +
@@ -121,6 +129,21 @@ func runFakePiScenario(scenario string) {
 				// it, exactly like Pi. The message carries markup characters on
 				// purpose, so the question the owner receives proves the escaping.
 				emit(dialogRequestLine(scenario))
+			case "echo-prompt":
+				// Every run answers with the prompt itself, so a test can tell the
+				// turns of one session apart by what each delivery carries.
+				emit(textDeltaLine(lastPrompt))
+				emit(`{"type":"agent_settled"}`)
+			case "dialog-confirm-once":
+				// The first prompt raises the approval; every later prompt answers
+				// with the prompt text itself, so a test can prove both that the
+				// approval was answered and which message reached Pi afterwards.
+				if prompts == 1 {
+					emit(dialogRequestLine("dialog-confirm"))
+					continue
+				}
+				emit(textDeltaLine(lastPrompt))
+				emit(`{"type":"agent_settled"}`)
 			case "stream":
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hola "}}`)
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"desde Pi"}}`)
@@ -135,6 +158,14 @@ func runFakePiScenario(scenario string) {
 			switch scenario {
 			case "stream":
 				text = "Hola desde Pi, **con markdown**"
+			case "echo-prompt":
+				text = lastPrompt
+			case "dialog-confirm-once":
+				if prompts > 1 {
+					text = lastPrompt
+				} else {
+					text = dialogReply
+				}
 			default:
 				if strings.HasPrefix(scenario, "dialog-") {
 					text = dialogReply
@@ -148,6 +179,17 @@ func runFakePiScenario(scenario string) {
 				`","data":{"text":` + string(encoded) + `}}`)
 		}
 	}
+}
+
+// textDeltaLine renders the RPC record of one streamed assistant delta, with the
+// text encoded so a prompt carrying quotes or newlines stays a valid record.
+func textDeltaLine(text string) string {
+	encoded, err := json.Marshal(text)
+	if err != nil {
+		return `{"type":"agent_settled"}`
+	}
+	return `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":` +
+		string(encoded) + `}}`
 }
 
 // dialogRequestLine renders the RPC record the fake Pi emits for the dialog
@@ -1605,4 +1647,273 @@ func TestBridgeResetFailureAnswersTheErrorLine(t *testing.T) {
 	if rich[1] != "Hola desde Pi, **con markdown**" {
 		t.Errorf("delivery after the failed reset = %q, want the ordinary Pi answer", rich[1])
 	}
+}
+
+// dialogRecords returns every chat message that is the dialog record Pi
+// received, so a test can assert the answer without depending on the order the
+// confirmation line and the turn's reply arrived in.
+func dialogRecords(rich []string) []map[string]any {
+	out := make([]map[string]any, 0, len(rich))
+	for _, markdown := range rich {
+		var resp map[string]any
+		if err := json.Unmarshal([]byte(markdown), &resp); err != nil {
+			continue
+		}
+		if resp["type"] == "extension_ui_response" {
+			out = append(out, resp)
+		}
+	}
+	return out
+}
+
+// countTyping reads how many chat actions the chat has received so far.
+func countTyping(b *fakeBot) int {
+	_, _, _, typing := b.snapshot()
+	return len(typing)
+}
+
+// TestTypingRefresherKeepsRefreshingUntilItIsStopped pins the refresher on its
+// own: it repeats the action inside every interval, a failing Bot API call is
+// logged and never stops it nor fails anything, and stop waits for the goroutine
+// so a finished turn leaves nothing behind.
+func TestTypingRefresherKeepsRefreshingUntilItIsStopped(t *testing.T) {
+	sender := &countingChatAction{err: errors.New("telegram: sendChatAction failed: too many requests")}
+	refresher := typingRefresher{
+		sender: sender,
+		chatID: testOwnerID,
+		action: bridgeTypingAction,
+		every:  10 * time.Millisecond,
+		logger: discardLogger(),
+	}
+
+	stop := refresher.start(context.Background())
+	deadline := time.Now().Add(10 * time.Second)
+	for sender.count() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := sender.count(); got < 3 {
+		t.Fatalf("chat actions = %d, want at least 3: a failing call must not stop the refresh", got)
+	}
+
+	stop()
+	stopped := sender.count()
+	time.Sleep(100 * time.Millisecond)
+	if got := sender.count(); got != stopped {
+		t.Errorf("chat actions went from %d to %d after stop: the refresher must end with the turn", stopped, got)
+	}
+	if got := sender.actions(); len(got) == 0 || got[0] != bridgeTypingAction {
+		t.Errorf("actions = %v, want %q", got, bridgeTypingAction)
+	}
+}
+
+// TestTypingRefresherStopsWhenTheContextIsCancelled proves cancellation — the
+// owner stopping the service, or a turn whose context died — ends the refresher
+// by itself, without anybody calling stop first.
+func TestTypingRefresherStopsWhenTheContextIsCancelled(t *testing.T) {
+	sender := &countingChatAction{}
+	refresher := typingRefresher{
+		sender: sender,
+		chatID: testOwnerID,
+		action: bridgeTypingAction,
+		every:  10 * time.Millisecond,
+		logger: discardLogger(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := refresher.start(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for sender.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel()
+	// stop must return promptly: the goroutine already ended with the context.
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return after the context was cancelled")
+	}
+	cancelled := sender.count()
+	time.Sleep(100 * time.Millisecond)
+	if got := sender.count(); got != cancelled {
+		t.Errorf("chat actions went from %d to %d after cancellation", cancelled, got)
+	}
+}
+
+// countingChatAction is a Bot API chat-action recorder that can fail every call
+// and shows all the calls it served.
+type countingChatAction struct {
+	mu   sync.Mutex
+	n    int
+	sent []string
+	err  error
+}
+
+func (c *countingChatAction) SendChatAction(_ context.Context, _ int64, action string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	c.sent = append(c.sent, action)
+	return c.err
+}
+
+func (c *countingChatAction) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func (c *countingChatAction) actions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sent...)
+}
+
+// TestBridgeTypingRefreshKeepsTheIndicatorAliveForTheWholeTurn is the reported
+// defect: Telegram shows "escribiendo…" for about five seconds, but a turn lasts
+// minutes. The indicator is refreshed inside the turn, including while the turn is
+// parked on an approval — the wait the owner cannot see — and the refresher stops
+// as soon as the turn ends.
+func TestBridgeTypingRefreshKeepsTheIndicatorAliveForTheWholeTurn(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm", 0, withTypingInterval(20*time.Millisecond))
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q is not the approval prompt: the turn is not parked", question)
+	}
+
+	// The turn is parked on the approval, far longer than one interval, and the
+	// indicator keeps being refreshed during that wait.
+	deadline := time.Now().Add(10 * time.Second)
+	for countTyping(h.bot.fakeBot) < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := countTyping(h.bot.fakeBot); got < 3 {
+		t.Fatalf("chat actions during the turn = %d, want at least 3: the indicator must outlive Telegram's five seconds", got)
+	}
+
+	// Answer the approval so the turn ends, and give a live refresher every chance
+	// to tick again: it must have stopped with the turn.
+	pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-typing", askButtonData(t, question)[approvalIndexAllow]))
+	h.waitRich(t, 2)
+	time.Sleep(60 * time.Millisecond)
+	after := countTyping(h.bot.fakeBot)
+	time.Sleep(200 * time.Millisecond)
+	if got := countTyping(h.bot.fakeBot); got != after {
+		t.Errorf("chat actions went from %d to %d after the turn ended: the refresher must stop with the turn", after, got)
+	}
+	for _, action := range h.bot.snapshotTyping() {
+		if action != bridgeTypingAction {
+			t.Errorf("chat action %q, want %q", action, bridgeTypingAction)
+		}
+	}
+}
+
+// TestBridgeTypedTextAnswersThePendingQuestion covers the second reported defect
+// at the wiring level: while an ask_options question waits, a typed message is the
+// answer — the tool receives that text and no new turn blocks on the turn slot for
+// the ten minutes of the ask deadline.
+func TestBridgeTypedTextAnswersThePendingQuestion(t *testing.T) {
+	h := startDialogBridge(t, "dialog-select", 0)
+	h.sendText(1, 1, "mira el enlace")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "¿Qué hago con el enlace?") {
+		t.Fatalf("question %q is not the select prompt", question)
+	}
+
+	const typed = "resúmelo en dos líneas"
+	h.sendText(2, 2, typed)
+
+	rich := h.waitRich(t, 3)
+	// Give a wrong extra delivery (a second question, a second turn) the chance to
+	// appear before asserting the count.
+	time.Sleep(100 * time.Millisecond)
+	if got := h.rich(); len(got) != 3 {
+		t.Fatalf("deliveries = %v, want exactly three: the question, the confirmation and the answer", got)
+	}
+
+	records := dialogRecords(rich)
+	if len(records) != 1 {
+		t.Fatalf("dialog records = %v, want exactly one, the answer Pi received", records)
+	}
+	if records[0]["value"] != typed {
+		t.Errorf("Pi received %v, want the typed text %q as the answer", records[0], typed)
+	}
+	if !containsLine(rich, bridgeAskTakenAsAnswerReply) {
+		t.Errorf("deliveries = %v, want the confirmation %q saying the question was taken as answered",
+			rich, bridgeAskTakenAsAnswerReply)
+	}
+	if got := h.spawns.count(); got != 1 {
+		t.Errorf("spawns = %d, want 1: a typed answer must not start another turn", got)
+	}
+}
+
+// TestBridgeUnrelatedTextCancelsTheApprovalAndRunsAsAMessage is the fail-closed
+// rule end to end: a sentence that is not an approval word cancels the pending
+// approval as a rejection — Pi receives confirmed:false, so nothing is granted —
+// and the same sentence then runs as an ordinary message, which Pi receives.
+func TestBridgeUnrelatedTextCancelsTheApprovalAndRunsAsAMessage(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm-once", 0)
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q is not the approval prompt", question)
+	}
+
+	const unrelated = "oye, ¿qué tiempo hace?"
+	h.sendText(2, 2, unrelated)
+
+	rich := h.waitRich(t, 4)
+	time.Sleep(100 * time.Millisecond)
+	if got := h.rich(); len(got) != 4 {
+		t.Fatalf("deliveries = %v, want four: the question, the confirmation, the answer Pi received and the new turn's reply", got)
+	}
+
+	records := dialogRecords(rich)
+	if len(records) != 1 {
+		t.Fatalf("dialog records = %v, want exactly one", records)
+	}
+	if records[0]["confirmed"] != false {
+		t.Errorf("Pi received %v, want confirmed:false: an unrelated message must never approve", records[0])
+	}
+	if _, granted := records[0]["cancelled"]; granted {
+		t.Errorf("Pi received %v, want a plain rejection instead of a cancellation record", records[0])
+	}
+	if !containsLine(rich, bridgeAskApprovalCancelledReply) {
+		t.Errorf("deliveries = %v, want the confirmation %q naming the cancelled approval",
+			rich, bridgeAskApprovalCancelledReply)
+	}
+	// The message itself was not swallowed: the new turn answered with it, which is
+	// only possible if Pi received it as a prompt.
+	if !containsLine(rich, unrelated) {
+		t.Errorf("deliveries = %v, want the unrelated message to reach Pi and come back as a turn", rich)
+	}
+	if got := h.spawns.count(); got != 1 {
+		t.Errorf("spawns = %d, want 1: the session is reused, the text is an ordinary prompt", got)
+	}
+}
+
+// containsLine reports whether the chat received exactly that line.
+func containsLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotTyping returns the chat actions the fake recorded.
+func (b *fakeBot) snapshotTyping() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.typing...)
 }

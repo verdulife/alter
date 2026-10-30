@@ -76,8 +76,49 @@ var approvalOptions = []string{"Aprobar", "Rechazar"}
 // owner did not ask for.
 const askApprovalAllowStyle = "success"
 
-// approvalIndexAllow is the button index that approves.
-const approvalIndexAllow = 0
+// approvalIndexAllow is the button index that approves, and approvalIndexReject
+// the one that rejects. A typed answer settles the question through the same
+// index, so a press and a word can never disagree about what an approval means.
+const (
+	approvalIndexAllow  = 0
+	approvalIndexReject = 1
+)
+
+// approvalWord is what one typed message says about a pending approval: allow,
+// reject, or nothing this bridge is willing to read as an answer.
+type approvalWord int
+
+const (
+	approvalWordUnknown approvalWord = iota
+	approvalWordAllow
+	approvalWordReject
+)
+
+// The only words that answer an approval, and the only place they are listed. The
+// set is closed on purpose: a sentence that merely contains one of them ("sí, pero
+// mañana") is not an answer, and reading it as a yes would turn the owner's doubt
+// into permission. Case and surrounding whitespace are ignored.
+var (
+	approvalWordsAllow  = []string{"sí", "si", "vale", "ok", "adelante", "claro"}
+	approvalWordsReject = []string{"no", "nop", "cancela", "rechaza", "para"}
+)
+
+// parseApprovalWord reports what a typed message says about a pending approval.
+// Only a whole word counts, so an unrelated sentence can never approve anything.
+func parseApprovalWord(text string) approvalWord {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	for _, word := range approvalWordsAllow {
+		if normalized == word {
+			return approvalWordAllow
+		}
+	}
+	for _, word := range approvalWordsReject {
+		if normalized == word {
+			return approvalWordReject
+		}
+	}
+	return approvalWordUnknown
+}
 
 // The acknowledgements the owner sees as a toast on the press. They confirm that
 // the press registered; they are not a second message, so they never edit the
@@ -113,16 +154,104 @@ type bridgeAskBroker struct {
 	pending *bridgePendingAsk
 }
 
-// bridgePendingAsk is one question waiting for a press. reply carries the chosen
-// option index; it is buffered so Resolve never blocks the poll loop. labels and
-// kind are kept only so a press can be acknowledged with what it chose: neither
-// one changes what the press means.
+// bridgePendingAsk is one question waiting for an answer. reply carries the
+// answer — an option index from a button press, or the text the owner typed — and
+// is buffered so Resolve and ResolveText never block the poll loop. labels and
+// kind are kept only so a press can be acknowledged with what it chose and so a
+// typed message can be read according to the question it answers: neither one
+// changes what a press means.
 type bridgePendingAsk struct {
 	id      string
 	labels  []string
 	options int
 	kind    askKind
-	reply   chan int
+	reply   chan askAnswer
+}
+
+// askAnswer is the one answer a question receives. A button press produces an
+// option index; a typed message produces its text. Exactly one of the two arrives,
+// because settling consumes the pending slot under the broker's lock.
+type askAnswer struct {
+	index int
+	text  string
+	// typed marks the text answer: it is the whole answer for an ask_options
+	// question and never an approval by accident.
+	typed bool
+}
+
+// textAnswer maps one typed message onto this question's answer. A neutral
+// question takes the text as it is — a chat question answered by typing is the
+// point — while an approval only takes a word that cannot be misread and treats
+// anything else as a cancellation, which settles it as a rejection.
+func (p *bridgePendingAsk) textAnswer(text string) (askTextOutcome, askAnswer) {
+	if p.kind != askKindApproval {
+		return askTextAnswered, askAnswer{text: text, typed: true}
+	}
+	switch parseApprovalWord(text) {
+	case approvalWordAllow:
+		return askTextApproved, askAnswer{index: approvalIndexAllow}
+	case approvalWordReject:
+		return askTextRejected, askAnswer{index: approvalIndexReject}
+	default:
+		// Not an answer to this question: fail closed as a rejection, never as an
+		// approval the owner did not give.
+		return askTextApprovalCancelled, askAnswer{index: approvalIndexReject}
+	}
+}
+
+// askTextOutcome is what one typed message did to the pending question. The chat
+// receives a line that states it, and the wiring uses it to decide whether the
+// message also runs as an ordinary turn.
+type askTextOutcome int
+
+const (
+	// askTextNoQuestion: nothing was waiting, so the message is ordinary.
+	askTextNoQuestion askTextOutcome = iota
+	// askTextAnswered: an ask_options question took the text as its answer.
+	askTextAnswered
+	// askTextApproved and askTextRejected: an approval took one unambiguous word.
+	askTextApproved
+	askTextRejected
+	// askTextApprovalCancelled: a message that is not an approval word cancelled
+	// the approval fail-closed — as a rejection — and goes on as an ordinary one.
+	askTextApprovalCancelled
+)
+
+// settled reports whether the text consumed the pending question.
+func (o askTextOutcome) settled() bool { return o != askTextNoQuestion }
+
+// passesTextOn reports whether the message still runs as an ordinary prompt. Only
+// the text that cancelled an approval keeps travelling; the message that answered
+// a question was consumed by it.
+func (o askTextOutcome) passesTextOn() bool {
+	return o == askTextNoQuestion || o == askTextApprovalCancelled
+}
+
+// The lines the chat receives after a typed message met a pending question. Each
+// one states what happened, because the tool call that just returned is invisible
+// to the owner: silence would leave him wondering whether he answered.
+const (
+	bridgeAskTakenAsAnswerReply     = "Anotado: tomo tu mensaje como respuesta a la pregunta."
+	bridgeAskTakenAsApprovalReply   = "Anotado: lo tomo como aprobación."
+	bridgeAskTakenAsRejectionReply  = "Anotado: lo tomo como rechazo."
+	bridgeAskApprovalCancelledReply = "He cancelado la aprobación porque llegó otro mensaje: no se ha aprobado nada, sigo con lo que me escribes."
+)
+
+// askTextConfirmation is the line that states what a typed message did. An
+// ordinary message gets none, so the chat never receives noise for it.
+func askTextConfirmation(o askTextOutcome) string {
+	switch o {
+	case askTextAnswered:
+		return bridgeAskTakenAsAnswerReply
+	case askTextApproved:
+		return bridgeAskTakenAsApprovalReply
+	case askTextRejected:
+		return bridgeAskTakenAsRejectionReply
+	case askTextApprovalCancelled:
+		return bridgeAskApprovalCancelledReply
+	default:
+		return ""
+	}
 }
 
 // ackText is the toast the owner sees after pressing the button of this question.
@@ -158,14 +287,19 @@ func (b *bridgeAskBroker) AskOptions(ctx context.Context, question string, optio
 		return "", fmt.Errorf("ask_options needs between 2 and 4 options, got %d", len(options))
 	}
 
-	index, err := b.ask(ctx, question, options, askKindOptions)
+	answer, err := b.ask(ctx, question, options, askKindOptions)
 	if err != nil {
 		if errors.Is(err, errAskBusy) || errors.Is(err, tools.ErrNoAnswer) {
 			return "", err
 		}
 		return "", fmt.Errorf("ask_options: %w", err)
 	}
-	return options[index], nil
+	if answer.typed {
+		// The owner typed the answer instead of pressing a neutral choice: the text
+		// is the answer and reaches the model exactly as it was written.
+		return answer.text, nil
+	}
+	return options[answer.index], nil
 }
 
 // Approve asks the owner to approve one destructive action and reports whether it
@@ -182,7 +316,7 @@ func (b *bridgeAskBroker) Approve(ctx context.Context, question string) (bool, e
 		return false, errors.New("approve needs a question")
 	}
 
-	index, err := b.ask(ctx, question, approvalOptions, askKindApproval)
+	answer, err := b.ask(ctx, question, approvalOptions, askKindApproval)
 	if err != nil {
 		switch {
 		case errors.Is(err, tools.ErrNoAnswer):
@@ -193,52 +327,98 @@ func (b *bridgeAskBroker) Approve(ctx context.Context, question string) (bool, e
 			return false, fmt.Errorf("approval: %w", err)
 		}
 	}
-	return index == approvalIndexAllow, nil
+	if answer.typed {
+		// Only an ask_options question accepts free text. An unexpected typed
+		// answer must never be read as an approval: fail closed.
+		return false, nil
+	}
+	return answer.index == approvalIndexAllow, nil
 }
 
-// ask posts one question with one button per option and waits for the press. It
-// owns the single pending slot: whoever ends the wait — press, deadline or
-// cancellation — the slot is free again, so a later question can never inherit it.
-func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []string, kind askKind) (int, error) {
+// ask posts one question with one button per option and waits for the answer. It
+// owns the single pending slot: whoever ends the wait — press, typed answer,
+// deadline or cancellation — the slot is free again, so a later question can never
+// inherit it.
+func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []string, kind askKind) (askAnswer, error) {
 	id, err := newAskID()
 	if err != nil {
-		return 0, err
+		return askAnswer{}, err
 	}
 	p := &bridgePendingAsk{
 		id:      id,
 		labels:  append([]string(nil), options...),
 		options: len(options),
 		kind:    kind,
-		reply:   make(chan int, 1),
+		reply:   make(chan askAnswer, 1),
 	}
 
 	b.mu.Lock()
 	if b.pending != nil {
 		b.mu.Unlock()
-		return 0, errAskBusy
+		return askAnswer{}, errAskBusy
 	}
 	b.pending = p
 	b.mu.Unlock()
 
-	// Whatever ends the wait — press, deadline or cancellation — the slot must be
-	// free again, or the next question would never be posted.
+	// Whatever ends the wait — press, typed answer, deadline or cancellation — the
+	// slot must be free again, or the next question would never be posted.
 	defer b.release(p)
 
 	if _, err := b.client.SendRich(ctx, b.chatID, askMarkdown(question, options, id, kind)); err != nil {
 		// No buttons means no press: fail loudly so the caller can block the action
 		// instead of waiting for an answer that cannot come.
-		return 0, fmt.Errorf("send question: %w", err)
+		return askAnswer{}, fmt.Errorf("send question: %w", err)
 	}
 
 	select {
-	case index := <-p.reply:
-		if index < 0 || index >= len(options) {
-			return 0, fmt.Errorf("chosen index %d is out of range", index)
+	case answer := <-p.reply:
+		if answer.typed {
+			return answer, nil
 		}
-		return index, nil
+		if answer.index < 0 || answer.index >= len(options) {
+			return askAnswer{}, fmt.Errorf("chosen index %d is out of range", answer.index)
+		}
+		return answer, nil
 	case <-ctx.Done():
-		return 0, tools.ErrNoAnswer
+		return askAnswer{}, tools.ErrNoAnswer
 	}
+}
+
+// ResolveText settles the pending question from a typed message and reports what
+// it did. A neutral ask_options question takes any text as its answer, because a
+// chat question answered by typing is the point. An approval only takes one of the
+// words listed in approvalWordsAllow/approvalWordsReject: any other text cancels it
+// fail-closed — as a rejection — and goes on as an ordinary message, so nothing
+// stays blocked for the whole ask deadline while the owner believes he answered.
+//
+// Whoever settles first wins: the slot is consumed under the same lock a press
+// takes, so a typed answer and a later press can never both answer one question.
+func (b *bridgeAskBroker) ResolveText(text string) askTextOutcome {
+	answer := strings.TrimSpace(text)
+	if answer == "" {
+		// Nothing to answer with: the question keeps waiting exactly as it was.
+		return askTextNoQuestion
+	}
+
+	b.mu.Lock()
+	p := b.pending
+	if p == nil {
+		b.mu.Unlock()
+		return askTextNoQuestion
+	}
+	outcome, reply := p.textAnswer(answer)
+	// Consumed: the slot is free at once, so the press of that question can no
+	// longer settle anything.
+	b.pending = nil
+	b.mu.Unlock()
+
+	if outcome == askTextApprovalCancelled {
+		b.logger.Printf("bridge: approval %s cancelled: the message is not an approval word, so nothing was approved", p.id)
+	}
+
+	// Buffered, so the poll loop never waits for the turn to wake up.
+	p.reply <- reply
+	return outcome
 }
 
 // Resolve settles the pending question from one inbound event. A press always
@@ -246,7 +426,8 @@ func (b *bridgeAskBroker) ask(ctx context.Context, question string, options []st
 // button in an old message must not look broken to the owner. A press that does
 // settle the question also carries a short toast saying what it chose. Only a
 // press carrying the pending question's id and a valid option index settles it,
-// so a late press can never answer a later question.
+// so a late press can never answer a later question — and never one a typed
+// message already answered.
 func (b *bridgeAskBroker) Resolve(ctx context.Context, ev telegram.Event) {
 	if ev.Kind != telegram.EventCallback {
 		return
@@ -256,7 +437,7 @@ func (b *bridgeAskBroker) Resolve(ctx context.Context, ev telegram.Event) {
 
 	b.mu.Lock()
 	p := b.pending
-	var reply chan int
+	var reply chan askAnswer
 	ackText := ""
 	if ok && p != nil && p.id == id && index < p.options {
 		// Consumed: one press settles one question, and the slot is free at once.
@@ -279,7 +460,7 @@ func (b *bridgeAskBroker) Resolve(ctx context.Context, ev telegram.Event) {
 	if reply == nil {
 		return
 	}
-	reply <- index
+	reply <- askAnswer{index: index}
 }
 
 // release frees the pending slot if it still belongs to p.
