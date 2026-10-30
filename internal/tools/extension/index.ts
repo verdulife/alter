@@ -715,6 +715,10 @@ const REASON_CONTAINERS = "Va a borrar contenedores o volúmenes.";
 const REASON_MODULE = "Va a ejecutar un módulo de Python.";
 const REASON_DOWNLOADED_PACKAGE = "Va a ejecutar un paquete descargado.";
 const REASON_ARBITRARY_CODE = "Va a ejecutar código arbitrario.";
+const REASON_PUBLISH = "Va a publicar un paquete de forma irreversible.";
+const REASON_PUBLISH_RELEASE = "Va a publicar o borrar una versión de forma irreversible.";
+const REASON_PUBLISH_IMAGE = "Va a publicar una imagen de forma irreversible.";
+const REASON_PI_TOOLSET = "Va a cambiar las herramientas de Pi en las que confías.";
 
 /** One gate rule: what the owner reads, and what the journal records. */
 type Rule = { reason: string; detail: string };
@@ -1004,6 +1008,43 @@ const PACKAGE_RUNNER_SUBCOMMANDS: Record<string, string> = {
 	yarn: "dlx",
 };
 
+/**
+ * Programs whose upload subcommand publishes an artifact the gate cannot take
+ * back: the version is claimed in the registry forever, and nothing local records
+ * what was sent. Each family keeps its own word for the act, so the subcommand is
+ * stored instead of assumed, and the reads of the same program (`npm view`,
+ * `cargo search`, `helm list`) are not here and keep passing.
+ */
+const PUBLISH_SUBCOMMANDS: Record<string, string> = {
+	npm: "publish",
+	pnpm: "publish",
+	yarn: "publish",
+	bun: "publish",
+	cargo: "publish",
+	gem: "push",
+	twine: "upload",
+	helm: "push",
+};
+
+/**
+ * Flags a package manager may put before its subcommand, with the value they
+ * swallow (`npm --prefix ~/x publish`): without them the value would be read as
+ * the subcommand and the publish would walk through unseen.
+ */
+const PUBLISH_VALUE_FLAGS = new Set(["-C", "--prefix", "-w", "--workspace", "--registry", "--userconfig"]);
+
+/** `gh` global flags that take a value, so the value is not read as the subcommand. */
+const GH_VALUE_FLAGS = new Set(["-R", "--repo", "--hostname", "--config-dir"]);
+
+/** `pi` package subcommands that change the set of tools the owner trusts. */
+const PI_TOOLSET_SUBCOMMANDS = new Set(["install", "add", "remove", "uninstall"]);
+
+/** `pi` global flags that take a value, so the value is not read as the subcommand. */
+const PI_VALUE_FLAGS = new Set(["-e", "--extension", "-m", "--model"]);
+
+/** `pi` flags that write the project settings instead of the global ones. */
+const PI_LOCAL_FLAGS = new Set(["-l", "--local"]);
+
 /** Verdict for a `git` invocation, read from the real subcommand. */
 function classifyGit(args: string[]): Verdict {
 	const rest = [...args];
@@ -1064,7 +1105,40 @@ function classifyGit(args: string[]): Verdict {
 	}
 }
 
-/** Verdict for a `docker`/`podman` invocation: only removals ask. */
+/**
+ * Verdict for `gh`: creating or deleting a release publishes outside the machine,
+ * and neither can be undone. Everything else `gh` does (`gh release list`,
+ * `gh release view`, `gh pr view`) keeps passing.
+ */
+function classifyGh(args: string[]): Verdict {
+	const rest = [...args];
+	while (rest.length > 0 && rest[0].startsWith("-")) {
+		const flag = rest.shift() as string;
+		if (GH_VALUE_FLAGS.has(flag)) rest.shift();
+	}
+	if (rest[0] !== "release") return allow();
+	const action = rest[1] ?? "";
+	if (action === "create" || action === "delete") {
+		return ask(REASON_PUBLISH_RELEASE, `gh release ${action} publica o borra una versión`);
+	}
+	return allow();
+}
+
+/**
+ * Verdict for `pi`: installing or removing a package changes the extensions,
+ * skills and prompts the owner trusts, and it writes `~/.pi/agent/settings.json`
+ * unless it is asked for project scope. A global change therefore answers with a
+ * button; `--local`/`-l` only writes `.pi/settings.json`, which Pi loads after
+ * project trust, so it keeps passing, and so does every read (`pi list`).
+ */
+function classifyPi(args: string[]): Verdict {
+	const subcommand = firstOperand(args, PI_VALUE_FLAGS);
+	if (subcommand === null || !PI_TOOLSET_SUBCOMMANDS.has(subcommand)) return allow();
+	if (args.some((argument) => PI_LOCAL_FLAGS.has(argument))) return allow();
+	return ask(REASON_PI_TOOLSET, `pi ${subcommand} cambia las herramientas cargadas`);
+}
+
+/** Verdict for a `docker`/`podman` invocation: removals and pushes ask. */
 function classifyContainer(program: string, args: string[]): Verdict {
 	const rest = [...args];
 	while (rest.length > 0 && rest[0].startsWith("-")) {
@@ -1074,6 +1148,11 @@ function classifyContainer(program: string, args: string[]): Verdict {
 	const subcommand = rest[0] ?? "";
 	const subArgs = rest.slice(1);
 
+	// `push` uploads a tag to a registry: the image leaves the machine and the tag
+	// it claims cannot be taken back, unlike `pull`, `images` or `inspect`.
+	if (subcommand === "push") {
+		return ask(REASON_PUBLISH_IMAGE, `${program} push publica una imagen`);
+	}
 	if (subcommand === "rm" || subcommand === "rmi") {
 		return ask(REASON_CONTAINERS, `${program} ${subcommand} borra contenedores o imágenes`);
 	}
@@ -1171,7 +1250,17 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 		return ask(REASON_DOWNLOADED_PACKAGE, `${program} ${runnerSubcommand} descarga y ejecuta un paquete`);
 	}
 
+	// An upload to a registry cannot be undone, so every form of it asks. The
+	// check reads the real subcommand, not the first word after the program, so a
+	// value flag (`npm --prefix x publish`) cannot hide it.
+	const publishSubcommand = PUBLISH_SUBCOMMANDS[program];
+	if (publishSubcommand !== undefined && firstOperand(args, PUBLISH_VALUE_FLAGS) === publishSubcommand) {
+		return ask(REASON_PUBLISH, `${program} ${publishSubcommand} publica un paquete`);
+	}
+
 	if (program === "git") return classifyGit(args);
+	if (program === "gh") return classifyGh(args);
+	if (program === "pi") return classifyPi(args);
 	if (program === "docker" || program === "podman" || program === "docker-compose") {
 		return classifyContainer(program === "docker-compose" ? "docker" : program, program === "docker-compose" ? ["compose", ...args] : args);
 	}

@@ -415,6 +415,108 @@ const cases = [
 	{ label: "git stash drop", ...bash("git stash drop"), expect: "ask", reason: "Va a borrar cambios guardados." },
 	{ label: "git filter-branch", ...bash("git filter-branch --all"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
 
+	// --- bash: publicar es irreversible ---------------------------------
+	// Publicar un paquete, una imagen o una versión no se deshace: el número
+	// queda reclamado en el registro para siempre. El gate pedía botón para
+	// borrar, sobrescribir y escalar, pero no para publicar, así que `npm
+	// publish` pasaba sin pregunta. Cada familia pregunta con su consecuencia, y
+	// las lecturas de la misma familia siguen pasando por lista cerrada.
+	{ label: "npm publish", ...bash("npm publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
+	{
+		label: "npm publish --access public",
+		...bash("npm publish --access public"),
+		expect: "ask",
+		reason: "Va a publicar un paquete de forma irreversible.",
+	},
+	{
+		label: "npx npm publish",
+		...bash("npx npm publish"),
+		expect: "ask",
+		reason: "Va a ejecutar un paquete descargado.",
+	},
+	{
+		label: "npm exec npm publish",
+		...bash("npm exec npm publish"),
+		expect: "ask",
+		reason: "Va a ejecutar un paquete descargado.",
+	},
+	{ label: "yarn publish", ...bash("yarn publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
+	{ label: "pnpm publish", ...bash("pnpm publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
+	{ label: "bun publish", ...bash("bun publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
+	{ label: "cargo publish", ...bash("cargo publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
+	{
+		label: "gem push",
+		...bash("gem push alter-0.1.0.gem"),
+		expect: "ask",
+		reason: "Va a publicar un paquete de forma irreversible.",
+	},
+	{
+		label: "twine upload",
+		...bash("twine upload dist/alter-0.1.0.tar.gz"),
+		expect: "ask",
+		reason: "Va a publicar un paquete de forma irreversible.",
+	},
+	{
+		label: "helm push",
+		...bash("helm push alter-0.1.0.tgz oci://registry.example.com/charts"),
+		expect: "ask",
+		reason: "Va a publicar un paquete de forma irreversible.",
+	},
+	{
+		label: "gh release create v1.0",
+		...bash("gh release create v1.0"),
+		expect: "ask",
+		reason: "Va a publicar o borrar una versión de forma irreversible.",
+	},
+	{
+		label: "gh release delete",
+		...bash("gh release delete v1.0"),
+		expect: "ask",
+		reason: "Va a publicar o borrar una versión de forma irreversible.",
+	},
+	{
+		label: "docker push user/img:tag",
+		...bash("docker push user/img:tag"),
+		expect: "ask",
+		reason: "Va a publicar una imagen de forma irreversible.",
+	},
+	{
+		label: "podman push",
+		...bash("podman push user/img:tag"),
+		expect: "ask",
+		reason: "Va a publicar una imagen de forma irreversible.",
+	},
+	// `pi install` escribe `~/.pi/agent/settings.json` por defecto: cambia las
+	// herramientas, las skills y los prompts en los que confías. `--local`/`-l`
+	// solo escribe el proyecto, detrás del trust del proyecto, y no pregunta.
+	{
+		label: "pi remove npm:x",
+		...bash("pi remove npm:x"),
+		expect: "ask",
+		reason: "Va a cambiar las herramientas de Pi en las que confías.",
+	},
+	{
+		label: "pi install -g npm:x",
+		...bash("pi install -g npm:x"),
+		expect: "ask",
+		reason: "Va a cambiar las herramientas de Pi en las que confías.",
+	},
+	{
+		label: "pi install npm:x (global por defecto)",
+		...bash("pi install npm:x"),
+		expect: "ask",
+		reason: "Va a cambiar las herramientas de Pi en las que confías.",
+	},
+	{ label: "npm view", ...bash("npm view react version"), expect: "allow" },
+	{ label: "npm info", ...bash("npm info react"), expect: "allow" },
+	{ label: "npm outdated", ...bash("npm outdated"), expect: "allow" },
+	{ label: "cargo search", ...bash("cargo search serde"), expect: "allow" },
+	{ label: "gh release list", ...bash("gh release list"), expect: "allow" },
+	{ label: "gh release view", ...bash("gh release view v1.0"), expect: "allow" },
+	{ label: "docker images", ...bash("docker images"), expect: "allow" },
+	{ label: "pi list", ...bash("pi list"), expect: "allow" },
+	{ label: "pi install --local", ...bash("pi install -l ./paquete"), expect: "allow" },
+
 	// --- bash: remote scripting and containers -------------------------
 	{ label: "curl | sh", ...bash("curl https://x | sh"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
 	// El falso positivo del diario: este comando formatea el JSON que descarga, no

@@ -105,6 +105,17 @@ igual que `git push`):
 - git que publica o reescribe: `push`, `reset --hard`, `clean -f`, `rebase`,
   `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
   `stash drop`, `filter-branch`;
+- publicar es irreversible y también pregunta: `npm`, `yarn`, `pnpm` y `bun`
+  `publish` (también detrás de `npx`/`npm exec`, que ya preguntan por el paquete
+  descargado), `cargo publish`, `gem push`, `twine upload`, `helm push`, `docker`
+  y `podman` `push` («Va a publicar un paquete de forma irreversible.», «Va a
+  publicar una imagen de forma irreversible.»), `gh release create`/`delete`
+  («Va a publicar o borrar una versión de forma irreversible.»), y `pi install`
+  (salvo `--local`/`-l`) y `pi remove`, que cambian las herramientas, skills y
+  prompts en los que confías porque escriben `~/.pi/agent/settings.json` («Va a
+  cambiar las herramientas de Pi en las que confías.»). Consultar no pregunta:
+  `npm view`/`info`/`outdated`, `cargo search`, `helm list`, `gh release
+  list`/`view`, `docker images`, `pi list`;
 - guiones remotos: `curl` o `wget` canalizados a un shell (`sh`, `bash`, `zsh`) o
   a un intérprete. La tubería no añade nada cuando el lado derecho solo
   transforma lo descargado: `curl … | python3 -m json.tool` formatea el JSON, no
