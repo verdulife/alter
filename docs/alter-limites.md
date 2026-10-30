@@ -105,7 +105,10 @@ igual que `git push`):
 - git que publica o reescribe: `push`, `reset --hard`, `clean -f`, `rebase`,
   `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
   `stash drop`, `filter-branch`;
-- guiones remotos: `curl` o `wget` canalizados a un intérprete;
+- guiones remotos: `curl` o `wget` canalizados a un shell (`sh`, `bash`, `zsh`) o
+  a un intérprete. La tubería no añade nada cuando el lado derecho solo
+  transforma lo descargado: `curl … | python3 -m json.tool` formatea el JSON, no
+  lo ejecuta;
 - intérpretes: `python`, `python3`, `python3.x`, `node`, `perl`, `ruby`. El nombre
   del programa no basta para decidir, porque el instalador va detrás: `python3 -m
   pip install …` instala lo mismo que `pip install` (y `-m pip uninstall` y `-m
@@ -113,8 +116,12 @@ igual que `git push`):
   visto nunca y pregunta («Va a ejecutar un módulo de Python.»), y `-c` de Python
   y `-e`/`-E` de Perl y Ruby (más `--eval` de Node) son código escrito en el propio
   comando, que pregunta sin intentar leerlo («Va a ejecutar código arbitrario.»).
-  No hay lista de módulos permitidos: `venv`, `http.server` y `json.tool` escriben
-  o sirven, así que ninguno está en ella;
+  Los módulos que solo transforman datos **no preguntan**, y solo esos: la lista
+  es cerrada —hoy `json.tool` y `base64`, que leen su entrada y escriben en
+  stdout sin archivo de salida, sin sockets y sin instalar nada— y todo módulo que
+  no esté en ella sigue preguntando. La lista se lee además por la forma de la
+  orden: `python3 -m json.tool in.json out.json` escribe ese segundo archivo y
+  pregunta;
 - lanzadores de paquetes: `npx`, `npm exec`, `pnpm dlx`, `yarn dlx` y `bunx`
   descargan un paquete y lo ejecutan, así que preguntan siempre («Va a ejecutar un
   paquete descargado.»);
@@ -192,7 +199,8 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
    borrar o cifrar archivos tuyos sin que veas nada. La red de seguridad ya no es
    el botón: es el diario y lo que revises en él.
    - Desde el agujero del diario (`python3 -m pip install …` permitido porque el
-     programa era `python3`), los intérpretes se leen por lo que se les pide: `-m`,
+     programa era `python3`), los intérpretes se leen por lo que se les pide: `-m`
+     (salvo los módulos que solo transforman datos, que son una lista cerrada),
      `-c`, `-e`/`-E`/`--eval` y los lanzadores de paquetes (`npx`, `npm exec`,
      `pnpm dlx`, `yarn dlx`, `bunx`) preguntan. No se lee el contenido de ningún
      programa: `python3 script.py`, `node script.js` y `./binario` se siguen

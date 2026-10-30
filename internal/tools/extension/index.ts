@@ -773,17 +773,26 @@ function isGlobalInstallFlag(argument: string): boolean {
 	);
 }
 
-/** Program a simple command actually runs, after assignments and transparent wrappers. */
-function programOf(input: string[]): string {
+/**
+ * Words a simple command actually runs, after its assignments and transparent
+ * wrappers: the words of `env FOO=1 rm x` start at `rm`.
+ */
+function commandWords(input: string[]): string[] {
 	let rest = [...input];
 	for (let guard = 0; guard < 8; guard += 1) {
 		while (rest.length > 0 && ENV_ASSIGNMENT.test(rest[0])) rest = rest.slice(1);
-		if (rest.length === 0) return "";
+		if (rest.length === 0) return rest;
 		const program = basename(rest[0]);
-		if (!TRANSPARENT_WRAPPERS.has(program)) return program;
+		if (!TRANSPARENT_WRAPPERS.has(program)) return rest;
 		rest = stripWrapperArgs(program, rest.slice(1));
 	}
-	return "";
+	return [];
+}
+
+/** Program a simple command actually runs, after assignments and transparent wrappers. */
+function programOf(input: string[]): string {
+	const rest = commandWords(input);
+	return rest.length > 0 ? basename(rest[0]) : "";
 }
 
 /** The inline script of `sh -c '…'`, or null when the shell is not running one. */
@@ -860,21 +869,60 @@ function isPipModule(module: string): boolean {
 }
 
 /**
- * Verdict for `python`. A module asks, because it is code that is not in the command
- * line: `-m pip install`/`uninstall` and `-m ensurepip` with the installer reason
- * and any other module as unknown code (there is no allowlist of modules worth
- * keeping: `venv`, `http.server` and `json.tool` all write or serve). Inline code
- * (`-c`) asks as arbitrary code. A script argument is allowed: it is an existing
- * file, the same class as `go test`, and the decision is recorded in
- * `docs/alter-limites.md`.
+ * Closed allowlist of `python -m` modules that only transform the data they are
+ * given: they read stdin or an input file and write the result to stdout. The
+ * number is how many operands the module reads, and with that shape no invocation
+ * writes a file, opens a socket or installs anything: `json.tool` writes its
+ * *second* positional (`python3 -m json.tool in.json out.json` overwrites
+ * `out.json`), and that form is the reason for the cap.
+ *
+ * `json.tool` re-prints JSON, `base64` encodes or decodes bytes. Nothing else is
+ * here: `http.server`/`pydoc -b` serve, `venv`/`ensurepip`/`pip` install,
+ * `doctest`/`timeit` run code, `gzip`/`zipfile`/`pickletools -o` write files.
+ * Every module this reader has not checked keeps the ask it had, and the whole
+ * list is documented in `docs/alter-limites.md`.
  */
-function classifyPython(program: string, args: string[]): Verdict {
+const DATA_TRANSFORM_MODULES: Record<string, number> = {
+	"json.tool": 1,
+	base64: 1,
+};
+
+/**
+ * True when `module` is in the allowlist and its words leave it no output file:
+ * a flag is not an operand, and every other word counts as one.
+ */
+function isDataTransformModule(module: string, args: string[]): boolean {
+	const operandLimit = DATA_TRANSFORM_MODULES[module];
+	if (operandLimit === undefined) return false;
+	let operands = 0;
+	for (const argument of args) {
+		// `-` is the stdin operand, not a flag: it occupies a slot like a file does.
+		if (argument.startsWith("-") && argument !== "-") continue;
+		operands += 1;
+		if (operands > operandLimit) return false;
+	}
+	return true;
+}
+
+/** What a `python` command line runs: inline code, a module, or neither. */
+type PythonRequest =
+	| { kind: "inline" }
+	| { kind: "module"; module: string; args: string[] }
+	| { kind: "none" };
+
+/**
+ * Request of a `python` invocation, read from its options. `-c` and `-m` are the
+ * only flags that decide, and both end the scan: what follows `-m` belongs to the
+ * module. A script argument, `-` and `--` run a file, so they leave nothing for
+ * this reader to add.
+ */
+function pythonRequest(args: string[]): PythonRequest {
 	for (let index = 0; index < args.length; index += 1) {
 		const argument = args[index];
 		// `--` ends the options and `-` reads the script from stdin: both run a
 		// script, so they keep the verdict `python3 script.py` has.
-		if (argument === "--" || argument === "-") return allow();
-		if (!argument.startsWith("-")) return allow(); // an existing script
+		if (argument === "--" || argument === "-") return { kind: "none" };
+		if (!argument.startsWith("-")) return { kind: "none" }; // an existing script
 		const letters = optionLetters(argument);
 		if (letters === null) continue; // a long option (`--version`): none runs code
 		// `-W ignore` and `-X utf8` take the next word as their value, so that word is
@@ -883,20 +931,37 @@ function classifyPython(program: string, args: string[]): Verdict {
 			index += 1;
 			continue;
 		}
-		if (letters.includes("c")) return ask(REASON_ARBITRARY_CODE, `${program} -c ejecuta código arbitrario`);
+		if (letters.includes("c")) return { kind: "inline" };
 		if (!letters.includes("m")) continue;
-		const module = args[index + 1] ?? "";
-		if (module.length === 0) {
-			return ask(REASON_MODULE, `${program} -m sin módulo: no reconozco la operación`);
-		}
-		const subcommand = args.slice(index + 2).find((rest) => !rest.startsWith("-")) ?? "";
-		if (module === "ensurepip") return ask(REASON_INSTALL, `${program} -m ensurepip instala pip`);
-		if (isPipModule(module) && (subcommand === "install" || subcommand === "uninstall")) {
-			return ask(REASON_INSTALL, `${program} -m pip ${subcommand} instala o quita paquetes`);
-		}
-		return ask(REASON_MODULE, `${program} -m ${module} ejecuta un módulo`);
+		return { kind: "module", module: args[index + 1] ?? "", args: args.slice(index + 2) };
 	}
-	return allow();
+	return { kind: "none" };
+}
+
+/**
+ * Verdict for `python`. A module asks, because it is code that is not in the command
+ * line: `-m pip install`/`-m pip uninstall` and `-m ensurepip` with the installer reason,
+ * a module of the closed data-transforming allowlist is allowed (`json.tool`
+ * re-prints JSON), and any other module as unknown code. Inline code (`-c`) asks
+ * as arbitrary code. A script argument is allowed: it is an existing file, the
+ * same class as `go test`, and the decision is recorded in `docs/alter-limites.md`.
+ */
+function classifyPython(program: string, args: string[]): Verdict {
+	const request = pythonRequest(args);
+	if (request.kind === "inline") return ask(REASON_ARBITRARY_CODE, `${program} -c ejecuta código arbitrario`);
+	if (request.kind === "none") return allow();
+
+	const { module, args: moduleArgs } = request;
+	if (module.length === 0) {
+		return ask(REASON_MODULE, `${program} -m sin módulo: no reconozco la operación`);
+	}
+	if (isDataTransformModule(module, moduleArgs)) return allow();
+	const subcommand = moduleArgs.find((rest) => !rest.startsWith("-")) ?? "";
+	if (module === "ensurepip") return ask(REASON_INSTALL, `${program} -m ensurepip instala pip`);
+	if (isPipModule(module) && (subcommand === "install" || subcommand === "uninstall")) {
+		return ask(REASON_INSTALL, `${program} -m pip ${subcommand} instala o quita paquetes`);
+	}
+	return ask(REASON_MODULE, `${program} -m ${module} ejecuta un módulo`);
 }
 
 /**
@@ -1404,6 +1469,20 @@ function classifyMove(args: string[], cwd: string): Verdict {
 	return allow();
 }
 
+/**
+ * True when the reader of a download pipe only transforms the data it receives:
+ * `curl … | python3 -m json.tool` formats the download, it does not run it, so the
+ * pipe adds no risk of its own. The reader has to be a Python module of the closed
+ * allowlist, with the same reading of its words the interpreter rule uses.
+ */
+function readsPipedDataAsData(words: string[]): boolean {
+	const inner = commandWords(words);
+	if (inner.length === 0) return false;
+	if (interpreterKind(basename(inner[0])) !== "python") return false;
+	const request = pythonRequest(inner.slice(1));
+	return request.kind === "module" && isDataTransformModule(request.module, request.args);
+}
+
 /** Verdict for one simple command, redirections and download pipes included. */
 function classifySimpleCommand(command: SimpleCommand, next: SimpleCommand | undefined, cwd: string, depth: number): Verdict {
 	for (const redirection of command.redirs) {
@@ -1414,10 +1493,12 @@ function classifySimpleCommand(command: SimpleCommand, next: SimpleCommand | und
 	const program = programOf(command.words);
 	if (program === "") return allow();
 
-	// `curl … | sh` runs code nobody read: the pipe is the whole risk.
+	// `curl … | sh` runs code nobody read: the pipe is the whole risk. A reader that
+	// only transforms the download (`python3 -m json.tool`) is the exception, and it
+	// is read from the same closed allowlist as the interpreter rule.
 	if ((program === "curl" || program === "wget") && next !== undefined && (next.afterOp === "|" || next.afterOp === "|&")) {
 		const reader = programOf(next.words);
-		if (SHELLS.has(reader) || INTERPRETERS.has(reader)) {
+		if ((SHELLS.has(reader) || INTERPRETERS.has(reader)) && !readsPipedDataAsData(next.words)) {
 			return ask(REASON_DOWNLOADED_CODE, `${program} | ${reader} ejecuta código descargado`);
 		}
 	}
