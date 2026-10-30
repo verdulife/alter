@@ -252,6 +252,11 @@ type fakeBot struct {
 	finals   []string
 	messages []string
 
+	// failMessages makes every plain sendMessage fail, which is how a test pins
+	// that the progress notice is cosmetic: a failure there must not touch the
+	// turn nor the final reply. Guarded by mu, like the recordings.
+	failMessages bool
+
 	delivered chan struct{}
 }
 
@@ -342,7 +347,13 @@ func (b *fakeBot) handle(w http.ResponseWriter, r *http.Request) {
 		decodeBotJSON(r, &payload)
 		b.mu.Lock()
 		b.messages = append(b.messages, payload.Text)
+		fail := b.failMessages
 		b.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"ok":false,"error_code":500,"description":"sendMessage failed"}`)
+			return
+		}
 		b.signal()
 
 	default:
@@ -392,6 +403,23 @@ func (b *fakeBot) snapshot() (finals, messages, drafts, typing []string) {
 		append([]string(nil), b.messages...),
 		append([]string(nil), b.drafts...),
 		append([]string(nil), b.typing...)
+}
+
+// failPlainMessages makes every later plain sendMessage fail, so a test can show
+// that the progress notice breaking changes nothing else in the turn.
+func (b *fakeBot) failPlainMessages() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failMessages = true
+}
+
+// plainMessages returns the plain-text messages the chat received, in order.
+// The progress notice is the only plain-text message the bridge sends; the final
+// reply always travels through the rich-message path.
+func (b *fakeBot) plainMessages() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.messages...)
 }
 
 // stageRecorder records the teardown stages the runtime reports.
@@ -1812,6 +1840,102 @@ func TestBridgeTypingRefreshKeepsTheIndicatorAliveForTheWholeTurn(t *testing.T) 
 		if action != bridgeTypingAction {
 			t.Errorf("chat action %q, want %q", action, bridgeTypingAction)
 		}
+	}
+}
+
+// TestBridgeProgressNoticeArrivesOnceOnALongTurn is the reported silence: a turn
+// parked for minutes shows a typing action and nothing else. Past the threshold
+// the chat gets one short line, once, and the answer still arrives as its own
+// message afterwards.
+func TestBridgeProgressNoticeArrivesOnceOnALongTurn(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm", 0, withProgressAfter(20*time.Millisecond))
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q is not the approval prompt: the turn is not parked", question)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for len(h.bot.plainMessages()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := h.bot.plainMessages(); len(got) != 1 || got[0] != bridgeProgressLine {
+		t.Fatalf("plain messages = %v, want exactly the progress line %q", got, bridgeProgressLine)
+	}
+
+	// The turn stays parked for many thresholds: the owner hears it once, not
+	// once per interval.
+	time.Sleep(150 * time.Millisecond)
+	if got := h.bot.plainMessages(); len(got) != 1 {
+		t.Fatalf("plain messages = %v, want the progress line exactly once per turn", got)
+	}
+
+	// The answer is a message of its own: releasing the turn delivers it, and the
+	// notice is still a single line, not the beginning of the reply.
+	pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-progress", askButtonData(t, question)[approvalIndexAllow]))
+	rich := h.waitRich(t, 2)
+	if !strings.HasPrefix(rich[1], `{"confirmed":true`) {
+		t.Errorf("delivery = %q, want the turn's own answer after the notice", rich[1])
+	}
+	if got := h.bot.plainMessages(); len(got) != 1 {
+		t.Errorf("plain messages = %v after the turn ended, want exactly one notice", got)
+	}
+}
+
+// TestBridgeProgressNoticeStaysSilentOnAFastTurn proves the notice belongs to long
+// turns only: a turn that finishes before the threshold leaves the chat with the
+// answer alone, never a courtesy line about work that is already done.
+func TestBridgeProgressNoticeStaysSilentOnAFastTurn(t *testing.T) {
+	h := startDialogBridge(t, "stream", 0, withProgressAfter(2*time.Second))
+	h.sendText(1, 1, "hola Pi")
+
+	rich := h.waitRich(t, 1)
+	if rich[0] != "Hola desde Pi, **con markdown**" {
+		t.Fatalf("delivery = %q, want the ordinary Pi answer", rich[0])
+	}
+	// Give a wrong notice the chance to show up late before asserting.
+	time.Sleep(100 * time.Millisecond)
+	if got := h.bot.plainMessages(); len(got) != 0 {
+		t.Errorf("plain messages = %v, want none: a turn that ends early never announces itself", got)
+	}
+}
+
+// TestBridgeProgressNoticeFailureDoesNotAffectTheTurn pins the notice as cosmetic:
+// when the Bot API refuses it the failure is logged, the notice is not retried,
+// and the turn still ends with its own reply.
+func TestBridgeProgressNoticeFailureDoesNotAffectTheTurn(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm", 0, withProgressAfter(20*time.Millisecond))
+	h.bot.failPlainMessages()
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q is not the approval prompt: the turn is not parked", question)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for len(h.bot.plainMessages()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := h.bot.plainMessages(); len(got) != 1 || got[0] != bridgeProgressLine {
+		t.Fatalf("plain messages = %v, want one failed attempt at the progress line %q", got, bridgeProgressLine)
+	}
+
+	// The turn is untouched: the approval still settles it and the reply arrives.
+	pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-progress-fail", askButtonData(t, question)[approvalIndexAllow]))
+	rich := h.waitRich(t, 2)
+	if !strings.HasPrefix(rich[1], `{"confirmed":true`) {
+		t.Errorf("delivery = %q, want the turn's own answer despite the failed notice", rich[1])
+	}
+	if got := h.bot.plainMessages(); len(got) != 1 {
+		t.Errorf("plain messages = %v, want no retry of the failed notice", got)
+	}
+
+	// The log read waits for the turn on purpose: the notice is stopped before the
+	// reply, so by now nothing else writes to it.
+	if logs := h.logs.String(); !strings.Contains(logs, "progress notice") {
+		t.Errorf("log %q does not report the failed notice", logs)
 	}
 }
 

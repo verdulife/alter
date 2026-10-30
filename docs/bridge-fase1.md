@@ -51,7 +51,17 @@ descubre desde su directorio de trabajo hacia arriba, así que solo existen para
 - **Sesión persistente.** Un único proceso `pi --mode rpc` con sesión nombrada, así
   que la conversación conserva el hilo entre mensajes.
 - **Timeout amplio.** El tope por turno son 300 s por defecto
-  (`ALTER_BRIDGE_TIMEOUT`), porque un turno con `bash` puede tardar.
+  (`ALTER_BRIDGE_TIMEOUT`), porque un turno con `bash` puede tardar. Es un
+  intercambio consciente: cinco minutos dan sitio a una tarea lenta de verdad,
+  pero un turno de chat que agota los cinco minutos es casi siempre un bucle, no
+  trabajo duro.
+- **Aviso de que el turno sigue vivo.** Pasados 45 s, el chat recibe una sola
+  línea —«Sigo con esto, dame un momento.»— como mensaje aparte. La respuesta
+  final llega después, como su propio mensaje, y el aviso no la sustituye ni la
+  adelanta. Se envía una vez por turno, nunca en un turno que termina antes del
+  umbral, y un fallo al enviarlo solo queda en el log: el turno y la respuesta no
+  dependen de él. Es la señal de que Pi sigue trabajando cuando el indicador de
+  «escribiendo…» y los borrados intermedios ya no dicen nada.
 - **Un solo chat.** Solo se atiende el chat del dueño (`TELEGRAM_CHAT_ID`); el
   resto de chats y de tipos de evento se ignoran.
 
@@ -104,7 +114,7 @@ en la shell siempre gana sobre el fichero, y la ausencia de `.env` no es un erro
 | `ALTER_BRIDGE_TOOLS` | vacío (sin `--tools`) | Allowlist **opcional** de `--tools`. Vacío no pasa el flag, así que Pi conserva su selección completa por defecto. Si lo rellenas, **reemplaza** la selección entera: nombra también `send_file` y `ask_options` o Pi no podrá usarlas. |
 | `ALTER_BRIDGE_PROMPT_FILES` | `alter-persona.md` | Ficheros markdown para `--append-system-prompt`, en orden. Separador `;`. |
 | `ALTER_BRIDGE_EXTENSIONS` | `internal/tools/extension/index.ts` | Extensiones cargadas con `-e`. Separador `;`. |
-| `ALTER_BRIDGE_TIMEOUT` | `300s` | Tope de un turno completo (spawn + modelo + tools + respuesta). |
+| `ALTER_BRIDGE_TIMEOUT` | `300s` | Tope de un turno completo (spawn + modelo + tools + respuesta). Es amplio a propósito; un turno de chat que agota los cinco minutos es casi siempre un bucle, y el aviso de los 45 s es la señal de que sigue vivo. |
 | `ALTER_BRIDGE_WORKDIR` | directorio de trabajo del proceso (el repositorio) | `cwd` del proceso de Pi: su directorio de trabajo, no el vault. De ahí para arriba se descubren las skills del proyecto; si no se puede resolver, cae a `$HOME`. |
 | `ALTER_VAULT_DIR` | `$HOME/vault` | Raíz del vault: el almacén que Pi escribe con `write`/`edit` y donde caen los archivos entrantes. No es el `cwd` de Pi. |
 | `ALTER_TELEGRAM_API_BASE` | `https://api.telegram.org` | Base URL del Bot API (S8). |

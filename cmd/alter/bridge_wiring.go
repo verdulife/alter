@@ -32,6 +32,16 @@ const (
 	// the refresh the owner saw the indicator vanish while Pi was still working.
 	bridgeTypingInterval = 4 * time.Second
 
+	// bridgeProgressAfter is how long a turn may run before the chat is told, once,
+	// that it is still working. Telegram's typing indicator lasts seconds and the
+	// streamed drafts may be silent for minutes, so without this line a long turn
+	// looked exactly like a dead one to the owner.
+	bridgeProgressAfter = 45 * time.Second
+
+	// bridgeProgressLine is that notice. It is deliberately short and says only
+	// that the turn is alive: the answer still arrives as its own, later message.
+	bridgeProgressLine = "Sigo con esto, dame un momento."
+
 	// bridgeDraftInterval caps how often one turn publishes a streaming draft.
 	// Pi emits one text_delta per tiny burst, so without a cap every burst would
 	// be one Bot API request. The final message always carries the whole answer,
@@ -223,6 +233,10 @@ type bridgeRuntime struct {
 	// The field is the test seam for the refresher; production always uses
 	// bridgeTypingInterval.
 	typingInterval time.Duration
+	// progressAfter is how long a turn runs before the chat gets the progress
+	// line. The field is the test seam for the notice; production always uses
+	// bridgeProgressAfter.
+	progressAfter time.Duration
 	// resetSession performs the reset a /reset asks for (test seam): the real one
 	// is Session.Reset, and a test can make it fail to pin the error line.
 	resetSession func(ctx context.Context, sessionID string) error
@@ -270,6 +284,13 @@ func withTypingInterval(interval time.Duration) bridgeRuntimeOption {
 	return func(r *bridgeRuntime) { r.typingInterval = interval }
 }
 
+// withProgressAfter replaces how long a turn runs before the chat gets the
+// progress line (test seam), so a test can observe the notice inside a turn that
+// would otherwise last forty-five seconds.
+func withProgressAfter(after time.Duration) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.progressAfter = after }
+}
+
 // newBridgeRuntime composes the bridge: vault store → tools server → Pi session
 // (carrying the tools URL and token in its environment) → poller for the owner
 // chat. Nothing is spawned until the first prompt, and the tools server is bound
@@ -285,7 +306,13 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		return nil, err
 	}
 
-	r := &bridgeRuntime{chatID: cfg.TelegramChatID, logger: logger, inboundMax: bridgeInboundMaxBytes, typingInterval: bridgeTypingInterval}
+	r := &bridgeRuntime{
+		chatID:         cfg.TelegramChatID,
+		logger:         logger,
+		inboundMax:     bridgeInboundMaxBytes,
+		typingInterval: bridgeTypingInterval,
+		progressAfter:  bridgeProgressAfter,
+	}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -626,6 +653,11 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 	stopTyping := r.keepTypingAlive(ctx, chatID)
 	defer stopTyping()
 
+	// A turn that runs past the threshold announces itself once: silence for
+	// minutes is indistinguishable from a dead turn in the chat.
+	stopProgress := r.notifyProgress(ctx, chatID)
+	defer stopProgress()
+
 	throttle := &draftThrottle{min: bridgeDraftInterval, now: time.Now}
 	final, err := r.sess.PromptStream(ctx, prompt, func(accumulated string) {
 		if !throttle.allow() {
@@ -636,6 +668,10 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 			r.logger.Printf("bridge: draft: %v", derr)
 		}
 	})
+
+	// Stop the notice — waiting for a send already in flight — before the answer
+	// goes out, so the progress line can never land after the final reply.
+	stopProgress()
 
 	switch {
 	case err != nil:
@@ -653,6 +689,82 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 // chat state.
 type bridgeChatAction interface {
 	SendChatAction(ctx context.Context, chatID int64, action string) error
+}
+
+// bridgeTextSender is the Bot API surface the progress notice needs: one plain
+// chat message. Plain text is what keeps the notice apart from the final reply,
+// which always goes out through the rich-message path.
+type bridgeTextSender interface {
+	SendMessage(ctx context.Context, chatID int64, text string) error
+}
+
+// progressNotifier tells the chat once that a long turn is still alive. It exists
+// because the typing indicator and the streamed drafts both go quiet: a turn
+// waiting on Pi, or on an approval, can show nothing for minutes.
+type progressNotifier struct {
+	sender bridgeTextSender
+	chatID int64
+	text   string
+	after  time.Duration
+	logger *log.Logger
+}
+
+// start sends the line once, after the threshold, and nothing else: a fast turn
+// stops it before the timer fires, so the chat only hears about turns that really
+// are long. The returned stop is safe to call more than once and waits for the
+// goroutine, so a finished turn leaves nothing behind; a cancelled ctx ends the
+// goroutine by itself.
+func (p progressNotifier) start(ctx context.Context) (stop func()) {
+	after := p.after
+	if after <= 0 {
+		after = bridgeProgressAfter
+	}
+
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(after)
+		defer timer.Stop()
+		select {
+		case <-stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			p.send(ctx)
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stopCh) })
+		<-done
+	}
+}
+
+// send emits the notice. A failure is logged only: the turn must never fail
+// because a courtesy line did not arrive.
+func (p progressNotifier) send(ctx context.Context) {
+	if err := p.sender.SendMessage(ctx, p.chatID, p.text); err != nil && p.logger != nil {
+		p.logger.Printf("bridge: progress notice: %v", err)
+	}
+}
+
+// notifyProgress starts the progress notice of one turn and returns the function
+// that stops it.
+func (r *bridgeRuntime) notifyProgress(ctx context.Context, chatID int64) (stop func()) {
+	after := r.progressAfter
+	if after <= 0 {
+		after = bridgeProgressAfter
+	}
+	return progressNotifier{
+		sender: r.client,
+		chatID: chatID,
+		text:   bridgeProgressLine,
+		after:  after,
+		logger: r.logger,
+	}.start(ctx)
 }
 
 // typingRefresher keeps one chat action alive for as long as a turn runs. Telegram
