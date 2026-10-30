@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,6 +58,10 @@ const (
 	// remindErrorLimit bounds an error text taken from a child process, so one
 	// noisy stderr never fills the journal.
 	remindErrorLimit = 300
+
+	// remindEnvFileVar names the variable that overrides where the dotenv file is
+	// read from. Unset, the file is the one the service unit loads: <WorkDir>/.env.
+	remindEnvFileVar = "ALTER_ENV_FILE"
 )
 
 // Exit codes of the remind and notify subcommands. They match `alter vault check`:
@@ -81,6 +86,10 @@ fire      dispara un recordatorio: lo marca y despierta al agente para que avise
           llama el timer.
 notify    envía un texto al chat del Dueño usando TELEGRAM_TOKEN y
           TELEGRAM_CHAT_ID. Nunca imprime el token.
+
+fire y notify leen antes el fichero de entorno (ALTER_ENV_FILE, o <WorkDir>/.env)
+para el token: un timer arranca sin el entorno del servicio. Si el fichero no
+está, se dice en una línea y se usan las variables del proceso.
 
 Sin ALTER_VAULT_DIR, el vault es $HOME/vault. Imprime una línea por acción
 (creado, borrado, disparado, sin cambios) y una de resumen. Sale con 0 si todo
@@ -158,7 +167,7 @@ func runNotify(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "notify: falta el texto del aviso\n\n%s", remindUsage)
 		return remindExitBadArgs
 	}
-	if err := newRemindRunner(config.Load(), stdout, stderr).notify(context.Background(), text); err != nil {
+	if err := newRemindRunner(config.Load(), stdout, stderr).sendNotice(context.Background(), text); err != nil {
 		// The error never carries the token: the client redacts it and every message
 		// built here names the variable, not its value.
 		fmt.Fprintf(stderr, "notify: %v\n", err)
@@ -187,21 +196,56 @@ type remindRunner struct {
 	wake func(ctx context.Context, prompt string) error
 	// notify delivers one plain text to the owner's chat.
 	notify func(ctx context.Context, text string) error
+	// envFile is the dotenv file read before the credentials are looked for, and
+	// loadEnv is what reads it. A timer starts with no environment, so the file is
+	// the only place the token can come from.
+	envFile string
+	loadEnv func(path string) error
 }
 
 // newRemindRunner composes the runner from the configuration: the real clock, the
 // real systemd scheduler, the real Pi wake-up and the real Bot API.
 func newRemindRunner(cfg config.Config, stdout, stderr io.Writer) *remindRunner {
 	binary := selfBinary()
+	envFile := remindEnvFile(cfg)
 	return &remindRunner{
-		vaultDir:  cfg.VaultDir,
-		binary:    binary,
-		scheduler: reminder.NewSystemd(binary),
+		vaultDir: cfg.VaultDir,
+		binary:   binary,
+		// The transient unit does not inherit this environment, so the PATH and the
+		// dotenv file the firing needs travel with it.
+		scheduler: reminder.NewSystemd(binary, os.Getenv("PATH"), envFile),
 		stdout:    stdout,
 		stderr:    stderr,
 		now:       time.Now,
 		wake:      piReminderRunner(cfg),
 		notify:    telegramNotifier(cfg),
+		envFile:   envFile,
+		loadEnv:   config.LoadDotEnv,
+	}
+}
+
+// remindEnvFile returns the dotenv file the firing reads: the explicit override in
+// ALTER_ENV_FILE, or <WorkDir>/.env, which is the file the service unit loads.
+func remindEnvFile(cfg config.Config) string {
+	if path := strings.TrimSpace(os.Getenv(remindEnvFileVar)); path != "" {
+		return path
+	}
+	return filepath.Join(cfg.WorkDir, ".env")
+}
+
+// loadCredentials reads the dotenv file before anything looks for the Bot API
+// credentials. A missing file is one line, never a failure: the variables may
+// already be in the environment, and a reminder must not be lost over it.
+func (r *remindRunner) loadCredentials() {
+	if r.envFile == "" || r.loadEnv == nil {
+		return
+	}
+	if info, err := os.Stat(r.envFile); err != nil || !info.Mode().IsRegular() {
+		r.line(fmt.Sprintf("remind: no hay fichero de entorno en %s; se usan las variables del proceso", r.envFile))
+		return
+	}
+	if err := r.loadEnv(r.envFile); err != nil {
+		fmt.Fprintf(r.stderr, "remind: no se pudo leer %s: %v\n", r.envFile, err)
 	}
 }
 
@@ -213,6 +257,14 @@ func selfBinary() string {
 		return path
 	}
 	return "alter"
+}
+
+// sendNotice reads the dotenv file and then delivers one text to the owner. It is
+// the only path the notify subcommand uses, so the token is looked for where a
+// timer's environment can actually have it: the file.
+func (r *remindRunner) sendNotice(ctx context.Context, text string) error {
+	r.loadCredentials()
+	return r.notify(ctx, text)
 }
 
 // line writes one line of the command's own output.
@@ -426,6 +478,9 @@ func (r *remindRunner) fireDue(ctx context.Context, slug, path string, entry vau
 		code = remindExitFailed
 	}
 
+	// The dotenv file is read before the agent runs, so the wake-up and the notice
+	// both see the credentials: a timer starts with almost no environment.
+	r.loadCredentials()
 	if err := r.wake(ctx, reminderPrompt(r.binary, entry)); err != nil {
 		// The agent is the voice of the reminder, so its failure must not swallow the
 		// reminder: the title goes to the chat as the last resort.
@@ -643,13 +698,16 @@ func piReminderRunner(cfg config.Config) func(context.Context, string) error {
 // telegramNotifier delivers one text to the owner's chat through the same Bot API
 // client the bridge uses. The token comes from the environment and is never
 // printed: the client redacts it from transport errors, and the errors built here
-// name the variable, not its value.
+// name the variable, not its value. The credentials are read at call time, not
+// when the runner was built, because fire and notify load the dotenv file just
+// before sending.
 func telegramNotifier(cfg config.Config) func(context.Context, string) error {
 	return func(ctx context.Context, text string) error {
-		if cfg.TelegramToken == "" {
+		token, chatID := noticeCredentials(cfg)
+		if token == "" {
 			return fmt.Errorf("falta TELEGRAM_TOKEN: sin token no hay forma de avisar al Dueño")
 		}
-		if cfg.TelegramChatID == 0 {
+		if chatID == 0 {
 			return fmt.Errorf("falta TELEGRAM_CHAT_ID: no se sabe a qué chat avisar")
 		}
 		text = strings.TrimSpace(text)
@@ -658,9 +716,26 @@ func telegramNotifier(cfg config.Config) func(context.Context, string) error {
 		}
 		// SendFormatted is the client's own text path: it escapes the text, keeps every
 		// request under Telegram's documented limits and splits what does not fit.
-		client := telegram.NewClientWithBase(cfg.TelegramToken, cfg.TelegramAPIBase)
-		return client.SendFormatted(ctx, cfg.TelegramChatID, text)
+		client := telegram.NewClientWithBase(token, cfg.TelegramAPIBase)
+		return client.SendFormatted(ctx, chatID, text)
 	}
+}
+
+// noticeCredentials resolves what the notice needs. The process environment wins,
+// because the dotenv file has just been loaded into it; cfg is the fallback for a
+// caller that injected the values directly.
+func noticeCredentials(cfg config.Config) (token string, chatID int64) {
+	token = os.Getenv("TELEGRAM_TOKEN")
+	if token == "" {
+		token = cfg.TelegramToken
+	}
+	chatID = cfg.TelegramChatID
+	if raw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed != 0 {
+			chatID = parsed
+		}
+	}
+	return token, chatID
 }
 
 // remindLogWriter sends every line a reminder command prints to the log. The

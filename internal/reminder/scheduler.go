@@ -58,38 +58,81 @@ type RunFunc func(ctx context.Context, name string, args ...string) ([]byte, err
 // the timer and systemctl stops it. Nothing is written to the unit folders, so
 // there is no fichero per reminder, no daemon-reload and no enable; the price is
 // that a machine restart wipes them, which the next sync covers.
+//
+// A transient unit does not inherit the service's environment: it starts from
+// what the systemd user manager has, which is nearly nothing. A firing has to
+// find the binary it runs and the token it notifies with, so both travel with
+// the unit: the PATH through --setenv and the dotenv file through
+// EnvironmentFile=.
 type Systemd struct {
 	binary string
-	run    RunFunc
+	// path is the PATH the transient unit receives. It is a constructor input so
+	// the caller (and a test) decides it instead of this package guessing.
+	path string
+	// envFile is the dotenv file the transient unit loads, empty when the caller
+	// has none.
+	envFile string
+	run     RunFunc
 }
 
-// NewSystemd returns a Scheduler that starts binary when a timer fires. The path
-// is passed in rather than guessed, so the caller decides which executable
-// systemd runs.
-func NewSystemd(binary string) *Systemd {
-	return newSystemd(binary, execCommand)
+// NewSystemd returns a Scheduler that starts binary when a timer fires. binary,
+// path and envFile are passed in rather than guessed, so the caller decides which
+// executable systemd runs and with which environment. An empty envFile is a
+// scheduler whose timers carry only path.
+func NewSystemd(binary, path, envFile string) *Systemd {
+	return newSystemd(binary, path, envFile, execCommand)
 }
 
 // newSystemd builds the implementation around a command runner. Tests use it to
 // assert the exact argv without running a command.
-func newSystemd(binary string, run RunFunc) *Systemd {
-	return &Systemd{binary: binary, run: run}
+func newSystemd(binary, path, envFile string, run RunFunc) *Systemd {
+	return &Systemd{binary: binary, path: path, envFile: envFile, run: run}
 }
 
 // Create schedules one firing of the reminder at at with
 // `systemd-run --user --on-calendar=<when> --unit=alter-remind-<slug>`. The
 // calendar value is the reminder's wall-clock time in the host zone, because
 // systemd reads OnCalendar= as local time: sending the instant's own offset
-// would move the alarm by the offset difference.
+// would move the alarm by the offset difference. The unit also carries the PATH
+// it needs to find the binary and, when one is configured and exists, the dotenv
+// file it needs to notify.
 func (s *Systemd) Create(ctx context.Context, slug string, at time.Time) error {
 	when := at.In(time.Local).Format(calendarLayout)
-	_, err := s.runCommand(ctx, "systemd-run",
+	args := []string{
 		"--user",
-		"--on-calendar="+when,
-		"--unit="+unitName(slug),
-		s.binary, "remind", "fire", slug,
-	)
+		"--on-calendar=" + when,
+		"--unit=" + unitName(slug),
+	}
+	// Without this the unit inherits the manager's minimal PATH and cannot find the
+	// binary it is told to run, nor the interpreter that binary wraps. An empty one
+	// is not passed: setting PATH to nothing would leave the unit worse off than the
+	// systemd default.
+	if s.path != "" {
+		args = append(args, "--setenv=PATH="+s.path)
+	}
+	// systemd-run refuses to create a unit whose EnvironmentFile= it cannot read, so
+	// a file that is not there is not passed: the process environment may already
+	// carry the credentials.
+	if s.envFile != "" && fileIsReadable(s.envFile) {
+		args = append(args, "--property=EnvironmentFile="+s.envFile)
+	}
+	args = append(args, s.binary, "remind", "fire", slug)
+	_, err := s.runCommand(ctx, "systemd-run", args...)
 	return err
+}
+
+// fileIsReadable reports whether path is a readable regular file, which is what
+// systemd needs to accept it as an EnvironmentFile=.
+func fileIsReadable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	return file.Close() == nil
 }
 
 // Remove stops the timer of slug with `systemctl --user stop`. A unit systemd

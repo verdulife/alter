@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -76,11 +78,30 @@ func assertCommand(t *testing.T, got command, wantName string, wantArgs ...strin
 	}
 }
 
+// bareSystemd builds a scheduler whose transient units carry no extra
+// environment, for the tests that only look at the systemctl side.
+func bareSystemd(binary string, run RunFunc) *Systemd {
+	return newSystemd(binary, "", "", run)
+}
+
+// writeEnvFile creates a dotenv file the scheduler can point a transient unit at.
+func writeEnvFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
 // TestCreateBuildsSystemdRunArgv pins the exact argv of a timer creation: a
-// transient user timer that runs this binary's `remind fire <slug>`.
+// transient user timer that runs this binary's `remind fire <slug>` and carries
+// the environment a firing needs, because a transient unit does not inherit the
+// service's.
 func TestCreateBuildsSystemdRunArgv(t *testing.T) {
+	envFile := writeEnvFile(t, "TELEGRAM_TOKEN=no-es-un-token-real\n")
 	rec := &recorder{}
-	scheduler := newSystemd("/home/owner/bin/alter", rec.run)
+	scheduler := newSystemd("/home/owner/bin/alter", "/home/owner/.local/bin:/usr/bin", envFile, rec.run)
 
 	if err := scheduler.Create(context.Background(), "llamar-a-mama", fixedAt()); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -90,9 +111,82 @@ func TestCreateBuildsSystemdRunArgv(t *testing.T) {
 		"--user",
 		"--on-calendar=2026-11-03 12:00:00",
 		"--unit=alter-remind-llamar-a-mama",
+		"--setenv=PATH=/home/owner/.local/bin:/usr/bin",
+		"--property=EnvironmentFile="+envFile,
 		"/home/owner/bin/alter",
 		"remind", "fire", "llamar-a-mama",
 	)
+}
+
+// TestCreatePassesThePathWithoutAnEnvFile pins the half of the environment that
+// is always there: the timer's PATH is the one the bridge itself has, and no
+// EnvironmentFile= argument appears when none is configured.
+func TestCreatePassesThePathWithoutAnEnvFile(t *testing.T) {
+	rec := &recorder{}
+	scheduler := newSystemd("/bin/alter", "/home/owner/.local/bin:/bin", "", rec.run)
+
+	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	args := rec.onlyCall(t).args
+	if !slices.Contains(args, "--setenv=PATH=/home/owner/.local/bin:/bin") {
+		t.Errorf("argv = %q, want the bridge's PATH for the transient unit", args)
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "EnvironmentFile") {
+			t.Errorf("argv = %q, want no EnvironmentFile= when none is configured", args)
+		}
+	}
+}
+
+// TestCreateKeepsTheSystemdPATHWhenThereIsNoneToPass pins the guard around an
+// empty PATH: setting it to nothing would leave the unit worse off than systemd's
+// own default, so nothing is passed instead.
+func TestCreateKeepsTheSystemdPATHWhenThereIsNoneToPass(t *testing.T) {
+	rec := &recorder{}
+	scheduler := newSystemd("/bin/alter", "", "", rec.run)
+
+	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	args := rec.onlyCall(t).args
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--setenv=") {
+			t.Errorf("argv = %q, want no --setenv= when there is no PATH to pass", args)
+		}
+	}
+	assertCommand(t, rec.calls[0], "systemd-run",
+		"--user",
+		"--on-calendar=2026-11-03 12:00:00",
+		"--unit=alter-remind-regar-las-plantas",
+		"/bin/alter",
+		"remind", "fire", "regar-las-plantas",
+	)
+}
+
+// TestCreateSkipsAnEnvFileThatIsNotThere pins the guard around the dotenv file:
+// systemd-run would fail the whole creation over a file it cannot read, so a
+// configured path that does not exist is simply not passed.
+func TestCreateSkipsAnEnvFileThatIsNotThere(t *testing.T) {
+	rec := &recorder{}
+	missing := filepath.Join(t.TempDir(), "no-existe.env")
+	scheduler := newSystemd("/bin/alter", "/bin", missing, rec.run)
+
+	if err := scheduler.Create(context.Background(), "regar-las-plantas", fixedAt()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	args := rec.onlyCall(t).args
+	if !slices.Contains(args, "--setenv=PATH=/bin") {
+		t.Errorf("argv = %q, want the PATH argument kept", args)
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "EnvironmentFile") {
+			t.Errorf("argv = %q, want no EnvironmentFile= for a file that is not there", args)
+		}
+	}
 }
 
 // TestCreateSendsLocalWallClockCalendar checks the calendar value is the local
@@ -101,7 +195,7 @@ func TestCreateBuildsSystemdRunArgv(t *testing.T) {
 // with a foreign offset would move the alarm.
 func TestCreateSendsLocalWallClockCalendar(t *testing.T) {
 	rec := &recorder{}
-	scheduler := newSystemd("/bin/alter", rec.run)
+	scheduler := bareSystemd("/bin/alter", rec.run)
 	// An instant written in a Tokyo offset: what matters is the host wall clock.
 	at := time.Date(2026, 7, 1, 10, 30, 0, 0, time.FixedZone("TKY", 9*3600))
 
@@ -124,7 +218,7 @@ func TestCreateSendsLocalWallClockCalendar(t *testing.T) {
 // a successful removal runs nothing else.
 func TestRemoveBuildsSystemctlArgv(t *testing.T) {
 	rec := &recorder{}
-	scheduler := newSystemd("/bin/alter", rec.run)
+	scheduler := bareSystemd("/bin/alter", rec.run)
 
 	if err := scheduler.Remove(context.Background(), "llamar-a-mama"); err != nil {
 		t.Fatalf("Remove: %v", err)
@@ -145,7 +239,7 @@ func TestFailureSurfacesStderrAndReason(t *testing.T) {
 			stderr: "Failed to start transient timer unit: Unit alter-remind-llamar-a-mama.timer already exists.\n",
 			err:    reason,
 		}
-		scheduler := newSystemd("/bin/alter", rec.run)
+		scheduler := bareSystemd("/bin/alter", rec.run)
 
 		err := scheduler.Create(context.Background(), "llamar-a-mama", fixedAt())
 		if err == nil {
@@ -172,7 +266,7 @@ func TestFailureSurfacesStderrAndReason(t *testing.T) {
 			stderr: "Failed to stop alter-remind-x.timer: Access denied\n",
 			err:    errors.New("exit status 1"),
 		}
-		scheduler := newSystemd("/bin/alter", rec.run)
+		scheduler := bareSystemd("/bin/alter", rec.run)
 
 		err := scheduler.Remove(context.Background(), "x")
 		if err == nil {
@@ -192,7 +286,7 @@ func TestRemoveOfMissingUnitIsNotAnError(t *testing.T) {
 		stderr: "Failed to stop alter-remind-llamar-a-mama.timer: Unit alter-remind-llamar-a-mama.timer not loaded.\n",
 		err:    errors.New("exit status 5"),
 	}
-	scheduler := newSystemd("/bin/alter", rec.run)
+	scheduler := bareSystemd("/bin/alter", rec.run)
 
 	if err := scheduler.Remove(context.Background(), "llamar-a-mama"); err != nil {
 		t.Fatalf("Remove of a missing unit = %v, want nil", err)
@@ -249,7 +343,7 @@ func TestListParsesJSONTimers(t *testing.T) {
   }
 ]`
 	rec := &recorder{stdout: payload}
-	scheduler := newSystemd("/bin/alter", rec.run)
+	scheduler := bareSystemd("/bin/alter", rec.run)
 
 	slugs, err := scheduler.List(context.Background())
 	if err != nil {
@@ -282,7 +376,7 @@ func TestListFallsBackToThePlainTable(t *testing.T) {
 		}
 		return []byte(table), nil
 	}}
-	scheduler := newSystemd("/bin/alter", rec.run)
+	scheduler := bareSystemd("/bin/alter", rec.run)
 
 	slugs, err := scheduler.List(context.Background())
 	if err != nil {
@@ -305,7 +399,7 @@ func TestCommandsHonourCancellation(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		rec := &recorder{}
-		scheduler := newSystemd("/bin/alter", rec.run)
+		scheduler := bareSystemd("/bin/alter", rec.run)
 
 		errs := map[string]error{
 			"create": scheduler.Create(ctx, "llamar-a-mama", fixedAt()),
@@ -330,7 +424,7 @@ func TestCommandsHonourCancellation(t *testing.T) {
 			cancel()
 			return []byte("signal: killed\n"), errors.New("signal: killed")
 		}}
-		scheduler := newSystemd("/bin/alter", rec.run)
+		scheduler := bareSystemd("/bin/alter", rec.run)
 
 		// A kill caused by cancellation is reported as the cancellation, and it
 		// is not mistaken for the leniency Remove grants a missing unit.

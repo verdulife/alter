@@ -450,6 +450,153 @@ func TestRemindFireFallsBackToNotifyWhenTheAgentFails(t *testing.T) {
 	}
 }
 
+// botAPIRecorder is a Bot API stand-in that records what was sent to it, so a
+// test can prove a notice really went out.
+type botAPIRecorder struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+// server starts the fake Bot API and returns it with the recorder behind it.
+func (r *botAPIRecorder) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		r.mu.Lock()
+		r.calls = append(r.calls, string(body))
+		r.mu.Unlock()
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":4242}}}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// received returns the bodies the fake Bot API was sent.
+func (r *botAPIRecorder) received() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+// writeDotEnv writes a dotenv file into a fresh temporary directory and returns
+// its path.
+func writeDotEnv(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("escribir %s: %v", path, err)
+	}
+	return path
+}
+
+// TestRemindFireNotifiesWithTheDotEnvFile pins the second net under the timers: a
+// firing that starts without TELEGRAM_TOKEN in its environment still reaches the
+// owner, because the token is read from the dotenv file before the notice is sent.
+func TestRemindFireNotifiesWithTheDotEnvFile(t *testing.T) {
+	const token = "123456:TOKEN-QUE-SOLO-VIVE-EN-EL-FICHERO"
+	var bot botAPIRecorder
+	srv := bot.server(t)
+
+	h := newRemindHarness(t)
+	h.runner.envFile = writeDotEnv(t, "TELEGRAM_TOKEN="+token+"\nTELEGRAM_CHAT_ID=4242\n")
+	h.runner.loadEnv = config.LoadDotEnv
+	h.runner.notify = telegramNotifier(config.Config{TelegramAPIBase: srv.URL})
+	h.runner.wake = func(context.Context, string) error { return errors.New("pi no arrancó") }
+	// The transient unit starts with no credentials at all; only the file has them.
+	t.Setenv("TELEGRAM_TOKEN", "")
+	t.Setenv("TELEGRAM_CHAT_ID", "")
+	t.Setenv("ALTER_TELEGRAM_API_BASE", srv.URL)
+
+	due := reminderSpec{
+		slug:      "2026-11-03-llamar-a-mama",
+		title:     "Llamar a mamá",
+		remindAt:  "2026-11-03T09:00:00+01:00",
+		lastFired: "2026-11-02T09:00:00+01:00",
+	}
+	h.write(due)
+
+	if code := h.runner.fire(context.Background(), due.slug); code != remindExitOK {
+		t.Fatalf("fire = %d, want %d (stderr=%q)", code, remindExitOK, h.err.String())
+	}
+
+	received := bot.received()
+	if len(received) != 1 {
+		t.Fatalf("avisos enviados = %d, want one: el token del fichero no llegó al chat", len(received))
+	}
+	if !strings.Contains(received[0], "Llamar a mamá") {
+		t.Errorf("aviso %q sin el título del recordatorio", received[0])
+	}
+	printed := h.out.String() + h.err.String()
+	if strings.Contains(printed, "falta TELEGRAM_TOKEN") {
+		t.Errorf("salida %q: se leyó el token antes que el fichero de entorno", printed)
+	}
+	if strings.Contains(printed, token) {
+		t.Errorf("la salida %q imprime el token", printed)
+	}
+}
+
+// TestNotifyLoadsTheDotEnvFile pins the same net on the plain `notify` path, with
+// the default file location: <WorkDir>/.env.
+func TestNotifyLoadsTheDotEnvFile(t *testing.T) {
+	const token = "123456:TOKEN-DEL-FICHERO-POR-DEFECTO"
+	var bot botAPIRecorder
+	srv := bot.server(t)
+
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workDir, ".env"), []byte("TELEGRAM_TOKEN="+token+"\nTELEGRAM_CHAT_ID=4242\n"), 0o600); err != nil {
+		t.Fatalf("escribir el .env del workdir: %v", err)
+	}
+	t.Setenv("ALTER_BRIDGE_WORKDIR", workDir)
+	t.Setenv("TELEGRAM_TOKEN", "")
+	t.Setenv("TELEGRAM_CHAT_ID", "")
+	t.Setenv("ALTER_TELEGRAM_API_BASE", srv.URL)
+
+	var out, errOut strings.Builder
+	if code := runNotify([]string{"Llamar", "a", "mamá"}, &out, &errOut); code != remindExitOK {
+		t.Fatalf("notify = %d, want %d (stderr=%q)", code, remindExitOK, errOut.String())
+	}
+	received := bot.received()
+	if len(received) != 1 {
+		t.Fatalf("avisos enviados = %d, want one: el token del .env no se cargó", len(received))
+	}
+	if !strings.Contains(received[0], "Llamar a mamá") {
+		t.Errorf("aviso %q sin el texto", received[0])
+	}
+	if printed := out.String() + errOut.String(); strings.Contains(printed, token) {
+		t.Errorf("la salida %q imprime el token", printed)
+	}
+}
+
+// TestNotifyRunsWithoutTheDotEnvFile pins the other side of the second net: the
+// file is optional. A missing file is one reported line, and an exported token
+// still sends the notice.
+func TestNotifyRunsWithoutTheDotEnvFile(t *testing.T) {
+	const token = "123456:TOKEN-DEL-ENTORNO"
+	var bot botAPIRecorder
+	srv := bot.server(t)
+
+	missing := filepath.Join(t.TempDir(), "no-existe.env")
+	t.Setenv("ALTER_ENV_FILE", missing)
+	t.Setenv("TELEGRAM_TOKEN", token)
+	t.Setenv("TELEGRAM_CHAT_ID", "4242")
+	t.Setenv("ALTER_TELEGRAM_API_BASE", srv.URL)
+
+	var out, errOut strings.Builder
+	if code := runNotify([]string{"Llamar a mamá"}, &out, &errOut); code != remindExitOK {
+		t.Fatalf("notify = %d, want %d: que falte el .env no puede romper el aviso (stderr=%q)", code, remindExitOK, errOut.String())
+	}
+	if got := len(bot.received()); got != 1 {
+		t.Fatalf("avisos enviados = %d, want one", got)
+	}
+	printed := out.String() + errOut.String()
+	if !strings.Contains(printed, missing) {
+		t.Errorf("salida %q sin la línea que dice que falta el fichero de entorno", printed)
+	}
+	if lines := strings.Count(strings.TrimSpace(out.String()), "\n"); lines != 1 {
+		t.Errorf("salida %q: el fichero que falta es una línea más el envío", out.String())
+	}
+}
+
 // TestNotifyPostsTheTextAndNeverLogsTheToken pins the transport: the text reaches
 // the Bot API for the owner chat, and neither a success nor a transport failure
 // writes the token anywhere the owner or the journal can read it.
