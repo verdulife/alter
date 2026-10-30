@@ -48,8 +48,11 @@ Las recetas de búsqueda están en `alter-vault`; no las repitas aquí. El orden
 la respuesta: primero lo atrasado y lo de hoy, después lo que no tiene fecha, y
 lo cerrado solo si lo pide. Título y fecha, sin rutas ni nombres de fichero.
 
-## Nada dispara estos recordatorios
+## Los recordatorios suenan
 
-**Hoy no hay ningún proceso que lea `remind_at`: el recordatorio se guarda bien, pero no llega ningún aviso.** No prometas una notificación. Si el Dueño cuenta con que le avises, dilo en una línea y ofrece lo que sí puedes hacer: dejarlo apuntado para que lo vea, o un `event` en la fecha.
+`remind_at` ya despierta al Dueño: `alter remind sync` pone el timer de systemd y
+`alter remind fire` avisa por Telegram. Tras crear o editar un recordatorio,
+ejecuta `alter remind sync`; si sale con algo distinto de 0, dilo en una línea con
+el error y no prometas el aviso.
 
 Al terminar, una línea: qué has apuntado, de qué tipo y cuándo.

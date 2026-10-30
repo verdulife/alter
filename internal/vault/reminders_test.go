@@ -372,22 +372,41 @@ Un separador en el cuerpo no es frontmatter, y la sangría tampoco se toca.
 	}
 }
 
-func TestMarkFiredWithoutLastFiredKeyFails(t *testing.T) {
+// TestMarkFiredAddsTheMissingKey pins the integration rule that makes one-off
+// reminders work at all: the contract does not ask for last_fired at creation,
+// so the writer must be able to create it inside the existing frontmatter
+// instead of refusing. Refusing turned every one-off reminder into one that
+// never fired.
+func TestMarkFiredAddsTheMissingKey(t *testing.T) {
 	path := writeFile(t,
 		filepath.Join(t.TempDir(), "2026-10-29-llamar-a-mama.md"),
 		reminderDoc(reminderSpec{remindAt: "2026-11-03T11:00:00+01:00"}))
 	before := readFile(t, path)
+	if strings.Contains(before, "last_fired") {
+		t.Fatalf("fixture already carries last_fired:\n%s", before)
+	}
 
-	err := MarkFired(path, scanNow())
-	if err == nil {
-		t.Fatal("MarkFired on a reminder without last_fired: got nil error, want a failure")
+	at := time.Date(2026, 11, 3, 11, 0, 0, 0, time.FixedZone("CET", 3600))
+	if err := MarkFired(path, at); err != nil {
+		t.Fatalf("MarkFired: %v", err)
 	}
-	if !strings.Contains(err.Error(), "last_fired") {
-		t.Errorf("error = %q, want it to name last_fired", err)
+
+	got := readFile(t, path)
+	// The key is appended at the end of the frontmatter, before its closing line.
+	want := strings.Replace(before, "\n---\n", "\nlast_fired: "+at.Format(stampLayout)+"\n---\n", 1)
+	if got != want {
+		t.Errorf("file after MarkFired:\n%q\nwant:\n%q", got, want)
 	}
-	// Failing loudly means not appending a second key either.
-	if got := readFile(t, path); got != before {
-		t.Errorf("file changed after the failure:\n%q\nwant:\n%q", got, before)
+
+	entry, problems := ParseFile(path)
+	if len(problems) > 0 {
+		t.Fatalf("ParseFile after MarkFired: %v", problems)
+	}
+	if entry.LastFired.IsZero() || !entry.LastFired.Equal(at) {
+		t.Errorf("last_fired = %s, want %s", entry.LastFired, at)
+	}
+	if DueAt(entry, at.Add(time.Minute)) {
+		t.Error("entry still due after MarkFired")
 	}
 }
 

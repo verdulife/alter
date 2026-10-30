@@ -252,11 +252,20 @@ func rewriteFrontmatterValue(path, key, value string) error {
 	// The parser owns the frontmatter: it finds the key's line and refuses
 	// duplicates, so the line number it reports is the one to replace.
 	entry, _ := Parse(path, data)
+	lines := byteLines(data)
 	line := entry.Line(key)
 	if line == 0 {
-		return fmt.Errorf("%s: el frontmatter no tiene la clave %q y no se añade: escribe la entrada con el contrato del vault", path, key)
+		// last_fired is written the first time a reminder fires, so the contract
+		// does not ask for it at creation. Append it inside the frontmatter rather
+		// than refusing: a writer that cannot create the key it owns turns every
+		// one-off reminder into a reminder that never fires.
+		close := closingDelimiter(lines)
+		if close < 0 {
+			return fmt.Errorf("%s: el frontmatter no está cerrado, no puedo añadir %q", path, key)
+		}
+		updated := insertLine(lines, close, key+": "+value)
+		return writeAtomic(path, updated)
 	}
-	lines := byteLines(data)
 	if line > len(lines) {
 		return fmt.Errorf("%s: no se puede localizar la línea %d de %q", path, line, key)
 	}
@@ -343,4 +352,28 @@ func writeAtomic(path string, data []byte) error {
 		return fmt.Errorf("no se puede reemplazar %s: %w", path, err)
 	}
 	return nil
+}
+
+// closingDelimiter returns the 0-based index of the frontmatter's closing "---",
+// or -1 when the block is not closed. The first line is the opening delimiter.
+func closingDelimiter(lines [][]byte) int {
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(string(lines[i])) == "---" {
+			return i
+		}
+	}
+	return -1
+}
+
+// insertLine returns the whole file with value inserted as a new line at index i.
+func insertLine(lines [][]byte, i int, value string) []byte {
+	out := make([][]byte, 0, len(lines)+1)
+	out = append(out, lines[:i]...)
+	out = append(out, []byte(value+"\n"))
+	out = append(out, lines[i:]...)
+	var buf bytes.Buffer
+	for _, line := range out {
+		buf.Write(line)
+	}
+	return buf.Bytes()
 }

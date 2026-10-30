@@ -269,6 +269,10 @@ type bridgeRuntime struct {
 	// resetSession performs the reset a /reset asks for (test seam): the real one
 	// is Session.Reset, and a test can make it fail to pin the error line.
 	resetSession func(ctx context.Context, sessionID string) error
+	// syncReminders runs the reminder reconciliation once at start-up (test seam):
+	// the real one is `alter remind sync`, and a test can replace it to keep the
+	// machine's systemd out of the run.
+	syncReminders func(ctx context.Context)
 }
 
 // bridgeRuntimeOption tunes the composed runtime. Options exist for the test
@@ -433,6 +437,11 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 		r.resetSession = session.Reset
 	}
 	r.poller = telegram.NewPoller(client, cfg.TelegramChatID, logger, r.handleEvent)
+	// F3-3: the timers are derived from the vault, so a restart leaves nothing
+	// scheduled and a reminder may have come due while the machine was off.
+	// Reconciling is composed here and fired by Run, which keeps the composition
+	// itself free of side effects.
+	r.syncReminders = func(ctx context.Context) { startupReminderSync(ctx, cfg, logger) }
 	return r, nil
 }
 
@@ -440,6 +449,11 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 // in reverse order: poller, tools server, Pi session. The Pi process must not
 // outlive the endpoint its tools call, and the poller must not outlive either.
 func (r *bridgeRuntime) Run(ctx context.Context) error {
+	// The reminder reconciler runs beside the poller and never in front of it: it may
+	// have to wake the agent for a reminder that came due while the machine was off,
+	// and a failure is logged instead of stopping the bridge.
+	go r.syncReminders(ctx)
+
 	err := r.poller.Run(ctx)
 	// A turn started by the poll loop may still be running: it must finish (or be
 	// cancelled with the same context) before the session and the tools server it

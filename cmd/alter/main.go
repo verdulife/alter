@@ -7,9 +7,11 @@
 // owns.
 //
 // The binary also answers `alter vault check [dir]`, a validator that checks the
-// vault's markdown entries against the alter-vault contract and exits. It is not
-// a second entry path: it takes no message, starts no bridge and leaves the
-// runtime untouched when no subcommand is given.
+// vault's markdown entries against the alter-vault contract and exits, and the
+// reminder subcommands (`alter remind sync`, `alter remind fire`, `alter notify`)
+// that join the vault with the machine's timers. They are not a second entry path:
+// they take no message, start no bridge and leave the runtime untouched when no
+// subcommand is given.
 package main
 
 import (
@@ -31,10 +33,13 @@ import (
 const ignoredBridgeSwitch = "ALTER_BRIDGE_ENABLED"
 
 func main() {
-	// The vault validator is a subcommand, not a second runtime: it validates and
-	// exits before the bridge is composed. With no subcommand the process behaves
-	// exactly as before.
+	// The vault validator and the reminder commands are subcommands, not a second
+	// runtime: they act and exit before the bridge is composed. With no subcommand
+	// the process behaves exactly as before.
 	if handled, code := runVaultCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+	if handled, code := runRemindCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}
 
