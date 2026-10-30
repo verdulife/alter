@@ -111,6 +111,11 @@ func runFakePiScenario(scenario string) {
 		case "extension_ui_response":
 			// The dialog was answered: the run settles and reports the record.
 			dialogReply = string(in.Bytes())
+			if scenario == "dialog-confirm-stream" {
+				// Text follows the answer, so a test can tell what the bridge published
+				// between the press and the first streamed delta.
+				emit(textDeltaLine("Hola "))
+			}
 			emit(`{"type":"agent_settled"}`)
 		case "prompt":
 			prompts++
@@ -124,7 +129,7 @@ func runFakePiScenario(scenario string) {
 			emit(`{"type":"response","command":"prompt","success":true,"id":"` + cmd.ID +
 				`","data":{"disposition":"started"}}`)
 			switch scenario {
-			case "dialog-confirm", "dialog-select", "dialog-input":
+			case "dialog-confirm", "dialog-confirm-stream", "dialog-select", "dialog-input":
 				// One blocking dialog: the run only settles once the bridge answers
 				// it, exactly like Pi. The message carries markup characters on
 				// purpose, so the question the owner receives proves the escaping.
@@ -148,6 +153,14 @@ func runFakePiScenario(scenario string) {
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hola "}}`)
 				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"desde Pi"}}`)
 				emit(`{"type":"agent_settled"}`)
+			case "slow-stream":
+				// Pi thinks for a while before its first delta: the turn has produced no
+				// text for longer than the refresh interval, which is exactly the window
+				// the thinking draft has to cover.
+				time.Sleep(250 * time.Millisecond)
+				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hola "}}`)
+				emit(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"desde Pi"}}`)
+				emit(`{"type":"agent_settled"}`)
 			default:
 				emit(`{"type":"agent_settled"}`)
 			}
@@ -156,7 +169,7 @@ func runFakePiScenario(scenario string) {
 			// a human error line instead of an empty message.
 			text := ""
 			switch scenario {
-			case "stream":
+			case "stream", "slow-stream", "dialog-confirm-stream":
 				text = "Hola desde Pi, **con markdown**"
 			case "echo-prompt":
 				text = lastPrompt
@@ -2045,4 +2058,283 @@ func (b *fakeBot) snapshotTyping() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]string(nil), b.typing...)
+}
+
+// snapshotDrafts returns the drafts the chat received, in order.
+func (b *fakeBot) snapshotDrafts() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.drafts...)
+}
+
+// countDrafts reports how many drafts the chat has received so far.
+func countDrafts(b *fakeBot) int {
+	return len(b.snapshotDrafts())
+}
+
+// waitDrafts blocks until the chat received at least want drafts, so a test never
+// asserts on a request the fake may still be serving.
+func waitDrafts(t *testing.T, b *fakeBot, want int) []string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if drafts := b.snapshotDrafts(); len(drafts) >= want {
+			return drafts
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d drafts, got %v", want, b.snapshotDrafts())
+	return nil
+}
+
+// TestBridgeQueuedTurnAnnouncesItselfWhileItWaits is the reported gap: a message
+// that arrives while another turn is running showed nothing at all until it
+// started, so sending a link looked like Telegram had dropped it. The thinking
+// draft must be published when the message arrives, while the queued turn is still
+// waiting for the turn slot — not when it finally starts.
+func TestBridgeQueuedTurnAnnouncesItselfWhileItWaits(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	h := startDialogBridge(t, "echo-prompt", 0, withTurnGate(func(ctx context.Context) {
+		once.Do(func() { close(entered) })
+		select {
+		case <-gate:
+		case <-ctx.Done():
+		}
+	}))
+
+	h.sendText(1, 1, "primera")
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the first turn never took the turn slot; log: %s", h.logs.String())
+	}
+
+	// The first turn holds the slot and has not prompted Pi yet, so any draft that
+	// shows up now can only come from the message that is still waiting.
+	before := countDrafts(h.bot.fakeBot)
+	h.sendText(2, 2, "segunda")
+
+	drafts := waitDrafts(t, h.bot.fakeBot, before+1)
+	if got := drafts[len(drafts)-1]; got != bridgeThinkingDraft {
+		t.Errorf("draft published while the turn waits = %q, want the thinking draft %q", got, bridgeThinkingDraft)
+	}
+	// Nothing was answered yet: the announcement cannot come from a turn that ran.
+	if got := h.rich(); len(got) != 0 {
+		t.Fatalf("deliveries = %v while the first turn holds the slot, want none", got)
+	}
+
+	close(gate)
+	rich := h.waitRich(t, 2)
+	if !containsLine(rich, "primera") || !containsLine(rich, "segunda") {
+		t.Errorf("deliveries = %v, want both queued turns answered in arrival order", rich)
+	}
+}
+
+// TestBridgeThinkingDraftRefreshesUntilAnswerTextArrives is the second reported
+// gap: a turn shows the placeholder once and then nothing until the model's first
+// word, which can take minutes. The placeholder is refreshed while the turn has
+// produced no text, and it stops the moment text arrives so it never overwrites the
+// answer.
+func TestBridgeThinkingDraftRefreshesUntilAnswerTextArrives(t *testing.T) {
+	h := startDialogBridge(t, "slow-stream", 0, withThinkingInterval(15*time.Millisecond))
+	h.sendText(1, 1, "hola Pi")
+
+	rich := h.waitRich(t, 1)
+	if rich[0] != "Hola desde Pi, **con markdown**" {
+		t.Fatalf("delivery = %q, want the ordinary Pi answer", rich[0])
+	}
+
+	drafts := h.bot.snapshotDrafts()
+	thinking, firstText := 0, -1
+	for i, draft := range drafts {
+		if draft == bridgeThinkingDraft {
+			if firstText >= 0 {
+				t.Errorf("draft %d = %q was published after the answer text at %d: the refresher must stop at the first delta", i, draft, firstText)
+			}
+			thinking++
+			continue
+		}
+		if firstText < 0 {
+			firstText = i
+		}
+	}
+	if thinking < 2 {
+		t.Fatalf("drafts = %v, want the placeholder refreshed at least once while Pi produced no text", drafts)
+	}
+	if firstText < 0 {
+		t.Fatalf("drafts = %v, want the streamed answer text after the placeholder", drafts)
+	}
+
+	// The refresher belongs to the turn: once the turn is over no placeholder keeps
+	// arriving behind the final message.
+	settled := countDrafts(h.bot.fakeBot)
+	time.Sleep(100 * time.Millisecond)
+	if got := countDrafts(h.bot.fakeBot); got != settled {
+		t.Errorf("drafts went from %d to %d after the turn ended: the refresher must stop with the turn", settled, got)
+	}
+}
+
+// TestBridgeApprovalPressRepublishesTheThinkingDraft is the third reported gap: the
+// turn that resumes after a dialogue emitted its placeholder minutes ago, so the
+// owner saw nothing between his press and the next text. The press is itself the
+// trigger, and the placeholder has to land before Pi continues.
+func TestBridgeApprovalPressRepublishesTheThinkingDraft(t *testing.T) {
+	h := startDialogBridge(t, "dialog-confirm-stream", 0)
+	h.sendText(1, 1, "borra el log")
+
+	question := h.waitRich(t, 1)[0]
+	if !strings.Contains(question, "Aprobar") {
+		t.Fatalf("question %q is not the approval prompt: the turn is not parked", question)
+	}
+
+	// The turn is parked and produced no text: the only draft so far is its
+	// placeholder from before the question.
+	before := countDrafts(h.bot.fakeBot)
+	pushUpdates(h.bot.fakeBot, callbackUpdate(2, "cb-resume", askButtonData(t, question)[approvalIndexAllow]))
+
+	rich := h.waitRich(t, 2)
+	if rich[1] != "Hola desde Pi, **con markdown**" {
+		t.Fatalf("delivery after the press = %q, want the turn's own answer", rich[1])
+	}
+
+	drafts := h.bot.snapshotDrafts()
+	if len(drafts) < before+2 {
+		t.Fatalf("drafts after the press = %v, want the placeholder and then the streamed text", drafts[before:])
+	}
+	if drafts[before] != bridgeThinkingDraft {
+		t.Errorf("draft right after the press = %q, want the thinking draft %q", drafts[before], bridgeThinkingDraft)
+	}
+	if !strings.Contains(drafts[before+1], "Hola") {
+		t.Errorf("draft after the placeholder = %q, want the first streamed text", drafts[before+1])
+	}
+}
+
+// countingDraftSender is a Bot API draft recorder that can fail every call and
+// keeps every draft it served, so a test can assert on the exact sequence.
+type countingDraftSender struct {
+	mu   sync.Mutex
+	n    int
+	sent []string
+	err  error
+}
+
+func (c *countingDraftSender) SendRichDraft(_ context.Context, _ int64, _ int, markdown string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	c.sent = append(c.sent, markdown)
+	return c.err
+}
+
+func (c *countingDraftSender) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func (c *countingDraftSender) drafts() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sent...)
+}
+
+// TestThinkingRefresherStopsOnCancellationAndLogsSendFailures pins the refresher on
+// its own: a failing Bot API call is logged and never stops it, cancellation ends it
+// by itself, and stop waits for the goroutine so a finished turn leaves nothing
+// behind.
+func TestThinkingRefresherStopsOnCancellationAndLogsSendFailures(t *testing.T) {
+	sender := &countingDraftSender{err: errors.New("telegram: sendRichMessageDraft failed: too many requests")}
+	logs := &bytes.Buffer{}
+	refresher := thinkingRefresher{
+		sender:  sender,
+		chatID:  testOwnerID,
+		draftID: bridgeDraftID,
+		text:    bridgeThinkingDraft,
+		every:   10 * time.Millisecond,
+		logger:  log.New(logs, "", 0),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := refresher.start(ctx)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for sender.count() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := sender.count(); got < 3 {
+		t.Fatalf("drafts = %d, want at least 3: a failing send must not stop the refresh", got)
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return after the context was cancelled")
+	}
+
+	cancelled := sender.count()
+	time.Sleep(100 * time.Millisecond)
+	if got := sender.count(); got != cancelled {
+		t.Errorf("drafts went from %d to %d after cancellation", cancelled, got)
+	}
+	if got := sender.drafts(); len(got) == 0 || got[0] != bridgeThinkingDraft {
+		t.Errorf("drafts = %v, want %q", got, bridgeThinkingDraft)
+	}
+	if got := logs.String(); !strings.Contains(got, "thinking draft") {
+		t.Errorf("log %q does not report the failed thinking draft", got)
+	}
+}
+
+// TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft proves the placeholder never
+// fights the answer: once a turn owns the draft with its streamed text, the
+// refresher publishes nothing more and exits.
+func TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft(t *testing.T) {
+	sender := &countingDraftSender{}
+	var mu sync.Mutex
+	owns := false
+	refresher := thinkingRefresher{
+		sender:       sender,
+		chatID:       testOwnerID,
+		draftID:      bridgeDraftID,
+		text:         bridgeThinkingDraft,
+		every:        5 * time.Millisecond,
+		logger:       discardLogger(),
+		carryingText: func() bool { mu.Lock(); defer mu.Unlock(); return owns },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := refresher.start(ctx)
+	defer stop()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for sender.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := sender.count(); got < 2 {
+		t.Fatalf("drafts = %d, want at least 2 while the turn has no text", got)
+	}
+
+	mu.Lock()
+	owns = true
+	mu.Unlock()
+
+	if refresher.publish(ctx) {
+		t.Error("publish reported a send while answer text owns the draft")
+	}
+
+	// The refresher exits on its own, without anybody calling stop first.
+	time.Sleep(50 * time.Millisecond)
+	stopped := sender.count()
+	time.Sleep(100 * time.Millisecond)
+	if got := sender.count(); got != stopped {
+		t.Errorf("drafts went from %d to %d after the answer took the draft", stopped, got)
+	}
 }

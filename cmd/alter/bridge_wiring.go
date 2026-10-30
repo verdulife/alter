@@ -48,6 +48,21 @@ const (
 	// so intermediate frames may be dropped.
 	bridgeDraftInterval = time.Second
 
+	// bridgeThinkingInterval is how often a running turn re-publishes the thinking
+	// draft while it has produced no text. Telegram Web renders neither the typing
+	// action nor anything else for the minutes Pi may spend before its first delta
+	// — a turn parked on an approval or a question can show nothing at all — so the
+	// draft is refreshed well inside the window the owner would otherwise read as a
+	// dead turn. Four seconds matches bridgeTypingInterval and keeps the cost at one
+	// cheap request per interval instead of a burst.
+	bridgeThinkingInterval = 4 * time.Second
+
+	// bridgeAnnounceTimeout bounds the thinking draft the bridge sends when a
+	// message arrives. That send happens in the poll loop, before the turn is
+	// queued, so a slow or unreachable Bot API can delay the next poll by at most
+	// this much instead of the client's own forty-second timeout.
+	bridgeAnnounceTimeout = 3 * time.Second
+
 	// bridgeDraftID identifies the ephemeral draft of a turn: drafts sharing an
 	// id replace each other, and the final message replaces them all.
 	bridgeDraftID = 1
@@ -215,6 +230,10 @@ type bridgeRuntime struct {
 	// turns tracks the turn goroutines started by the poller, so teardown can wait
 	// for them before it takes the session and the tools server away.
 	turns sync.WaitGroup
+	// draft is the shared state of the one streaming draft: every turn publishes
+	// into the same draft id, so the bridge must know whether the visible draft
+	// already carries a turn's answer before it publishes the placeholder over it.
+	draft draftOwnership
 
 	// turnGate, when set, runs inside the turn goroutine right after it owns the
 	// turn slot (test seam): it lets a test hold a turn open, so it can prove that
@@ -242,6 +261,10 @@ type bridgeRuntime struct {
 	// line. The field is the test seam for the notice; production always uses
 	// bridgeProgressAfter.
 	progressAfter time.Duration
+	// thinkingInterval is how often a waiting turn re-publishes the thinking
+	// draft. The field is the test seam for the refresher; production always uses
+	// bridgeThinkingInterval.
+	thinkingInterval time.Duration
 	// resetSession performs the reset a /reset asks for (test seam): the real one
 	// is Session.Reset, and a test can make it fail to pin the error line.
 	resetSession func(ctx context.Context, sessionID string) error
@@ -296,6 +319,13 @@ func withProgressAfter(after time.Duration) bridgeRuntimeOption {
 	return func(r *bridgeRuntime) { r.progressAfter = after }
 }
 
+// withThinkingInterval replaces how often a waiting turn re-publishes the thinking
+// draft (test seam), so a test can watch the refresh inside a turn that would
+// otherwise last four seconds per tick.
+func withThinkingInterval(interval time.Duration) bridgeRuntimeOption {
+	return func(r *bridgeRuntime) { r.thinkingInterval = interval }
+}
+
 // newBridgeRuntime composes the bridge: vault store → tools server → Pi session
 // (carrying the tools URL and token in its environment) → poller for the owner
 // chat. Nothing is spawned until the first prompt, and the tools server is bound
@@ -312,11 +342,12 @@ func newBridgeRuntime(cfg config.Config, logger *log.Logger, opts ...bridgeRunti
 	}
 
 	r := &bridgeRuntime{
-		chatID:         cfg.TelegramChatID,
-		logger:         logger,
-		inboundMax:     bridgeInboundMaxBytes,
-		typingInterval: bridgeTypingInterval,
-		progressAfter:  bridgeProgressAfter,
+		chatID:           cfg.TelegramChatID,
+		logger:           logger,
+		inboundMax:       bridgeInboundMaxBytes,
+		typingInterval:   bridgeTypingInterval,
+		progressAfter:    bridgeProgressAfter,
+		thinkingInterval: bridgeThinkingInterval,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -453,6 +484,15 @@ func (r *bridgeRuntime) handleEvent(ctx context.Context, ev telegram.Event) erro
 	case telegram.EventDocument, telegram.EventPhoto:
 		return r.handleMedia(ctx, chatID, ev)
 	case telegram.EventCallback:
+		// The press is the answer that unblocks a parked turn, so it is itself the
+		// trigger for feedback: the turn published its placeholder minutes ago and
+		// Pi still needs a moment before the next text. Publishing here — before the
+		// broker hands the answer to Pi — is what puts the placeholder between the
+		// press and that text. A press on a button that settles nothing is skipped,
+		// so a stale press never replaces a live answer.
+		if r.asksWaiting() {
+			r.announceThinking(ctx, chatID)
+		}
 		r.asks.Resolve(ctx, ev)
 		return nil
 	}
@@ -571,6 +611,12 @@ func (r *bridgeRuntime) handleText(ctx context.Context, chatID int64, text strin
 		return r.resetConversation(ctx, chatID)
 	}
 	if r.asks != nil {
+		// A typed answer resumes the turn the same way a press does: the parked turn
+		// emitted its placeholder long ago and Pi needs a moment to continue, so the
+		// message republishes it before the broker wakes Pi up.
+		if r.asksWaiting() {
+			r.announceThinking(ctx, chatID)
+		}
 		if outcome := r.asks.ResolveText(text); outcome.settled() {
 			// The tool call that just returned is invisible to the owner, so the
 			// chat always learns what his message did to the question.
@@ -624,6 +670,22 @@ func bridgeResetSessionID(base string, now time.Time) string {
 	return base + "-" + now.UTC().Format(bridgeResetIDLayout)
 }
 
+// asksWaiting reports whether a question is parked waiting for the owner. It is
+// what keeps the resume announcement honest: only the answer that really settles a
+// dialogue republishes the thinking draft, so a stale button in an old message
+// never replaces the answer text of the turn that is streaming right now.
+//
+// The pending slot belongs to the broker (bridge_ask.go), which owns every
+// invariant around it; this only reads it under the same lock the broker takes.
+func (r *bridgeRuntime) asksWaiting() bool {
+	if r.asks == nil {
+		return false
+	}
+	r.asks.mu.Lock()
+	defer r.asks.mu.Unlock()
+	return r.asks.pending != nil
+}
+
 // runTurn starts one prompt: typing feedback, throttled streamed drafts, then the
 // final markdown. A failed or empty turn still answers the chat with a short
 // human line, never an empty message and never silence.
@@ -633,6 +695,13 @@ func bridgeResetSessionID(base string, now time.Time) string {
 // all arrive there, and a poll loop blocked inside a turn would leave the owner
 // pressing buttons nobody reads. turnMu keeps the turns themselves serialized.
 func (r *bridgeRuntime) runTurn(ctx context.Context, chatID int64, prompt string) error {
+	// Announce the turn when its message arrives, not when it starts running: a
+	// turn queued behind another one would otherwise show nothing at all while it
+	// waits for the slot, which is exactly what made a sent link look dropped.
+	// The send is bounded and never fails the turn; the turn's own refresher keeps
+	// the announcement alive once it owns the slot.
+	r.announceThinking(ctx, chatID)
+
 	r.turns.Add(1)
 	go func() {
 		defer r.turns.Done()
@@ -660,19 +729,26 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 
 	// Telegram Web does not render the typing indicator for bots, but it does
 	// render drafts, which is the channel that already shows the answer as it is
-	// written. Announcing the turn on that same channel is what the owner sees;
-	// the first streamed delta replaces this text.
-	if derr := r.client.SendRichDraft(ctx, chatID, bridgeDraftID, bridgeThinkingDraft); derr != nil {
-		r.logger.Printf("bridge: thinking draft: %v", derr)
-	}
+	// written. This refresher publishes the placeholder at once — the arrival
+	// announcement already did, and repeating it is one cheap request into the same
+	// draft id — and again every interval while Pi has produced no text, so a turn
+	// parked on an approval or a question stays visibly alive.
+	stopThinking := r.keepThinkingAlive(ctx, chatID)
+	defer stopThinking()
 
 	// A turn that runs past the threshold announces itself once: silence for
 	// minutes is indistinguishable from a dead turn in the chat.
 	stopProgress := r.notifyProgress(ctx, chatID)
 	defer stopProgress()
 
+	// firstText marks the draft as carrying the answer from the first streamed
+	// delta on: the refresher stops there (the placeholder must never replace the
+	// answer) and a later turn's announcement is held back while this turn writes.
+	var firstText sync.Once
+
 	throttle := &draftThrottle{min: bridgeDraftInterval, now: time.Now}
 	final, err := r.sess.PromptStream(ctx, prompt, func(accumulated string) {
+		firstText.Do(func() { r.draft.setText(true) })
 		if !throttle.allow() {
 			return
 		}
@@ -682,9 +758,12 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 		}
 	})
 
-	// Stop the notice — waiting for a send already in flight — before the answer
-	// goes out, so the progress line can never land after the final reply.
+	// Stop the refresher and the notice — waiting for sends already in flight —
+	// before the answer goes out. A placeholder published after the final message
+	// would appear as a stray "Pensando…" underneath it.
+	stopThinking()
 	stopProgress()
+	r.draft.setText(false)
 
 	switch {
 	case err != nil:
@@ -853,6 +932,141 @@ func (r *bridgeRuntime) keepTypingAlive(ctx context.Context, chatID int64) (stop
 		every:  interval,
 		logger: r.logger,
 	}.start(ctx)
+}
+
+// draftOwnership is the runtime's shared view of the one streaming draft. Every
+// turn publishes into the same draft id, so a send replaces the previous draft
+// instead of stacking up — cheap and idempotent — but it also means a placeholder
+// published over answer text erases what the owner is reading until the next delta
+// arrives. This state is what keeps that from happening: the turn claims the draft
+// with its first delta and releases it when it ends.
+type draftOwnership struct {
+	mu sync.Mutex
+	// text is true while a turn's streamed answer owns the draft.
+	text bool
+}
+
+// carriesText reports whether a turn's streamed answer currently owns the draft.
+func (d *draftOwnership) carriesText() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.text
+}
+
+// setText records whether a turn's streamed answer owns the draft.
+func (d *draftOwnership) setText(owns bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.text = owns
+}
+
+// bridgeDraftSender is the Bot API surface the thinking draft needs: one ephemeral
+// draft that replaces the draft with the same id.
+type bridgeDraftSender interface {
+	SendRichDraft(ctx context.Context, chatID int64, draftID int, markdown string) error
+}
+
+// thinkingRefresher publishes the thinking placeholder into the one streaming
+// draft. It is the only liveness signal Telegram Web renders for a bot, so a turn
+// that has produced no text yet must keep republishing it — and it must never
+// publish it over the answer.
+type thinkingRefresher struct {
+	sender  bridgeDraftSender
+	chatID  int64
+	draftID int
+	text    string
+	every   time.Duration
+	logger  *log.Logger
+	// carryingText reports whether a turn's answer already owns the draft. The
+	// refresher stops as soon as it does, and it holds back a placeholder that
+	// would replace text the owner is reading.
+	carryingText func() bool
+}
+
+// publish emits one placeholder draft and reports whether the refresh may go on.
+// A failed request is logged and never stops the refresh nor fails anything: the
+// draft is cosmetic. A draft already owned by answer text ends the refresh, which
+// is what stops a slow tick from overwriting the answer.
+func (t thinkingRefresher) publish(ctx context.Context) bool {
+	if t.carryingText != nil && t.carryingText() {
+		return false
+	}
+	if err := t.sender.SendRichDraft(ctx, t.chatID, t.draftID, t.text); err != nil && t.logger != nil {
+		t.logger.Printf("bridge: thinking draft: %v", err)
+	}
+	return true
+}
+
+// start emits the placeholder at once — so a turn shows feedback before Pi is
+// prompted — and repeats it every interval until stop is called, ctx ends, or a
+// turn's answer takes the draft over. The returned stop is safe to call more than
+// once and waits for the goroutine, so a finished turn leaves nothing behind; a
+// cancelled ctx ends the goroutine by itself.
+func (t thinkingRefresher) start(ctx context.Context) (stop func()) {
+	t.publish(ctx)
+
+	every := t.every
+	if every <= 0 {
+		every = bridgeThinkingInterval
+	}
+
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !t.publish(ctx) {
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stopCh) })
+		<-done
+	}
+}
+
+// thinkingFor builds the thinking-draft publisher of one chat. Every path that
+// publishes the placeholder — the arrival announcement, the resume announcement
+// and the refresher of a running turn — goes through this one shape, so all of them
+// share the draft id and the same "never over the answer" rule.
+func (r *bridgeRuntime) thinkingFor(chatID int64) thinkingRefresher {
+	return thinkingRefresher{
+		sender:       r.client,
+		chatID:       chatID,
+		draftID:      bridgeDraftID,
+		text:         bridgeThinkingDraft,
+		every:        r.thinkingInterval,
+		logger:       r.logger,
+		carryingText: r.draft.carriesText,
+	}
+}
+
+// announceThinking publishes the thinking draft outside the turn goroutine: when a
+// message arrives (queued or not) and when an answer unblocks a dialogue. The send
+// is bounded by bridgeAnnounceTimeout because these callers run in the poll loop,
+// and a failure is logged only — feedback is cosmetic and must never fail a turn.
+func (r *bridgeRuntime) announceThinking(ctx context.Context, chatID int64) {
+	announceCtx, cancel := context.WithTimeout(ctx, bridgeAnnounceTimeout)
+	defer cancel()
+	r.thinkingFor(chatID).publish(announceCtx)
+}
+
+// keepThinkingAlive starts the thinking refresher of one turn and returns the
+// function that stops it.
+func (r *bridgeRuntime) keepThinkingAlive(ctx context.Context, chatID int64) (stop func()) {
+	return r.thinkingFor(chatID).start(ctx)
 }
 
 // reply delivers the final markdown with the richest representation Telegram
