@@ -234,6 +234,8 @@ type bridgeRuntime struct {
 	// draft is the shared state of the one streaming draft: every turn publishes
 	// into the same draft id, so the bridge must know whether the visible draft
 	// already carries a turn's answer before it publishes the placeholder over it.
+	// Both sides claim it before they send, so the answer wins the decision even
+	// against a placeholder that is already on the wire.
 	draft draftOwnership
 
 	// turnGate, when set, runs inside the turn goroutine right after it owns the
@@ -756,17 +758,16 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 	stopProgress := r.notifyProgress(ctx, chatID)
 	defer stopProgress()
 
-	// firstText marks the draft as carrying the answer from the first streamed
-	// delta on: the refresher stops there (the placeholder must never replace the
-	// answer) and a later turn's announcement is held back while this turn writes.
-	var firstText sync.Once
-
 	throttle := &draftThrottle{min: bridgeDraftInterval, now: time.Now}
 	final, err := r.sess.PromptStream(ctx, prompt, func(accumulated string) {
-		firstText.Do(func() { r.draft.setText(true) })
 		if !throttle.allow() {
 			return
 		}
+		// Claim the draft for the answer before sending it, so that deciding
+		// whether a placeholder may go out and taking the draft for the answer are
+		// one step: from here on the refresher stops and any placeholder already in
+		// flight repairs itself with this text.
+		r.draft.claimText(accumulated)
 		if derr := r.client.SendRichDraft(ctx, chatID, bridgeDraftID, accumulated); derr != nil {
 			// A dropped draft is cosmetic too: the final message still arrives.
 			r.logger.Printf("bridge: draft: %v", derr)
@@ -778,7 +779,7 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 	// would appear as a stray "Pensando…" underneath it.
 	stopThinking()
 	stopProgress()
-	r.draft.setText(false)
+	r.draft.releaseText()
 
 	switch {
 	case err != nil:
@@ -953,26 +954,60 @@ func (r *bridgeRuntime) keepTypingAlive(ctx context.Context, chatID int64) (stop
 // turn publishes into the same draft id, so a send replaces the previous draft
 // instead of stacking up — cheap and idempotent — but it also means a placeholder
 // published over answer text erases what the owner is reading until the next delta
-// arrives. This state is what keeps that from happening: the turn claims the draft
-// with its first delta and releases it when it ends.
+// arrives. This state is what keeps that from happening: both sides claim the draft
+// before they send it and release it after, and the claim of answer text is final
+// for the placeholder.
 type draftOwnership struct {
 	mu sync.Mutex
 	// text is true while a turn's streamed answer owns the draft.
 	text bool
+	// answer is the last answer text the turn published into the draft. A
+	// placeholder that loses the draft while its send is in flight puts this text
+	// back, so the owner never keeps reading the placeholder over the answer.
+	answer string
 }
 
-// carriesText reports whether a turn's streamed answer currently owns the draft.
-func (d *draftOwnership) carriesText() bool {
+// claimText takes the draft for the turn's streamed answer and records the text the
+// draft now shows. It runs before the delta is sent, so the decision and the claim
+// are one step: a placeholder that has not claimed yet never sends, and one already
+// in flight finds the draft taken when it comes back.
+func (d *draftOwnership) claimText(answer string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.text
+	d.text = true
+	d.answer = answer
 }
 
-// setText records whether a turn's streamed answer owns the draft.
-func (d *draftOwnership) setText(owns bool) {
+// releaseText ends the answer's ownership once the turn is over, so the next turn
+// starts from a draft that carries no text.
+func (d *draftOwnership) releaseText() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.text = owns
+	d.text = false
+	d.answer = ""
+}
+
+// claimPlaceholder takes the draft for the thinking placeholder and reports whether
+// it won. The claim is deliberately not held across the send — that would put a Bot
+// API round trip inside the turn and serialise every delta behind it — so the caller
+// releases it with releasePlaceholder once the send returns.
+func (d *draftOwnership) claimPlaceholder() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.text
+}
+
+// releasePlaceholder ends a placeholder's claim and reports the answer text the
+// draft must show again when a delta took it while the placeholder was in flight.
+// A placeholder that lost the draft is repaired with that text instead of being left
+// on screen for the owner to read as the answer.
+func (d *draftOwnership) releasePlaceholder() (answer string, lost bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.text {
+		return "", false
+	}
+	return d.answer, true
 }
 
 // bridgeDraftSender is the Bot API surface the thinking draft needs: one ephemeral
@@ -992,24 +1027,43 @@ type thinkingRefresher struct {
 	text    string
 	every   time.Duration
 	logger  *log.Logger
-	// carryingText reports whether a turn's answer already owns the draft. The
-	// refresher stops as soon as it does, and it holds back a placeholder that
-	// would replace text the owner is reading.
-	carryingText func() bool
+	// owner is the shared draft state this refresher claims the draft from. A nil
+	// owner means nobody competes for the draft (unit tests of the refresh itself);
+	// otherwise every publish wins the claim before sending and releases it after.
+	owner *draftOwnership
 }
 
 // publish emits one placeholder draft and reports whether the refresh may go on.
 // A failed request is logged and never stops the refresh nor fails anything: the
-// draft is cosmetic. A draft already owned by answer text ends the refresh, which
-// is what stops a slow tick from overwriting the answer.
+// draft is cosmetic.
+//
+// The draft is claimed before the send and released after it, because the claim
+// cannot be held across the Bot API call: a lock around a network round trip would
+// serialise the turn's deltas behind it. The claim is what makes "may I publish the
+// placeholder?" and "I own the draft" one step, so answer text that claims the
+// draft after the decision keeps it. A placeholder that loses the claim while its
+// send is in flight repairs the draft with the answer text at once, so the owner
+// never reads the placeholder where the answer already was.
 func (t thinkingRefresher) publish(ctx context.Context) bool {
-	if t.carryingText != nil && t.carryingText() {
+	if t.owner != nil && !t.owner.claimPlaceholder() {
 		return false
 	}
 	if err := t.sender.SendRichDraft(ctx, t.chatID, t.draftID, t.text); err != nil && t.logger != nil {
 		t.logger.Printf("bridge: thinking draft: %v", err)
 	}
-	return true
+	if t.owner == nil {
+		return true
+	}
+	answer, lost := t.owner.releasePlaceholder()
+	if !lost {
+		return true
+	}
+	if answer != "" {
+		if err := t.sender.SendRichDraft(ctx, t.chatID, t.draftID, answer); err != nil && t.logger != nil {
+			t.logger.Printf("bridge: thinking draft repair: %v", err)
+		}
+	}
+	return false
 }
 
 // start emits the placeholder at once — so a turn shows feedback before Pi is
@@ -1058,13 +1112,13 @@ func (t thinkingRefresher) start(ctx context.Context) (stop func()) {
 // share the draft id and the same "never over the answer" rule.
 func (r *bridgeRuntime) thinkingFor(chatID int64) thinkingRefresher {
 	return thinkingRefresher{
-		sender:       r.client,
-		chatID:       chatID,
-		draftID:      bridgeDraftID,
-		text:         bridgeThinkingDraft,
-		every:        r.thinkingInterval,
-		logger:       r.logger,
-		carryingText: r.draft.carriesText,
+		sender:  r.client,
+		chatID:  chatID,
+		draftID: bridgeDraftID,
+		text:    bridgeThinkingDraft,
+		every:   r.thinkingInterval,
+		logger:  r.logger,
+		owner:   &r.draft,
 	}
 }
 

@@ -2293,20 +2293,19 @@ func TestThinkingRefresherStopsOnCancellationAndLogsSendFailures(t *testing.T) {
 }
 
 // TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft proves the placeholder never
-// fights the answer: once a turn owns the draft with its streamed text, the
+// fights the answer: once a turn claims the draft with its streamed text, the
 // refresher publishes nothing more and exits.
 func TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft(t *testing.T) {
 	sender := &countingDraftSender{}
-	var mu sync.Mutex
-	owns := false
+	owner := &draftOwnership{}
 	refresher := thinkingRefresher{
-		sender:       sender,
-		chatID:       testOwnerID,
-		draftID:      bridgeDraftID,
-		text:         bridgeThinkingDraft,
-		every:        5 * time.Millisecond,
-		logger:       discardLogger(),
-		carryingText: func() bool { mu.Lock(); defer mu.Unlock(); return owns },
+		sender:  sender,
+		chatID:  testOwnerID,
+		draftID: bridgeDraftID,
+		text:    bridgeThinkingDraft,
+		every:   5 * time.Millisecond,
+		logger:  discardLogger(),
+		owner:   owner,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2322,9 +2321,7 @@ func TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft(t *testing.T) {
 		t.Fatalf("drafts = %d, want at least 2 while the turn has no text", got)
 	}
 
-	mu.Lock()
-	owns = true
-	mu.Unlock()
+	owner.claimText("Hola desde Pi")
 
 	if refresher.publish(ctx) {
 		t.Error("publish reported a send while answer text owns the draft")
@@ -2336,5 +2333,105 @@ func TestThinkingRefresherStopsWhenAnswerTextTakesTheDraft(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := sender.count(); got != stopped {
 		t.Errorf("drafts went from %d to %d after the answer took the draft", stopped, got)
+	}
+}
+
+// gatedDraftSender is a draft recorder that can hold one send open, so a test
+// controls exactly when a draft lands relative to another one. It records after
+// the gate, so the recorded order is the order the Bot API would have served: a
+// blocked send is still in flight while the other one lands.
+type gatedDraftSender struct {
+	mu      sync.Mutex
+	sent    []string
+	blockOn string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatedDraftSender(blockOn string) *gatedDraftSender {
+	return &gatedDraftSender{
+		blockOn: blockOn,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (g *gatedDraftSender) SendRichDraft(_ context.Context, _ int64, _ int, markdown string) error {
+	if markdown == g.blockOn {
+		g.once.Do(func() { close(g.entered) })
+		<-g.release
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sent = append(g.sent, markdown)
+	return nil
+}
+
+func (g *gatedDraftSender) drafts() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.sent...)
+}
+
+// TestThinkingDraftLostToAnswerTextRepairsTheDraft forces the interleaving that
+// used to publish the placeholder over the answer by luck: the placeholder checks
+// that no answer owns the draft, its send is held open, a streamed delta then
+// claims the draft and lands the answer text, and only then does the placeholder
+// reach the Bot API. The claim and the decision are one step, so the placeholder
+// must notice it lost and put the answer text back instead of leaving itself on
+// screen.
+func TestThinkingDraftLostToAnswerTextRepairsTheDraft(t *testing.T) {
+	owner := &draftOwnership{}
+	sender := newGatedDraftSender(bridgeThinkingDraft)
+	refresher := thinkingRefresher{
+		sender:  sender,
+		chatID:  testOwnerID,
+		draftID: bridgeDraftID,
+		text:    bridgeThinkingDraft,
+		every:   time.Hour,
+		logger:  discardLogger(),
+		owner:   owner,
+	}
+	const answer = "Hola desde Pi, **con markdown**"
+
+	published := make(chan bool, 1)
+	go func() { published <- refresher.publish(context.Background()) }()
+
+	select {
+	case <-sender.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the placeholder never reached the sender")
+	}
+	// The delta claims the draft and publishes the answer while the placeholder
+	// is still in flight, which is the window the race lived in.
+	owner.claimText(answer)
+	if err := sender.SendRichDraft(context.Background(), testOwnerID, bridgeDraftID, answer); err != nil {
+		t.Fatalf("answer draft: %v", err)
+	}
+	close(sender.release)
+
+	select {
+	case goOn := <-published:
+		if goOn {
+			t.Error("publish reported the refresh may go on after answer text claimed the draft")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("publish never returned after the placeholder was released")
+	}
+
+	drafts := sender.drafts()
+	// The placeholder was already on the wire when the answer claimed the draft, so
+	// it lands over the answer; the release then restores the answer text in the
+	// same placeholder claim. The owner therefore reads the answer last, and no
+	// placeholder survives the claim.
+	want := []string{answer, bridgeThinkingDraft, answer}
+	if len(drafts) != len(want) {
+		t.Fatalf("drafts = %v, want %v", drafts, want)
+	}
+	for i := range want {
+		if drafts[i] != want[i] {
+			t.Errorf("draft %d = %q, want %q (all drafts: %v)", i, drafts[i], want[i], drafts)
+		}
 	}
 }
