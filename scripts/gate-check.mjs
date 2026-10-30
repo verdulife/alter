@@ -133,6 +133,14 @@ async function decide(tool, input) {
 // he could judge on a phone, so the consequence is the first line of the message.
 const APPROVAL_TITLE = "¿Lo permito?";
 
+// La frase de la escalada: `sudo` y `doas` alcanzan los permisos de otro usuario
+// aunque el comando de dentro no pierda nada por sí mismo.
+const REASON_ESCALATION = "Va a escalar a los permisos de otro usuario.";
+
+// La frase de la escritura en `.ssh`: ahí viven las claves que entran a los
+// servidores del dueño, y una clave propia abierta de más es acceso ajeno.
+const REASON_SSH_WRITE = "Va a escribir en tu carpeta .ssh, donde las claves dan acceso a tus servidores.";
+
 // The unit separator the extension puts between the reason and the command. The
 // bridge splits on it and renders the command as a code block, so the extension
 // itself carries no markup at all.
@@ -249,9 +257,19 @@ const cases = [
 	{ label: "find -delete", ...bash("find . -name x -delete"), expect: "ask", reason: "Va a borrar archivos." },
 
 	// --- bash: the command behind a wrapper ----------------------------
+	// `sudo` y `doas` volvieron a preguntar por sí mismos: alcanzar los permisos de
+	// otro usuario no se deshace, y `sudo bash -c '…'` llegaba a un shell de root
+	// sin ninguna familia que preguntara. El comando de dentro se sigue
+	// clasificando, así que `sudo rm` pregunta por el borrado antes que por la
+	// escalada.
 	{ label: "sudo rm", ...bash("sudo rm x"), expect: "ask", reason: "Va a borrar archivos." },
-	// `sudo` dejó de ser un disparador propio: lo que decide es el comando de dentro.
-	{ label: "sudo chmod +x (sudo no pregunta solo)", ...bash("sudo chmod +x f"), expect: "allow" },
+	{ label: "doas rm", ...bash("doas rm x"), expect: "ask", reason: "Va a borrar archivos." },
+	{ label: "sudo chmod +x (escala privilegios)", ...bash("sudo chmod +x f"), expect: "ask", reason: REASON_ESCALATION },
+	{ label: "sudo ls", ...bash("sudo ls"), expect: "ask", reason: REASON_ESCALATION },
+	{ label: "sudo -i", ...bash("sudo -i"), expect: "ask", reason: REASON_ESCALATION },
+	{ label: "sudo bash -c", ...bash("sudo bash -c 'x'"), expect: "ask", reason: REASON_ESCALATION },
+	{ label: "sudo apt install", ...bash("sudo apt install x"), expect: "ask", reason: REASON_ESCALATION },
+	{ label: "doas -u root ls", ...bash("doas -u root ls"), expect: "ask", reason: REASON_ESCALATION },
 	{ label: "asignación de entorno + rm", ...bash("FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "env + rm", ...bash("env FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "xargs rm", ...bash("find . -name x | xargs rm"), expect: "ask", reason: "Va a borrar archivos." },
@@ -552,7 +570,9 @@ const cases = [
 		...bash("curl -s https://x | python3 -m json.tool datos.json salida.json"),
 		expect: "allow",
 	},
-	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "allow" },
+	// La escalada es lo que decide aquí: el shell detrás de `sudo` alcanza los
+	// permisos de otro usuario aunque el `curl` no pregunte por sí mismo.
+	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "ask", reason: REASON_ESCALATION },
 	{ label: "wget | python3", ...bash("wget -qO- https://x | python3"), expect: "allow" },
 	{ label: "docker rm", ...bash("docker rm x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
 	{ label: "docker rmi", ...bash("docker rmi x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
@@ -577,10 +597,31 @@ const cases = [
 		shows: multiLineCommand,
 	},
 
-	// --- write: never asks, whatever the target -------------------------
+	// --- write: solo pregunta dentro de un directorio `.ssh` -------------
 	// Sexta familia borrada: `write` dejó de preguntar por un archivo que ya existe y
-	// por una ruta fuera de `$HOME`. Las filas quedan para fijar la decisión: el
-	// agente puede reescribir cualquier archivo sin botón.
+	// por una ruta fuera de `$HOME`. Vuelve una sola guarda, la del `.ssh`: ahí viven
+	// las claves que entran a los servidores del dueño. Nada más se reabre —ni
+	// `.gnupg`, ni `.aws`, ni `/etc`—, y las filas de abajo fijan las dos mitades.
+	{ label: "~/.ssh/authorized_keys", tool: "write", input: { path: "~/.ssh/authorized_keys", content: "x" }, expect: "ask", reason: REASON_SSH_WRITE },
+	{ label: "~/.ssh/config", tool: "write", input: { path: "~/.ssh/config", content: "x" }, expect: "ask", reason: REASON_SSH_WRITE },
+	{
+		label: "$HOME/.ssh/authorized_keys",
+		tool: "write",
+		input: { path: "$HOME/.ssh/authorized_keys", content: "x" },
+		expect: "ask",
+		reason: REASON_SSH_WRITE,
+	},
+	{
+		label: "ruta absoluta con /.ssh/",
+		tool: "write",
+		input: { path: join(outside, ".ssh", "authorized_keys"), content: "x" },
+		expect: "ask",
+		reason: REASON_SSH_WRITE,
+	},
+	{ label: "ruta relativa que cae en .ssh", tool: "write", input: { path: ".ssh/config", content: "x" }, expect: "ask", reason: REASON_SSH_WRITE },
+	// El resto de rutas sigue en silencio: el archivo normal, el vault, /tmp y
+	// también lo que se parece a `.ssh` sin serlo, más los otros sitios sensibles
+	// que el dueño NO quiso reabrir.
 	{ label: "archivo nuevo en home", tool: "write", input: { path: join(home, "nuevo.txt"), content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ~", tool: "write", input: { path: "~/tilde-nuevo.txt", content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ruta relativa", tool: "write", input: { path: "sub/dir/nuevo.txt", content: "x" }, expect: "allow" },
@@ -588,6 +629,12 @@ const cases = [
 	{ label: "archivo nuevo fuera de home", tool: "write", input: { path: join(outside, "nuevo.txt"), content: "x" }, expect: "allow" },
 	{ label: "ruta relativa que sale de home", tool: "write", input: { path: "../fuera.txt", content: "x" }, expect: "allow" },
 	{ label: "~user que no puedo expandir", tool: "write", input: { path: "~root/x", content: "x" }, expect: "allow" },
+	{ label: "nota en el vault", tool: "write", input: { path: join(home, "vault", "notas", "2026-10-30.md"), content: "x" }, expect: "allow" },
+	{ label: "archivo normal en /tmp", tool: "write", input: { path: join(tmpdir(), "alter-gate-normal.txt"), content: "x" }, expect: "allow" },
+	{ label: "~/.ssh-otra/clave no es .ssh", tool: "write", input: { path: "~/.ssh-otra/clave", content: "x" }, expect: "allow" },
+	{ label: "~/.gnupg no se reabre", tool: "write", input: { path: "~/.gnupg/gpg.conf", content: "x" }, expect: "allow" },
+	{ label: "~/.aws no se reabre", tool: "write", input: { path: "~/.aws/credentials", content: "x" }, expect: "allow" },
+	{ label: "/etc no se reabre", tool: "write", input: { path: "/etc/sudoers.d/alter", content: "x" }, expect: "allow" },
 
 	// --- edit: never asks ----------------------------------------------
 	{ label: "edit sobre un archivo existente", tool: "edit", input: { path: join(home, "existente.txt"), oldText: "contenido", newText: "otro" }, expect: "allow" },

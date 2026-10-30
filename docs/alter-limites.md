@@ -55,13 +55,15 @@ nombre y la descripción hasta que el modelo las invoca.
 Pedir permiso para cada `bash`, `write` y `edit` era un peaje, no una defensa: un
 muro de botones se aprueba sin leer. El dueño eligió qué merece un botón, y son
 tres cosas y solo tres: **perder datos, publicar de forma irreversible y cambiar
-las herramientas de Pi**. Todo lo demás pasa sin pregunta y queda en el diario. La
-extensión decide caso por caso en `tool_call`:
+las herramientas de Pi**, con dos excepciones puntuales que también lo merecen y
+que no se amplían: **escribir dentro de un directorio `.ssh`** y **escalar a los
+permisos de otro usuario con `sudo`/`doas`**. Todo lo demás pasa sin pregunta y
+queda en el diario. La extensión decide caso por caso en `tool_call`:
 
 | Herramienta | Pide confirmación |
 |---|---|
-| `bash` | solo por las familias de la lista de abajo |
-| `write` | nunca: cualquier archivo, exista o no, dentro o fuera de `$HOME` |
+| `bash` | solo por las familias de la lista de abajo, y siempre por `sudo`/`doas` |
+| `write` | solo si la ruta cae dentro de un directorio `.ssh`; en cualquier otra, nunca |
 | `edit` | nunca: es un cambio quirúrgico y el diff es la revisión |
 | `read`, `grep`, `find`, `ls`, `send_file`, `ask_options` | nunca |
 | cualquier otra (paquetes, MCP) | solo si su nombre dice que destruye: `delete_file`, `removeRepo`, `reset_session`, `truncate_table` |
@@ -86,7 +88,8 @@ tampoco lo hace), así que un `mv` hacia esa ruta pregunta.
 
 Qué pide `bash`, sobre el comando entero y no solo sobre su primera palabra
 (`sudo rm` y `FOO=1 rm` son el mismo acto que `rm`, y `git -C x push` publica
-igual que `git push`). Son tres familias y solo tres:
+igual que `git push`). Son tres familias y solo tres, más la escalada de
+privilegios:
 
 - **pérdida de datos**: `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`,
   `mkfs`, `fdisk`, `parted` y `wipefs` —un disco formateado o repartido no se
@@ -109,7 +112,22 @@ igual que `git push`). Son tres familias y solo tres:
   los que confías porque escriben `~/.pi/agent/settings.json` («Va a cambiar las
   herramientas de Pi en las que confías.»). Consultar no pregunta: `npm
   view`/`info`/`outdated`, `cargo search`, `helm list`, `gh release list`/`view`,
-  `docker images`, `pi list`.
+  `docker images`, `pi list`;
+- **escalada de privilegios**: `sudo` y `doas` preguntan **por sí mismos**, con
+  cualquier comando detrás —`sudo ls`, `sudo -i`, `sudo bash -c '…'`—, porque
+  alcanzar los permisos de otro usuario no se deshace y `sudo bash -c '…'` llega a
+  un shell de root. La frase es «Va a escalar a los permisos de otro usuario.». El
+  comando de dentro se sigue clasificando y la pregunta conserva lo más concreto:
+  `sudo rm x` pregunta por el borrado («Va a borrar archivos.»), no por la
+  escalada.
+
+De `write` pregunta un solo caso: que la ruta caiga dentro de un directorio `.ssh`
+—`~/.ssh/…`, `$HOME/.ssh/…`, una absoluta con `/.ssh/` o una relativa que resuelva
+ahí—, porque ahí viven las claves y el `authorized_keys` que deciden quién entra a
+tus servidores, y sobrescribirlo entrega acceso en vez de perder datos. La frase es
+«Va a escribir en tu carpeta .ssh, donde las claves dan acceso a tus servidores.».
+Todo lo demás sigue mudo, incluido lo demás sensible: `.gnupg`, `.aws`, `/etc`,
+`.bashrc`, un archivo que ya existe y una ruta fuera de `$HOME`.
 
 Lo que **dejó de preguntar**, por decisión explícita del dueño, y ya no tiene botón
 ni forma de recuperarse:
@@ -122,12 +140,12 @@ ni forma de recuperarse:
 - intérpretes y lanzadores de paquetes: `python3 -m pip install`, cualquier otro
   `python3 -m <módulo>`, `python3 -c`, `node -e`, `perl -e`, `ruby -e`, `npx`,
   `npm exec`, `pnpm dlx`, `yarn dlx`, `bunx`;
-- `sudo`/`doas` por sí mismos: el comando de dentro se sigue clasificando, así que
-  `sudo rm x` pregunta por el `rm` y `sudo apt install x` no pregunta;
 - `curl`/`wget` canalizados a un shell o a un intérprete;
 - redirecciones `>` y `>>`: nunca preguntan, tampoco sobre un archivo que ya
   existe ni sobre una ruta sensible (`~/.ssh`, `~/.bashrc`, los arranques de
   shell, `/etc`, `/usr`…). Una ruta con variables (`$HOME/…`) tampoco pregunta.
+  Esto es `bash`: la guarda del `.ssh` de arriba la pone la herramienta `write`, no
+  una redirección, así que `echo … > ~/.ssh/authorized_keys` sigue en silencio.
 
 Ejecutar un script que ya existe **no pregunta**: `python3 script.py`, `node
 script.js`, `bash instalar.sh` y `./binario` son la misma clase que `go test`.
@@ -179,12 +197,13 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 
 Lo que esta reducción deja sin ninguna protección, dicho sin adornos: un agente
 confundido o comprometido —por una inyección de prompt, por un contenido que lea o
-por un error suyo— puede **reescribir o sobrescribir cualquier archivo**, **cambiar
-permisos y dueños**, **parar, reiniciar o alterar servicios y procesos**,
-**instalar software**, **programar tareas** y **ejecutar código descargado**, sin
-que aparezca un solo botón. El gate ya no cubre nada de eso: solo sigue parando lo
-que borra datos, lo que publica de forma irreversible y lo que cambia las
-herramientas de Pi.
+por un error suyo— puede **reescribir o sobrescribir cualquier archivo** —el único
+botón que queda ahí es el de `~/.ssh`—, **cambiar permisos y dueños**, **parar,
+reiniciar o alterar servicios y procesos**, **instalar software**, **programar
+tareas** y **ejecutar código descargado**, sin que aparezca un solo botón. El gate
+ya no cubre nada de eso: solo sigue parando lo que borra datos, lo que publica de
+forma irreversible, lo que cambia las herramientas de Pi, la escritura en `~/.ssh`
+y la escalada con `sudo`/`doas`.
 
 1. **Control total del servidor desde el móvil.** Con `bash` y `write` en `$HOME`,
    un mensaje puede borrar, cifrar o exfiltrar cualquier cosa tuya. La única
@@ -193,7 +212,8 @@ herramientas de Pi.
    - Si el token se filtra: cualquiera con él y tu chat ID puede operar. Un bot
      solo atiende a quien le escribe primero, pero el token da acceso a la API.
 2. **`$HOME` incluye secretos**: `~/.ssh`, `~/.config`, `.env`, credenciales de
-   git y de proveedores. No hay sandbox.
+   git y de proveedores. No hay sandbox; el único de esos sitios con botón es
+   `.ssh`.
 3. **Aprobaciones con latencia.** Cuando algo pregunta, espera un botón, y sin
    respuesta la tarea se bloquea a los N segundos. Ahora pregunta muy poco, y por
    eso el silencio ya no informa: que no aparezca un botón no significa que la
@@ -208,18 +228,19 @@ herramientas de Pi.
 5. **TOCTOU en el vault**: la contención de rutas de `send_file` se comprueba y
    luego se lee. Con `bash` disponible, esa defensa deja de ser una frontera real.
 6. **El gate es un clasificador, no un sandbox.** Reconoce los programas de tres
-   familias; todo lo que no reconozca pasa sin botón, y esa lista es hoy la mayor
-   parte de un turno: `chmod`, `systemctl`, `kill`, `apt`, `pip`, `npx`, `curl …
-   | sh` y cualquier redirección. Un script propio, un binario que borra por su
-   cuenta, un alias dentro de un archivo o un instalador metido en un `python3 -`
-   pasan igual, y también un `rm` escrito de una forma que el lector no entienda.
-   La red de seguridad ya no es el botón: es el diario y lo que revises en él.
-7. **`write` no pregunta nunca**, tampoco cuando el archivo ya existe, ni fuera
-   de `$HOME`, ni sobre `~/.ssh/authorized_keys`, `~/.bashrc` o una unidad de
-   systemd. Un turno puede reemplazar el contenido entero de cualquier archivo y
-   no verás un botón: lo verás en el diario, si lo miras. El `bash` equivalente
-   escribe igual de silencioso, `echo … > ~/.ssh/authorized_keys` incluido. La
-   única frontera que queda es el token del bot y tu chat ID.
+   familias y la escalada; todo lo que no reconozca pasa sin botón, y esa lista es
+   hoy la mayor parte de un turno: `chmod`, `systemctl`, `kill`, `apt`, `pip`,
+   `npx`, `curl … | sh` y cualquier redirección. Un script propio, un binario que
+   borra por su cuenta, un alias dentro de un archivo o un instalador metido en un
+   `python3 -` pasan igual, y también un `rm` escrito de una forma que el lector no
+   entienda. La red de seguridad ya no es el botón: es el diario y lo que revises
+   en él.
+7. **`write` no pregunta salvo dentro de `.ssh`**, tampoco cuando el archivo ya
+   existe, ni fuera de `$HOME`, ni sobre `~/.bashrc`, `~/.gnupg`, `~/.aws`, `/etc`
+   o una unidad de systemd. Un turno puede reemplazar el contenido entero de
+   cualquiera de esos archivos y no verás un botón: lo verás en el diario, si lo
+   miras. El `bash` equivalente escribe igual de silencioso, `echo … > ~/.bashrc`
+   incluido. La única frontera que queda es el token del bot y tu chat ID.
 
 ## Lo que Alter no hace
 

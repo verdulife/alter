@@ -4,17 +4,19 @@
  * Telegram bridge).
  *
  * The gate intercepts `tool_call` and asks the owner only three things: the loss of
- * data, an irreversible publication and a change to Pi's own tool set. `edit` and
- * `write` never ask, whatever the path and whether it exists; `bash` asks only for
- * the programs that delete data, rewrite published history, publish, or install and
- * remove Pi packages. Permissions, services, installers, downloaded code and shell
- * redirections were dropped on purpose, and `docs/alter-limites.md` states what that
- * leaves unprotected. The read-only tools and the two Alter tools never ask, and a
- * tool the gate has no rule for asks only when its own name says it destroys
- * something (`delete_file`, `reset_session`): Pi loads the global configuration
- * (S7), so a button per package tool would rebuild the toll booth one layer out.
- * The question is `ctx.ui.confirm()`, which in RPC mode the bridge turns into two
- * Telegram buttons; no answer means blocked.
+ * data, an irreversible publication and a change to Pi's own tool set. `edit` never
+ * asks and `write` asks on one path only, a target inside a `.ssh` directory, where
+ * a key decides who gets in; `bash` asks only for the programs that delete data,
+ * rewrite published history, publish, or install and remove Pi packages, plus the
+ * two escalation programs (`sudo`, `doas`), which reach another user's powers
+ * whatever they run. Permissions, services, installers, downloaded code, shell
+ * redirections and every other path were dropped on purpose, and
+ * `docs/alter-limites.md` states what that leaves unprotected. The read-only tools
+ * and the two Alter tools never ask, and a tool the gate has no rule for asks only
+ * when its own name says it destroys something (`delete_file`, `reset_session`): Pi
+ * loads the global configuration (S7), so a button per package tool would rebuild
+ * the toll booth one layer out. The question is `ctx.ui.confirm()`, which in RPC
+ * mode the bridge turns into two Telegram buttons; no answer means blocked.
  *
  * The two tools exist for what Pi's own toolset cannot reach, not as a second way
  * to do what it already does: they deliver a vault file to the owner's chat and
@@ -106,11 +108,13 @@ function ok(text: string, details: Json = {}): ToolResult {
  * Tools that never need approval (T13, T22). The read-only built-ins cannot change
  * anything, and the two deterministic Alter tools are validated by the bridge
  * against the vault and the owner chat. `edit` is a surgical change whose diff is
- * the review, and `write` stopped asking altogether: writing a file, over an empty
- * path or over a full one, is not one of the three things the owner chose to gate,
- * so it asks for nothing even when the target exists and even outside `$HOME`. The
- * button is reserved for the loss of data, the irreversible publication and Pi's
- * own tool set.
+ * the review, and `write` stopped asking for the ordinary case: writing a file,
+ * over an empty path or over a full one, is not one of the three things the owner
+ * chose to gate, so it asks for nothing even when the target exists and even
+ * outside `$HOME`. It keeps one guard of its own (`classifyWrite`): a target inside
+ * a `.ssh` directory, where a key decides who gets in. The button is otherwise
+ * reserved for the loss of data, the irreversible publication and Pi's own tool
+ * set.
  */
 const APPROVAL_FREE = new Set([
 	"read",
@@ -118,7 +122,6 @@ const APPROVAL_FREE = new Set([
 	"find",
 	"ls",
 	"edit",
-	"write",
 	"send_file",
 	"ask_options",
 ]);
@@ -314,6 +317,47 @@ function resolveUserPath(raw: string, cwd: string): string | null {
 	if (value.startsWith("~/")) return resolve(homeDir(), value.slice(2));
 	if (value.startsWith("~")) return null;
 	return resolve(cwd.length > 0 ? cwd : process.cwd(), value);
+}
+
+/** Contents of a path field of a tool call, or null when the field is missing. */
+function readPathField(input: unknown): string | null {
+	if (typeof input !== "object" || input === null) return null;
+	const value = (input as Json).path;
+	return typeof value === "string" ? value : null;
+}
+
+/**
+ * A path the model wrote with the shell's own variable (`$HOME/.ssh/config`)
+ * instead of `~`. Pi does not expand a variable, so the gate expands this one
+ * spelling itself: it is the spelling the owner named when he asked for the `.ssh`
+ * guard back. Every other variable is left alone, so `$SINK` stays a path this gate
+ * cannot judge.
+ */
+function expandHomeVariable(raw: string): string {
+	const home = homeDir();
+	if (raw === "$HOME" || raw === "${HOME}") return home;
+	if (raw.startsWith("$HOME/")) return `${home}/${raw.slice("$HOME/".length)}`;
+	if (raw.startsWith("${HOME}/")) return `${home}/${raw.slice("${HOME}/".length)}`;
+	return raw;
+}
+
+/**
+ * The one directory where a write is not ordinary work. `~/.ssh` holds the keys and
+ * the `authorized_keys` that say who may enter the owner's servers: rewriting it
+ * hands over access instead of losing data, so it is the single path `write` asks
+ * about. The list stays one entry long on purpose — `.gnupg`, `.aws`, `/etc` and
+ * the shell start-up files are sensitive too, and the owner chose not to reopen
+ * them.
+ */
+const SSH_DIRECTORY = ".ssh";
+
+/**
+ * True when the resolved path sits inside a `.ssh` directory, at any depth. The
+ * component is compared whole, so `~/.ssh/config` and `/srv/x/.ssh/authorized_keys`
+ * match while `~/.ssh-otra/clave` does not.
+ */
+function isInsideSshDirectory(absolutePath: string): boolean {
+	return absolutePath.split(sep).some((component) => component === SSH_DIRECTORY);
 }
 
 /** Path inside a file, or false when it is a directory or unreadable. */
@@ -567,9 +611,9 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "busy
 /**
  * Programs that only run the command after them. The program is skipped and the
  * inner command classified, so `env FOO=1 rm x` and `xargs rm` hit the `rm` rule.
- * `sudo`/`doas` are here for the same reason and no longer ask on their own: the
- * privilege rule was dropped, so `sudo rm x` asks because of the `rm` and
- * `sudo apt install x` asks for nothing.
+ * `sudo`/`doas` are in this set because the command after them is what runs, but
+ * they also carry their own rule before this set is consulted: the escalation asks
+ * by itself, whatever the inner command is.
  */
 const TRANSPARENT_WRAPPERS = new Set([
 	"env",
@@ -627,9 +671,12 @@ const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * program and its flags stay in the journal, through each rule's `detail`.
  *
  * There are only as many sentences as families the owner still gates: data loss,
- * published history, containers, publication and Pi's tool set.
+ * published history, containers, publication and Pi's tool set, plus the two
+ * exceptions he asked back, the `.ssh` write and the privilege escalation.
  */
 const REASON_DELETE_FILES = "Va a borrar archivos.";
+const REASON_ESCALATION = "Va a escalar a los permisos de otro usuario.";
+const REASON_SSH_WRITE = "Va a escribir en tu carpeta .ssh, donde las claves dan acceso a tus servidores.";
 const REASON_HISTORY = "Va a publicar o reescribir el historial del repositorio.";
 const REASON_CONTAINERS = "Va a borrar contenedores o volúmenes.";
 const REASON_PUBLISH = "Va a publicar un paquete de forma irreversible.";
@@ -643,9 +690,11 @@ type Rule = { reason: string; detail: string };
 /**
  * Programs that ask without reading their arguments: every one of them loses data
  * on its own (deleting, truncating, reformatting a disk). Permissions and
- * ownership, services and processes, package installers and the privilege
- * escalation used to be here and were removed on purpose: the owner gates data
- * loss, publication and Pi's tool set, and nothing else. `find`, `mv`, `git`,
+ * ownership, services and processes, and the package installers used to be here
+ * and were removed on purpose: the owner gates data loss, publication and Pi's
+ * tool set, and nothing else. The privilege escalation is not in this table
+ * because it has its own rule in `classifyWords`: `sudo`/`doas` reach another
+ * user's powers whatever the command behind them is. `find`, `mv`, `git`,
  * `docker` and the publishers keep their own reader further down.
  */
 const ASK_PROGRAMS: Record<string, Rule> = {
@@ -663,28 +712,6 @@ const ASK_PROGRAMS: Record<string, Rule> = {
 
 /** Docker flags that take a value, so the value is not mistaken for a subcommand. */
 const DOCKER_VALUE_FLAGS = new Set(["-H", "--host", "--context", "--config", "--log-level", "-l"]);
-
-/**
- * Words a simple command actually runs, after its assignments and transparent
- * wrappers: the words of `env FOO=1 rm x` start at `rm`.
- */
-function commandWords(input: string[]): string[] {
-	let rest = [...input];
-	for (let guard = 0; guard < 8; guard += 1) {
-		while (rest.length > 0 && ENV_ASSIGNMENT.test(rest[0])) rest = rest.slice(1);
-		if (rest.length === 0) return rest;
-		const program = basename(rest[0]);
-		if (!TRANSPARENT_WRAPPERS.has(program)) return rest;
-		rest = stripWrapperArgs(program, rest.slice(1));
-	}
-	return [];
-}
-
-/** Program a simple command actually runs, after assignments and transparent wrappers. */
-function programOf(input: string[]): string {
-	const rest = commandWords(input);
-	return rest.length > 0 ? basename(rest[0]) : "";
-}
 
 /** The inline script of `sh -c '…'`, or null when the shell is not running one. */
 function scriptArgument(args: string[]): string | null {
@@ -898,6 +925,21 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	const program = basename(words[0]);
 	const args = words.slice(1);
 
+	// The escape hatch itself. Reaching another user's privileges is not undone by
+	// anything, and `sudo bash -c '…'` opens a root shell that no data-loss rule
+	// would stop. The command inside is classified first, so `sudo rm x` still
+	// reports the deletion it causes and the journal keeps the concrete rule; the
+	// escalation answers for everything the inner command leaves open (`sudo ls`,
+	// `sudo -i`, `sudo bash -c '…'`).
+	if (program === "sudo" || program === "doas") {
+		const inner = stripWrapperArgs(program, args);
+		if (inner.length > 0) {
+			const innerVerdict = classifyWords(inner, cwd, depth + 1);
+			if (innerVerdict.ask) return innerVerdict;
+		}
+		return ask(REASON_ESCALATION, `${program} escala privilegios`);
+	}
+
 	if (TRANSPARENT_WRAPPERS.has(program)) {
 		const inner = stripWrapperArgs(program, args);
 		if (inner.length === 0) return allow();
@@ -1023,10 +1065,13 @@ function classifyMove(args: string[], cwd: string): Verdict {
 
 /** Verdict for one simple command. The redirections were already split off by
  * `splitCommands`, and they ask for nothing: the owner dropped every shell-writing
- * rule, so `>`, `>>` and `|` are read as the plain operators they are. */
+ * rule, so `>`, `>>` and `|` are read as the plain operators they are.
+ *
+ * No shortcut on an empty program: `sudo -i` is a wrapper with nothing after it, so
+ * the wrapper itself is what has to be judged. `classifyWords` already allows a
+ * simple command made only of assignments.
+ */
 function classifySimpleCommand(command: SimpleCommand, cwd: string, depth: number): Verdict {
-	const program = programOf(command.words);
-	if (program === "") return allow();
 	return classifyWords(command.words, cwd, depth);
 }
 
@@ -1053,6 +1098,24 @@ function classifyCommandString(command: string, cwd: string, depth: number): Ver
 		if (verdict.ask) return verdict;
 	}
 	return allow();
+}
+
+/**
+ * Verdict for the `write` tool (T22). `write` overwrites a whole file without a
+ * button, with one exception: a target inside a `.ssh` directory, because the keys
+ * stored there are what lets a machine into the owner's servers and an overwritten
+ * `authorized_keys` is access handed over, not data lost. Every other path stays
+ * silent — an existing file, a path outside `$HOME`, `/etc`, `.gnupg`, `.aws`, a
+ * shell start-up — and so does a path this gate cannot resolve: the owner asked for
+ * exactly one guard back, and widening it would rebuild the toll booth.
+ */
+function classifyWrite(input: unknown, cwd: string): Verdict {
+	const raw = readPathField(input);
+	if (raw === null) return allow();
+	const absolutePath = resolveUserPath(expandHomeVariable(raw), cwd);
+	if (absolutePath === null) return allow();
+	if (!isInsideSshDirectory(absolutePath)) return allow();
+	return ask(REASON_SSH_WRITE, `write en ${displayPath(absolutePath)}, una ruta de claves ssh`);
 }
 
 /** Verdict for the `bash` tool. A missing command is not decidable, so it asks. */
@@ -1128,6 +1191,7 @@ function namesDestruction(name: string): boolean {
 function classifyCall(name: string, input: unknown, cwd: string): Verdict {
 	if (APPROVAL_FREE.has(name)) return allow();
 	if (name === "bash") return classifyBash(input, cwd);
+	if (name === "write") return classifyWrite(input, cwd);
 	// A tool with no rule of its own is not a decision the owner must answer on a
 	// phone: the packages he loaded are part of the agent he asked for. Only the
 	// names that say they destroy keep their button, and the match never fails open.
