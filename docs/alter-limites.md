@@ -53,14 +53,16 @@ nombre y la descripción hasta que el modelo las invoca.
 ## Aprobaciones
 
 Pedir permiso para cada `bash`, `write` y `edit` era un peaje, no una defensa: un
-muro de botones se aprueba sin leer. **El permiso es para lo que no se puede
-deshacer**, y la extensión decide caso por caso en `tool_call`:
+muro de botones se aprueba sin leer. El dueño eligió qué merece un botón, y son
+tres cosas y solo tres: **perder datos, publicar de forma irreversible y cambiar
+las herramientas de Pi**. Todo lo demás pasa sin pregunta y queda en el diario. La
+extensión decide caso por caso en `tool_call`:
 
 | Herramienta | Pide confirmación |
 |---|---|
+| `bash` | solo por las familias de la lista de abajo |
+| `write` | nunca: cualquier archivo, exista o no, dentro o fuera de `$HOME` |
 | `edit` | nunca: es un cambio quirúrgico y el diff es la revisión |
-| `write` | cuando el archivo ya existe, o cuando la ruta cae fuera de `$HOME` |
-| `bash` | cuando el comando puede destruir, publicar o escalar |
 | `read`, `grep`, `find`, `ls`, `send_file`, `ask_options` | nunca |
 | cualquier otra (paquetes, MCP) | solo si su nombre dice que destruye: `delete_file`, `removeRepo`, `reset_session`, `truncate_table` |
 
@@ -80,68 +82,57 @@ sin botón: la lista es cerrada y se amplía aquí cuando aparezca uno.
 
 La ruta se resuelve como la resuelve Pi: `~` y `~/x` contra `$HOME`, el resto
 contra el directorio de trabajo de la sesión. `~usuario` no se expande (Pi
-tampoco lo hace), así que se pregunta.
+tampoco lo hace), así que un `mv` hacia esa ruta pregunta.
 
 Qué pide `bash`, sobre el comando entero y no solo sobre su primera palabra
 (`sudo rm` y `FOO=1 rm` son el mismo acto que `rm`, y `git -C x push` publica
-igual que `git push`):
+igual que `git push`). Son tres familias y solo tres:
 
-- borrar o truncar: `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`, `mkfs`,
-  `find -delete`, y `find -exec`/`-ok` salvo cuando el programa ejecutado es de
-  lectura (`ls`, `cat`, `grep`, `stat`…);
-- sobrescribir por redirección: `>` sobre un archivo que ya existe, y `>` o `>>`
-  sobre una ruta sensible (`~/.ssh`, `~/.bashrc`, los arranques de shell, `/etc`,
-  `/usr`…). `>>` añade y no destruye, así que solo pregunta por esas rutas; una
-  ruta con variables (`$HOME/…`) no se puede resolver y también pregunta;
-- `mv` cuyo destino ya existe;
-- permisos y propiedad: `chmod`, `chown`, `chgrp`, `chattr`;
+- **pérdida de datos**: `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `dd`,
+  `mkfs`, `fdisk`, `parted` y `wipefs` —un disco formateado o repartido no se
+  recupera—, `find -delete` y las formas de `find` que truncan un archivo propio,
+  `mv` cuyo destino ya existe, y `find -exec`/`-ok` cuando el programa ejecutado
+  pierde datos (`find … -exec rm`, `-exec sh -c 'rm x'`). `find -exec` se clasifica
+  por el programa que ejecuta, así que `find … -exec ls` y `find … -exec chmod` no
+  preguntan. `docker`/`podman`: `rm`, `rmi`, `prune`, `volume rm` y `compose down
+  -v`, que borran contenedores, imágenes o volúmenes;
+- **git que pierde datos o reescribe historia publicada**: `push`, `reset --hard`,
+  `clean -f`, `rebase`, `checkout --`, `restore`, `commit --amend`, `branch
+  -d`/`-D`, `tag -d`, `stash drop`/`clear` y `filter-branch`;
+- **publicación irreversible**: `npm`, `yarn`, `pnpm` y `bun` `publish` —también
+  detrás de `npx`/`npm exec`, que preguntan por la publicación y no por el paquete
+  descargado («Va a publicar un paquete de forma irreversible.»)—, `cargo publish`,
+  `gem push`, `twine upload`, `helm push`, `docker` y `podman` `push` («Va a
+  publicar una imagen de forma irreversible.»), `gh release create`/`delete` («Va
+  a publicar o borrar una versión de forma irreversible.»), y `pi install` (salvo
+  `--local`/`-l`) y `pi remove`, que cambian las herramientas, skills y prompts en
+  los que confías porque escriben `~/.pi/agent/settings.json` («Va a cambiar las
+  herramientas de Pi en las que confías.»). Consultar no pregunta: `npm
+  view`/`info`/`outdated`, `cargo search`, `helm list`, `gh release list`/`view`,
+  `docker images`, `pi list`.
+
+Lo que **dejó de preguntar**, por decisión explícita del dueño, y ya no tiene botón
+ni forma de recuperarse:
+
+- permisos y atributos: `chmod`, `chown`, `chgrp`, `chattr`;
 - procesos y servicios: `kill`, `pkill`, `killall`, `service`, `systemctl`,
-  `shutdown`, `reboot`, `poweroff`. Las consultas no preguntan: `kill -0`,
-  `kill -l`, `systemctl status`/`is-active`/`list-units`/`show`/`cat`;
-- la puerta de atrás de los privilegios: `sudo`, `doas`;
-- estado del sistema y paquetes: `apt`, `apt-get`, `dpkg`, `brew`, `snap`,
-  `npm i -g`, `pip install`, `cargo install`, `crontab`. Consultar no pregunta:
-  `apt list`/`search`/`show`/`policy`, `dpkg -l`/`-L`/`-s`, `crontab -l`;
-- git que publica o reescribe: `push`, `reset --hard`, `clean -f`, `rebase`,
-  `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
-  `stash drop`, `filter-branch`;
-- publicar es irreversible y también pregunta: `npm`, `yarn`, `pnpm` y `bun`
-  `publish` (también detrás de `npx`/`npm exec`, que ya preguntan por el paquete
-  descargado), `cargo publish`, `gem push`, `twine upload`, `helm push`, `docker`
-  y `podman` `push` («Va a publicar un paquete de forma irreversible.», «Va a
-  publicar una imagen de forma irreversible.»), `gh release create`/`delete`
-  («Va a publicar o borrar una versión de forma irreversible.»), y `pi install`
-  (salvo `--local`/`-l`) y `pi remove`, que cambian las herramientas, skills y
-  prompts en los que confías porque escriben `~/.pi/agent/settings.json` («Va a
-  cambiar las herramientas de Pi en las que confías.»). Consultar no pregunta:
-  `npm view`/`info`/`outdated`, `cargo search`, `helm list`, `gh release
-  list`/`view`, `docker images`, `pi list`;
-- guiones remotos: `curl` o `wget` canalizados a un shell (`sh`, `bash`, `zsh`) o
-  a un intérprete. La tubería no añade nada cuando el lado derecho solo
-  transforma lo descargado: `curl … | python3 -m json.tool` formatea el JSON, no
-  lo ejecuta;
-- intérpretes: `python`, `python3`, `python3.x`, `node`, `perl`, `ruby`. El nombre
-  del programa no basta para decidir, porque el instalador va detrás: `python3 -m
-  pip install …` instala lo mismo que `pip install` (y `-m pip uninstall` y `-m
-  ensurepip` también), cualquier otro `-m <módulo>` es código que el gate no ha
-  visto nunca y pregunta («Va a ejecutar un módulo de Python.»), y `-c` de Python
-  y `-e`/`-E` de Perl y Ruby (más `--eval` de Node) son código escrito en el propio
-  comando, que pregunta sin intentar leerlo («Va a ejecutar código arbitrario.»).
-  Los módulos que solo transforman datos **no preguntan**, y solo esos: la lista
-  es cerrada —hoy `json.tool` y `base64`, que leen su entrada y escriben en
-  stdout sin archivo de salida, sin sockets y sin instalar nada— y todo módulo que
-  no esté en ella sigue preguntando. La lista se lee además por la forma de la
-  orden: `python3 -m json.tool in.json out.json` escribe ese segundo archivo y
-  pregunta;
-- lanzadores de paquetes: `npx`, `npm exec`, `pnpm dlx`, `yarn dlx` y `bunx`
-  descargan un paquete y lo ejecutan, así que preguntan siempre («Va a ejecutar un
-  paquete descargado.»);
-- contenedores: `docker rm`, `rmi`, `prune`, `compose down -v`.
+  `shutdown`, `reboot`, `poweroff`;
+- instaladores del sistema: `apt`, `apt-get`, `dpkg`, `brew`, `snap`, `npm i -g`,
+  `pip install`, `cargo install`, `crontab`;
+- intérpretes y lanzadores de paquetes: `python3 -m pip install`, cualquier otro
+  `python3 -m <módulo>`, `python3 -c`, `node -e`, `perl -e`, `ruby -e`, `npx`,
+  `npm exec`, `pnpm dlx`, `yarn dlx`, `bunx`;
+- `sudo`/`doas` por sí mismos: el comando de dentro se sigue clasificando, así que
+  `sudo rm x` pregunta por el `rm` y `sudo apt install x` no pregunta;
+- `curl`/`wget` canalizados a un shell o a un intérprete;
+- redirecciones `>` y `>>`: nunca preguntan, tampoco sobre un archivo que ya
+  existe ni sobre una ruta sensible (`~/.ssh`, `~/.bashrc`, los arranques de
+  shell, `/etc`, `/usr`…). Una ruta con variables (`$HOME/…`) tampoco pregunta.
 
 Ejecutar un script que ya existe **no pregunta**: `python3 script.py`, `node
 script.js`, `bash instalar.sh` y `./binario` son la misma clase que `go test`.
-Esa fue una decisión deliberada, y su consecuencia está en el riesgo 6: lo que hay
-dentro del archivo no se lee.
+Esa fue una decisión anterior y sigue en pie: lo que hay dentro del archivo no se
+lee, y su consecuencia está en el riesgo 6.
 
 Lo que el clasificador no puede decidir, pregunta: comillas sin cerrar, una ruta
 que no resuelve, una línea partida en demasiadas piezas. El cuerpo de un heredoc
@@ -152,11 +143,11 @@ revés.
 La pregunta está escrita para leerla en un móvil: el título es siempre «¿Lo
 permito?» y debajo va una frase con la consecuencia, en segunda persona, que no
 nombra el programa salvo que el programa sea el asunto («Va a borrar archivos.»,
-«Va a sobrescribir ~/notas.md.», «Va a pedir permisos de administrador.»). El
-comando viaja dentro de un bloque de código, con sus saltos de línea, para poder
-juzgarlo línea a línea; uno de más de 800 caracteres se recorta por el medio,
-marcando el hueco con `…` y conservando el principio y el final, que es donde
-suele estar lo peligroso.
+«Va a sobrescribir un archivo.» para el `mv`, «Va a cambiar las herramientas de Pi
+en las que confías.»). El comando viaja dentro de un bloque de código, con sus
+saltos de línea, para poder juzgarlo línea a línea; uno de más de 800 caracteres se
+recorta por el medio, marcando el hueco con `…` y conservando el principio y el
+final, que es donde suele estar lo peligroso.
 
 El botón recorre el mismo camino: la pregunta viaja a Telegram como dos botones
 —cada uno en su fila, a todo el ancho, y el de aprobar con estilo `success`— y tu
@@ -186,6 +177,15 @@ existe, y por eso el diario es la otra mitad de la defensa.
 
 Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
 
+Lo que esta reducción deja sin ninguna protección, dicho sin adornos: un agente
+confundido o comprometido —por una inyección de prompt, por un contenido que lea o
+por un error suyo— puede **reescribir o sobrescribir cualquier archivo**, **cambiar
+permisos y dueños**, **parar, reiniciar o alterar servicios y procesos**,
+**instalar software**, **programar tareas** y **ejecutar código descargado**, sin
+que aparezca un solo botón. El gate ya no cubre nada de eso: solo sigue parando lo
+que borra datos, lo que publica de forma irreversible y lo que cambia las
+herramientas de Pi.
+
 1. **Control total del servidor desde el móvil.** Con `bash` y `write` en `$HOME`,
    un mensaje puede borrar, cifrar o exfiltrar cualquier cosa tuya. La única
    frontera es el token del bot y tu chat ID.
@@ -194,36 +194,32 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
      solo atiende a quien le escribe primero, pero el token da acceso a la API.
 2. **`$HOME` incluye secretos**: `~/.ssh`, `~/.config`, `.env`, credenciales de
    git y de proveedores. No hay sandbox.
-3. **Aprobaciones con latencia.** Cada acción sensible espera un botón. Si no
-   estás mirando el móvil, la tarea se bloquea a los N segundos.
+3. **Aprobaciones con latencia.** Cuando algo pregunta, espera un botón, y sin
+   respuesta la tarea se bloquea a los N segundos. Ahora pregunta muy poco, y por
+   eso el silencio ya no informa: que no aparezca un botón no significa que la
+   acción sea inocua.
 4. **Sin aislamiento entre conversación y sistema.** Una inyección de prompt en
    un contenido que Pi lea (`fetch_content`, un PDF, un archivo del usuario)
-   podría intentar dirigir sus herramientas. El gate de confirmación es la
-   defensa principal, no la única: conviene revisar qué se aprueba, y ahora la
-   mayoría de las acciones no se aprueba: se revisa después, en el diario.
+   podría intentar dirigir sus herramientas, y desde esta reducción la mayor parte
+   de lo que intentaría —escribir un archivo, tocar un arranque de shell, cambiar
+   permisos, instalar un paquete, ejecutar lo descargado— ya no tiene botón. El
+   gate dejó de ser la defensa principal: lo que queda es el diario y lo que
+   revises en él.
 5. **TOCTOU en el vault**: la contención de rutas de `send_file` se comprueba y
    luego se lee. Con `bash` disponible, esa defensa deja de ser una frontera real.
-6. **El gate es un clasificador, no un sandbox.** Reconoce programas,
-   subcomandos y redirecciones; una forma que no conozca —un script propio, un
-   binario que borra por su cuenta, un alias dentro de un archivo— pasa sin
-   botón. Y como `bash` corre sin permiso dentro de `$HOME`, un turno puede
-   borrar o cifrar archivos tuyos sin que veas nada. La red de seguridad ya no es
-   el botón: es el diario y lo que revises en él.
-   - Desde el agujero del diario (`python3 -m pip install …` permitido porque el
-     programa era `python3`), los intérpretes se leen por lo que se les pide: `-m`
-     (salvo los módulos que solo transforman datos, que son una lista cerrada),
-     `-c`, `-e`/`-E`/`--eval` y los lanzadores de paquetes (`npx`, `npm exec`,
-     `pnpm dlx`, `yarn dlx`, `bunx`) preguntan. No se lee el contenido de ningún
-     programa: `python3 script.py`, `node script.js` y `./binario` se siguen
-     ejecutando sin botón, así que un instalador metido en un script propio, en un
-     `python3 -` o en una bandera que el gate no lea (`node -p`, `php -r`) pasa.
-     Sigue siendo una frontera de formas conocidas, no un aislamiento.
-7. **`write` de un archivo nuevo dentro de `$HOME` no pregunta**, tampoco en
-   rutas como `~/.ssh/authorized_keys` o `~/.bashrc` cuando aún no existen. Crear
-   un archivo no destruye nada y pedir permiso por cada archivo nuevo volvía a
-   ser el peaje; lo que queda como frontera es que ese archivo no exista todavía.
-   El `bash` equivalente (`echo … >> ~/.ssh/authorized_keys`) sí pregunta, porque
-   la redirección escribe sobre una ruta sensible.
+6. **El gate es un clasificador, no un sandbox.** Reconoce los programas de tres
+   familias; todo lo que no reconozca pasa sin botón, y esa lista es hoy la mayor
+   parte de un turno: `chmod`, `systemctl`, `kill`, `apt`, `pip`, `npx`, `curl …
+   | sh` y cualquier redirección. Un script propio, un binario que borra por su
+   cuenta, un alias dentro de un archivo o un instalador metido en un `python3 -`
+   pasan igual, y también un `rm` escrito de una forma que el lector no entienda.
+   La red de seguridad ya no es el botón: es el diario y lo que revises en él.
+7. **`write` no pregunta nunca**, tampoco cuando el archivo ya existe, ni fuera
+   de `$HOME`, ni sobre `~/.ssh/authorized_keys`, `~/.bashrc` o una unidad de
+   systemd. Un turno puede reemplazar el contenido entero de cualquier archivo y
+   no verás un botón: lo verás en el diario, si lo miras. El `bash` equivalente
+   escribe igual de silencioso, `echo … > ~/.ssh/authorized_keys` incluido. La
+   única frontera que queda es el token del bot y tu chat ID.
 
 ## Lo que Alter no hace
 

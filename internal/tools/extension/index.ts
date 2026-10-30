@@ -3,15 +3,18 @@
  * and the two deterministic Alter tools (S7, T12, T13, T17 and T22 of the phase-1
  * Telegram bridge).
  *
- * The gate intercepts `tool_call` and asks the owner only for what cannot be
- * undone: `edit` never asks, `write` asks when the target already exists or sits
- * outside `$HOME`, and `bash` asks only when the command can destroy, publish or
- * escalate. The read-only tools and the two Alter tools never ask, and a tool the
- * gate has no rule for asks only when its own name says it destroys something
- * (`delete_file`, `reset_session`): Pi loads the global configuration (S7), so a
- * button per package tool would rebuild the toll booth one layer out. The question
- * is `ctx.ui.confirm()`, which in RPC mode the bridge turns into two Telegram
- * buttons; no answer means blocked.
+ * The gate intercepts `tool_call` and asks the owner only three things: the loss of
+ * data, an irreversible publication and a change to Pi's own tool set. `edit` and
+ * `write` never ask, whatever the path and whether it exists; `bash` asks only for
+ * the programs that delete data, rewrite published history, publish, or install and
+ * remove Pi packages. Permissions, services, installers, downloaded code and shell
+ * redirections were dropped on purpose, and `docs/alter-limites.md` states what that
+ * leaves unprotected. The read-only tools and the two Alter tools never ask, and a
+ * tool the gate has no rule for asks only when its own name says it destroys
+ * something (`delete_file`, `reset_session`): Pi loads the global configuration
+ * (S7), so a button per package tool would rebuild the toll booth one layer out.
+ * The question is `ctx.ui.confirm()`, which in RPC mode the bridge turns into two
+ * Telegram buttons; no answer means blocked.
  *
  * The two tools exist for what Pi's own toolset cannot reach, not as a second way
  * to do what it already does: they deliver a vault file to the owner's chat and
@@ -101,10 +104,13 @@ function ok(text: string, details: Json = {}): ToolResult {
 
 /**
  * Tools that never need approval (T13, T22). The read-only built-ins cannot change
- * anything, the two deterministic Alter tools are validated by the bridge against
- * the vault and the owner chat, and `edit` is a surgical change: it applies only
- * where its `oldText` matches, so the diff is the review. Asking for it was a toll
- * booth, not a safeguard.
+ * anything, and the two deterministic Alter tools are validated by the bridge
+ * against the vault and the owner chat. `edit` is a surgical change whose diff is
+ * the review, and `write` stopped asking altogether: writing a file, over an empty
+ * path or over a full one, is not one of the three things the owner chose to gate,
+ * so it asks for nothing even when the target exists and even outside `$HOME`. The
+ * button is reserved for the loss of data, the irreversible publication and Pi's
+ * own tool set.
  */
 const APPROVAL_FREE = new Set([
 	"read",
@@ -112,6 +118,7 @@ const APPROVAL_FREE = new Set([
 	"find",
 	"ls",
 	"edit",
+	"write",
 	"send_file",
 	"ask_options",
 ]);
@@ -309,84 +316,6 @@ function resolveUserPath(raw: string, cwd: string): string | null {
 	return resolve(cwd.length > 0 ? cwd : process.cwd(), value);
 }
 
-/**
- * Paths where a write is an escalation even inside `$HOME`, or a system area where
- * one write can break the machine: shell start-up files, keys, autostart, PATH
- * directories and the usual roots. Used for shell redirections, whose target the
- * shell expands and whose effect the owner cannot see from the command alone.
- */
-const SENSITIVE_HOME_PATHS = [
-	".ssh",
-	".gnupg",
-	".config/autostart",
-	".gitconfig",
-	".bashrc",
-	".bash_profile",
-	".profile",
-	".zshrc",
-	".zprofile",
-	".local/bin",
-];
-
-const SENSITIVE_ROOT_PATHS = [
-	"/etc",
-	"/root",
-	"/boot",
-	"/usr",
-	"/bin",
-	"/sbin",
-	"/lib",
-	"/lib64",
-	"/opt",
-	"/var",
-	"/srv",
-	"/sys",
-	"/proc",
-	"/dev",
-];
-
-function isSensitivePath(absolutePath: string): boolean {
-	const home = homeDir();
-	for (const relative of SENSITIVE_HOME_PATHS) {
-		const prefix = resolve(home, relative);
-		if (absolutePath === prefix || absolutePath.startsWith(prefix + sep)) return true;
-	}
-	for (const root of SENSITIVE_ROOT_PATHS) {
-		if (absolutePath === root || absolutePath.startsWith(root + "/")) return true;
-	}
-	return false;
-}
-
-/**
- * Devices a redirection may target without destroying anything: `/dev/null` throws
- * the bytes away and `/dev/stdout`, `/dev/stderr` and `/dev/tty` echo them into a
- * descriptor the owner already sees. None of them stores data, so none of them can
- * lose it, and `2>/dev/null` is how every script silences stderr: asking for it
- * turned the gate into a toll booth (six of eight questions in 25 minutes of the
- * production journal were exactly this). Deliberately a closed list of exact
- * paths, never a `/dev/*` prefix: `> /dev/sda` must still ask.
- */
-const DISCARD_DEVICES = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
-
-/**
- * True when a redirection target resolves to a device that only discards or
- * repeats output. The target is resolved the same way every other path is, so
- * `$HOME/../dev/null` lands here too, while a target carrying a variable still
- * falls through to the rule that asks: a shell-agnostic reader cannot know what
- * `$SINK` is, and only a literal device name is safe to allow.
- */
-function isDiscardDevice(target: string, cwd: string): boolean {
-	if (target.includes("$") || target.includes("`")) return false;
-	const absolutePath = resolveUserPath(target, cwd);
-	return absolutePath !== null && DISCARD_DEVICES.has(absolutePath);
-}
-
-/** True when the path sits outside the owner's home: no rule covers it, so it asks. */
-function isOutsideHome(absolutePath: string): boolean {
-	const home = homeDir();
-	return !(absolutePath === home || absolutePath.startsWith(home + sep));
-}
-
 /** Path inside a file, or false when it is a directory or unreadable. */
 function isDirectory(absolutePath: string): boolean {
 	try {
@@ -403,37 +332,37 @@ function displayPath(absolutePath: string): string {
 	return shown.length <= 60 ? shown : `${shown.slice(0, 57)}…`;
 }
 
-/** Contents of a path field of a tool call, or null when the field is missing. */
-function readPathField(input: unknown): string | null {
-	if (typeof input !== "object" || input === null) return null;
-	const value = (input as Json).path;
-	return typeof value === "string" ? value : null;
-}
-
 /** Failed tool result: the model sees the reason and must not retry blindly. */
 function failed(text: string): ToolResult {
 	return { content: [{ type: "text", text }], details: {}, isError: true };
 }
 
 /**
- * Classifier for `bash` (T22). Permission is for what cannot be undone, so the gate
- * asks when the command deletes, truncates, rewrites history, publishes, installs
- * system state or escalates privileges, and stays quiet for the rest (`ls`, `cat`,
- * `grep`, `go test`, `git status`, `git commit`...).
+ * Classifier for `bash` (T22). The owner keeps a button for three things only, so
+ * the gate asks when the command loses data, rewrites published history, publishes
+ * an artifact or changes Pi's own tool set, and stays quiet for the rest: `ls`,
+ * `cat`, `grep`, `go test`, `git status`, `git commit`, `chmod`, `systemctl`,
+ * `kill`, `apt install`, `pip install`, `npx`, `curl … | sh` and every shell
+ * redirection.
  *
  * Two rules keep it from being decorative:
  *
  *   - it matches every simple command of the line, not the first token, because
  *     `git -C x push`, `sudo rm` and `FOO=1 rm -rf` are the same act as `git push`
  *     and `rm`;
- *   - what it cannot decide, it asks. An unbalanced quote, a path it cannot
- *     resolve, a `~user` it cannot expand: all of them ask, never fail open.
+ *   - what it cannot decide, it asks. An unbalanced quote and an `mv` whose
+ *     destination it cannot resolve ask, never fail open.
  */
 
 /** One shell word, one operator or one redirection. */
 type Token = { kind: "word" | "op" | "redir"; value: string };
 
-/** One simple command of a line: its words, its redirections and the operator before it. */
+/**
+ * One simple command of a line: its words, the redirections it consumed and the
+ * operator before it. Nothing reads `redirs` any more —no shell-writing rule is
+ * left— but the redirection target is still kept out of the words, so
+ * `echo x > notas.md` never sees `notas.md` as an argument of `echo`.
+ */
 type SimpleCommand = {
 	words: string[];
 	redirs: { op: string; target: string }[];
@@ -632,17 +561,15 @@ function splitCommands(tokens: Token[]): SimpleCommand[] {
 	return commands;
 }
 
-/** Shells that run inline code with `-c` and can be the reader of a download pipe. */
+/** Shells that run inline code with `-c`, so the code inside that word is classified. */
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "busybox"]);
-
-/** Interpreters that execute a piped script just as a shell would. */
-const INTERPRETERS = new Set(["python", "python3", "perl", "ruby", "node", "php"]);
 
 /**
  * Programs that only run the command after them. The program is skipped and the
  * inner command classified, so `env FOO=1 rm x` and `xargs rm` hit the `rm` rule.
- * `sudo`/`doas` are listed so the download-pipe check can see the shell behind
- * them; the escalation itself is caught before this set is consulted.
+ * `sudo`/`doas` are here for the same reason and no longer ask on their own: the
+ * privilege rule was dropped, so `sudo rm x` asks because of the `rm` and
+ * `sudo apt install x` asks for nothing.
  */
 const TRANSPARENT_WRAPPERS = new Set([
 	"env",
@@ -693,28 +620,18 @@ function stripWrapperArgs(program: string, args: string[]): string[] {
 /** Shell word that starts with an assignment, as in `FOO=1 rm x` or `A=b c=d cmd`. */
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
-/** An option set with no value-taking flag, for the callers that only need an operand. */
-const NO_VALUE_FLAGS: Set<string> = new Set();
-
 /**
  * The sentences the owner reads. Each one names the consequence in the second
- * person and, unless the program IS the point (`sudo`), never the program: "rm
- * borra archivos" says nothing a person can weigh on a phone, while "Va a borrar
- * archivos." says what he is deciding. The program and its flags stay in the
- * journal, through each rule's `detail`.
+ * person and never the program: "rm borra archivos" says nothing a person can
+ * weigh on a phone, while "Va a borrar archivos." says what he is deciding. The
+ * program and its flags stay in the journal, through each rule's `detail`.
+ *
+ * There are only as many sentences as families the owner still gates: data loss,
+ * published history, containers, publication and Pi's tool set.
  */
 const REASON_DELETE_FILES = "Va a borrar archivos.";
-const REASON_PERMISSIONS = "Va a cambiar permisos de archivos.";
-const REASON_SYSTEM_STATE = "Va a cambiar el estado del sistema.";
-const REASON_ADMIN_RIGHTS = "Va a pedir permisos de administrador.";
-const REASON_INSTALL = "Va a instalar software en el sistema.";
-const REASON_SCHEDULE = "Va a programar una tarea automática.";
 const REASON_HISTORY = "Va a publicar o reescribir el historial del repositorio.";
-const REASON_DOWNLOADED_CODE = "Va a ejecutar código descargado de internet.";
 const REASON_CONTAINERS = "Va a borrar contenedores o volúmenes.";
-const REASON_MODULE = "Va a ejecutar un módulo de Python.";
-const REASON_DOWNLOADED_PACKAGE = "Va a ejecutar un paquete descargado.";
-const REASON_ARBITRARY_CODE = "Va a ejecutar código arbitrario.";
 const REASON_PUBLISH = "Va a publicar un paquete de forma irreversible.";
 const REASON_PUBLISH_RELEASE = "Va a publicar o borrar una versión de forma irreversible.";
 const REASON_PUBLISH_IMAGE = "Va a publicar una imagen de forma irreversible.";
@@ -724,12 +641,12 @@ const REASON_PI_TOOLSET = "Va a cambiar las herramientas de Pi en las que confí
 type Rule = { reason: string; detail: string };
 
 /**
- * Programs that ask without reading their arguments: deleting, truncating,
- * changing permissions or ownership, stopping a service, or installing a package.
- * The programs whose verdict depends on the subcommand they are given, or on the
- * program they run (`systemctl`, `apt`, `dpkg`, `crontab`, `kill`, `find`), have
- * their own reader further down: each one allows an explicit list of reads and
- * keeps asking for everything it does not recognise.
+ * Programs that ask without reading their arguments: every one of them loses data
+ * on its own (deleting, truncating, reformatting a disk). Permissions and
+ * ownership, services and processes, package installers and the privilege
+ * escalation used to be here and were removed on purpose: the owner gates data
+ * loss, publication and Pi's tool set, and nothing else. `find`, `mv`, `git`,
+ * `docker` and the publishers keep their own reader further down.
  */
 const ASK_PROGRAMS: Record<string, Rule> = {
 	rm: { reason: REASON_DELETE_FILES, detail: "rm borra archivos" },
@@ -742,40 +659,10 @@ const ASK_PROGRAMS: Record<string, Rule> = {
 	fdisk: { reason: "Va a repartir un disco.", detail: "fdisk reparte un disco" },
 	parted: { reason: "Va a repartir un disco.", detail: "parted reparte un disco" },
 	wipefs: { reason: "Va a borrar marcas de un disco.", detail: "wipefs borra firmas de un sistema de archivos" },
-	chmod: { reason: REASON_PERMISSIONS, detail: "chmod cambia permisos" },
-	chown: { reason: REASON_PERMISSIONS, detail: "chown cambia el dueño de un archivo" },
-	chgrp: { reason: REASON_PERMISSIONS, detail: "chgrp cambia el grupo de un archivo" },
-	chattr: { reason: "Va a cambiar atributos de archivos.", detail: "chattr cambia atributos del sistema de archivos" },
-	pkill: { reason: REASON_SYSTEM_STATE, detail: "pkill mata procesos" },
-	killall: { reason: REASON_SYSTEM_STATE, detail: "killall mata procesos" },
-	service: { reason: REASON_SYSTEM_STATE, detail: "service cambia servicios del sistema" },
-	shutdown: { reason: REASON_SYSTEM_STATE, detail: "shutdown apaga el sistema" },
-	reboot: { reason: REASON_SYSTEM_STATE, detail: "reboot reinicia el sistema" },
-	poweroff: { reason: REASON_SYSTEM_STATE, detail: "poweroff apaga el sistema" },
-	halt: { reason: REASON_SYSTEM_STATE, detail: "halt detiene el sistema" },
-	brew: { reason: REASON_INSTALL, detail: "brew instala o quita paquetes" },
-	snap: { reason: REASON_INSTALL, detail: "snap instala o quita paquetes" },
 };
-
-/** Package managers whose `-g`/`--global` install reaches outside the project. */
-const GLOBAL_INSTALL_PROGRAMS = new Set(["npm", "pnpm", "yarn", "bun"]);
-
-/** Package managers whose `install` subcommand changes the interpreter's environment. */
-const INSTALL_PROGRAMS = new Set(["pip", "pip3", "pipx", "uv"]);
 
 /** Docker flags that take a value, so the value is not mistaken for a subcommand. */
 const DOCKER_VALUE_FLAGS = new Set(["-H", "--host", "--context", "--config", "--log-level", "-l"]);
-
-/** True for an argument that makes a package manager install globally. */
-function isGlobalInstallFlag(argument: string): boolean {
-	return (
-		argument === "-g" ||
-		argument === "--global" ||
-		argument === "global" ||
-		argument === "-g=true" ||
-		argument === "--location=global"
-	);
-}
 
 /**
  * Words a simple command actually runs, after its assignments and transparent
@@ -812,192 +699,6 @@ function scriptArgument(args: string[]): string | null {
 	return null;
 }
 
-/**
- * Interpreters whose arguments the gate reads. The production journal had
- * `python3 -m pip install …` allowed because the program was `python3` and nothing
- * looked at what it was asked to run: an installer behind an interpreter walked
- * through the gap. What the interpreter is given decides, not its name.
- */
-type InterpreterKind = "python" | "node" | "perl" | "ruby";
-
-/** Program names of each interpreter, version suffixes included (`python3.11`, `perl5.36`). */
-const INTERPRETER_NAMES: { kind: InterpreterKind; name: RegExp }[] = [
-	{ kind: "python", name: /^python(\d+(\.\d+)?)?$/ },
-	{ kind: "node", name: /^node(js)?$/ },
-	{ kind: "perl", name: /^perl(\d+(\.\d+)?)?$/ },
-	{ kind: "ruby", name: /^ruby(\d+(\.\d+)?)?$/ },
-];
-
-/** Interpreter family of a program name, or null when it is not one. */
-function interpreterKind(program: string): InterpreterKind | null {
-	for (const entry of INTERPRETER_NAMES) {
-		if (entry.name.test(program)) return entry.kind;
-	}
-	return null;
-}
-
-/**
- * Short-option letters that make an interpreter run the code written in the
- * command instead of a file: `-c` for Python and `-e` for Node, Perl and Ruby.
- * Perl's `-E` is the same flag with features enabled, so it walks the same rule.
- * A command can pass the code glued to the flag (`python3 -c'print(1)'`), so the
- * letters of the cluster are read, not just the exact flag.
- */
-const INLINE_CODE_LETTERS: Record<InterpreterKind, string> = {
-	python: "c",
-	node: "e",
-	perl: "eE",
-	ruby: "e",
-};
-
-/**
- * Letters of an interpreter's short-option cluster (`-c`, `-we`, `-cprint(1)`), or
- * null when the word is not a short option. Only the leading letters are read, so a
- * glued value (`-cprint(1)`) does not turn the parentheses into flag names.
- */
-function optionLetters(argument: string): string | null {
-	if (!argument.startsWith("-") || argument.startsWith("--") || argument === "-") return null;
-	const letters = /^-([A-Za-z]*)/.exec(argument)?.[1] ?? "";
-	return letters.length > 0 ? letters : null;
-}
-
-/** Perl short options that swallow a glued value (`-Mstrict`, `-Ilib`), so they are not code. */
-const PERL_VALUE_PREFIXES = ["-M", "-m", "-I"];
-
-/** Python short options that take their value as the next word (`-W ignore`, `-X utf8`). */
-const PYTHON_VALUE_LETTERS = "WX";
-
-/** True for the module names that are pip itself: `pip`, `pip3`, `pip3.11`. */
-function isPipModule(module: string): boolean {
-	return /^pip\d*(\.\d+)*$/.test(module);
-}
-
-/**
- * Closed allowlist of `python -m` modules that only transform the data they are
- * given: they read stdin or an input file and write the result to stdout. The
- * number is how many operands the module reads, and with that shape no invocation
- * writes a file, opens a socket or installs anything: `json.tool` writes its
- * *second* positional (`python3 -m json.tool in.json out.json` overwrites
- * `out.json`), and that form is the reason for the cap.
- *
- * `json.tool` re-prints JSON, `base64` encodes or decodes bytes. Nothing else is
- * here: `http.server`/`pydoc -b` serve, `venv`/`ensurepip`/`pip` install,
- * `doctest`/`timeit` run code, `gzip`/`zipfile`/`pickletools -o` write files.
- * Every module this reader has not checked keeps the ask it had, and the whole
- * list is documented in `docs/alter-limites.md`.
- */
-const DATA_TRANSFORM_MODULES: Record<string, number> = {
-	"json.tool": 1,
-	base64: 1,
-};
-
-/**
- * True when `module` is in the allowlist and its words leave it no output file:
- * a flag is not an operand, and every other word counts as one.
- */
-function isDataTransformModule(module: string, args: string[]): boolean {
-	const operandLimit = DATA_TRANSFORM_MODULES[module];
-	if (operandLimit === undefined) return false;
-	let operands = 0;
-	for (const argument of args) {
-		// `-` is the stdin operand, not a flag: it occupies a slot like a file does.
-		if (argument.startsWith("-") && argument !== "-") continue;
-		operands += 1;
-		if (operands > operandLimit) return false;
-	}
-	return true;
-}
-
-/** What a `python` command line runs: inline code, a module, or neither. */
-type PythonRequest =
-	| { kind: "inline" }
-	| { kind: "module"; module: string; args: string[] }
-	| { kind: "none" };
-
-/**
- * Request of a `python` invocation, read from its options. `-c` and `-m` are the
- * only flags that decide, and both end the scan: what follows `-m` belongs to the
- * module. A script argument, `-` and `--` run a file, so they leave nothing for
- * this reader to add.
- */
-function pythonRequest(args: string[]): PythonRequest {
-	for (let index = 0; index < args.length; index += 1) {
-		const argument = args[index];
-		// `--` ends the options and `-` reads the script from stdin: both run a
-		// script, so they keep the verdict `python3 script.py` has.
-		if (argument === "--" || argument === "-") return { kind: "none" };
-		if (!argument.startsWith("-")) return { kind: "none" }; // an existing script
-		const letters = optionLetters(argument);
-		if (letters === null) continue; // a long option (`--version`): none runs code
-		// `-W ignore` and `-X utf8` take the next word as their value, so that word is
-		// not a script and must not end the scan: `python3 -W ignore -c '…'` still asks.
-		if (argument.length === 2 && PYTHON_VALUE_LETTERS.includes(letters)) {
-			index += 1;
-			continue;
-		}
-		if (letters.includes("c")) return { kind: "inline" };
-		if (!letters.includes("m")) continue;
-		return { kind: "module", module: args[index + 1] ?? "", args: args.slice(index + 2) };
-	}
-	return { kind: "none" };
-}
-
-/**
- * Verdict for `python`. A module asks, because it is code that is not in the command
- * line: `-m pip install`/`-m pip uninstall` and `-m ensurepip` with the installer reason,
- * a module of the closed data-transforming allowlist is allowed (`json.tool`
- * re-prints JSON), and any other module as unknown code. Inline code (`-c`) asks
- * as arbitrary code. A script argument is allowed: it is an existing file, the
- * same class as `go test`, and the decision is recorded in `docs/alter-limites.md`.
- */
-function classifyPython(program: string, args: string[]): Verdict {
-	const request = pythonRequest(args);
-	if (request.kind === "inline") return ask(REASON_ARBITRARY_CODE, `${program} -c ejecuta código arbitrario`);
-	if (request.kind === "none") return allow();
-
-	const { module, args: moduleArgs } = request;
-	if (module.length === 0) {
-		return ask(REASON_MODULE, `${program} -m sin módulo: no reconozco la operación`);
-	}
-	if (isDataTransformModule(module, moduleArgs)) return allow();
-	const subcommand = moduleArgs.find((rest) => !rest.startsWith("-")) ?? "";
-	if (module === "ensurepip") return ask(REASON_INSTALL, `${program} -m ensurepip instala pip`);
-	if (isPipModule(module) && (subcommand === "install" || subcommand === "uninstall")) {
-		return ask(REASON_INSTALL, `${program} -m pip ${subcommand} instala o quita paquetes`);
-	}
-	return ask(REASON_MODULE, `${program} -m ${module} ejecuta un módulo`);
-}
-
-/**
- * Verdict for an interpreter. What it is asked to run decides: `-c`/`-e` and the
- * Node long form `--eval` are code written in the command, so they ask without
- * being read (a reader of code is a promise this gate cannot keep); a script
- * argument is allowed, because running an existing file is the same class as
- * `go test`.
- */
-function classifyInterpreter(program: string, kind: InterpreterKind, args: string[]): Verdict {
-	if (kind === "python") return classifyPython(program, args);
-
-	for (let index = 0; index < args.length; index += 1) {
-		const argument = args[index];
-		if (argument === "--" || argument === "-") return allow();
-		if (!argument.startsWith("-")) return allow(); // an existing script
-		// The tokenizer glues a quoted value to its flag (`--eval'x'`), so the long
-		// Node option is matched by its head.
-		if (kind === "node" && argument.startsWith("--eval")) {
-			return ask(REASON_ARBITRARY_CODE, `${program} --eval ejecuta código arbitrario`);
-		}
-		if (kind === "perl" && PERL_VALUE_PREFIXES.some((prefix) => argument.startsWith(prefix))) continue;
-		const letters = optionLetters(argument);
-		if (letters === null) continue; // a long option: none of them runs code here
-		const flag = Array.from(letters).find((letter) => INLINE_CODE_LETTERS[kind].includes(letter));
-		if (flag !== undefined) {
-			return ask(REASON_ARBITRARY_CODE, `${program} -${flag} ejecuta código arbitrario`);
-		}
-	}
-	return allow();
-}
-
 /** Programs that download and run a package on every invocation. */
 const PACKAGE_RUNNERS = new Set(["npx", "bunx"]);
 
@@ -1007,6 +708,24 @@ const PACKAGE_RUNNER_SUBCOMMANDS: Record<string, string> = {
 	pnpm: "dlx",
 	yarn: "dlx",
 };
+
+/**
+ * Words a package runner was asked to run, or null when the invocation runs no
+ * command at all (`npx` alone). The runner only downloads a package, which the
+ * owner stopped gating; what it runs is classified as the command it is, so
+ * `npx npm publish` keeps its publish button and `npx cowsay hola` passes.
+ */
+function runnerInnerWords(program: string, args: string[]): string[] | null {
+	const rest = [...args];
+	const subcommand = PACKAGE_RUNNER_SUBCOMMANDS[program];
+	if (subcommand !== undefined) {
+		let index = 0;
+		while (index < rest.length && rest[index].startsWith("-")) index += 1;
+		if (rest[index] !== subcommand) return null;
+		rest.splice(0, index + 1);
+	}
+	return stripWrapperArgs(program, rest);
+}
 
 /**
  * Programs whose upload subcommand publishes an artifact the gate cannot take
@@ -1166,42 +885,7 @@ function classifyContainer(program: string, args: string[]): Verdict {
 	return allow();
 }
 
-/**
- * Verdict for one redirection. `>` destroys what was in the file, so it asks when
- * the target already exists; `>>` appends and destroys nothing, so it only asks
- * when the target is a sensitive path (appending a key to `authorized_keys` or a
- * line to `.bashrc` is escalation even though nothing is lost). A target with a
- * variable or a command substitution is not resolved by a shell-agnostic reader, so
- * it asks.
- */
-function classifyRedirection(redirection: { op: string; target: string }, cwd: string): Verdict {
-	if (redirection.op !== ">" && redirection.op !== ">>") return allow();
-	// A device sink is checked before every other rule, and for every descriptor and
-	// for both `>` and `>>`: `2>/dev/null` writes to `/dev`, which the sensitive list
-	// covers, but only as a sink that keeps nothing.
-	if (isDiscardDevice(redirection.target, cwd)) return allow();
-	if (redirection.target.includes("$") || redirection.target.includes("`")) {
-		return ask("Va a escribir en una ruta que no puedo comprobar.", `${redirection.op} escribe en una ruta con variables`);
-	}
-	const absolutePath = resolveUserPath(redirection.target, cwd);
-	if (absolutePath === null) {
-		return ask("Va a escribir en una ruta que no puedo comprobar.", `${redirection.op} escribe en una ruta que no puedo resolver`);
-	}
-	const shown = displayPath(absolutePath);
-	if (isSensitivePath(absolutePath)) {
-		// `>>` adds instead of destroying, but on a start-up file or a key list
-		// adding a line is the escalation, so the reason says which of the two it is.
-		return redirection.op === ">"
-			? ask(`Va a sobrescribir ${shown}.`, `${redirection.op} escribe en ${shown}, una ruta sensible`)
-			: ask(`Va a añadir contenido a ${shown}.`, `${redirection.op} escribe en ${shown}, una ruta sensible`);
-	}
-	if (redirection.op === ">" && existsSync(absolutePath)) {
-		return ask(`Va a sobrescribir ${shown}.`, `> sobrescribe ${shown}`);
-	}
-	return allow();
-}
-
-/** Verdict for the words of one simple command, ignoring redirections. */
+/** Verdict for the words of one simple command. */
 function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	if (depth > 4) return ask("No puedo revisar un comando tan anidado.", "anidamiento de comandos demasiado profundo");
 
@@ -1213,10 +897,6 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 
 	const program = basename(words[0]);
 	const args = words.slice(1);
-
-	// The escape hatch itself: whatever it runs, the escalation is the risk, and
-	// this is the one rule where the program is the consequence.
-	if (program === "sudo" || program === "doas") return ask(REASON_ADMIN_RIGHTS, `${program} escala privilegios`);
 
 	if (TRANSPARENT_WRAPPERS.has(program)) {
 		const inner = stripWrapperArgs(program, args);
@@ -1234,22 +914,18 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	const alwaysAsk = ASK_PROGRAMS[program];
 	if (alwaysAsk !== undefined) return ask(alwaysAsk.reason, alwaysAsk.detail);
 
-	// An installer or arbitrary code behind an interpreter is the same act as the
-	// program itself, so the interpreter's arguments are read before anything else
-	// about it: `python3 -m pip install x` asks as `pip install x` does.
-	const kind = interpreterKind(program);
-	if (kind !== null) return classifyInterpreter(program, kind, args);
-
-	// A package runner downloads a package and runs it: there is no local file to
-	// review, so every form asks.
-	const runnerSubcommand = PACKAGE_RUNNER_SUBCOMMANDS[program];
-	if (PACKAGE_RUNNERS.has(program)) {
-		return ask(REASON_DOWNLOADED_PACKAGE, `${program} descarga y ejecuta un paquete`);
+	// A package runner downloads a package and runs it. Downloading stopped being a
+	// reason to ask, but the command it runs is still read, so a publication behind
+	// a runner (`npx npm publish`) keeps its button.
+	if (PACKAGE_RUNNERS.has(program) || PACKAGE_RUNNER_SUBCOMMANDS[program] !== undefined) {
+		const inner = runnerInnerWords(program, args);
+		if (inner !== null) {
+			if (inner.length === 0) return allow();
+			return classifyWords(inner, cwd, depth + 1);
+		}
+		// `npm publish` is the package manager itself and not a runner, so it falls
+		// through to the publish rule below.
 	}
-	if (runnerSubcommand !== undefined && firstOperand(args, NO_VALUE_FLAGS) === runnerSubcommand) {
-		return ask(REASON_DOWNLOADED_PACKAGE, `${program} ${runnerSubcommand} descarga y ejecuta un paquete`);
-	}
-
 	// An upload to a registry cannot be undone, so every form of it asks. The
 	// check reads the real subcommand, not the first word after the program, so a
 	// value flag (`npm --prefix x publish`) cannot hide it.
@@ -1264,21 +940,8 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 	if (program === "docker" || program === "podman" || program === "docker-compose") {
 		return classifyContainer(program === "docker-compose" ? "docker" : program, program === "docker-compose" ? ["compose", ...args] : args);
 	}
-	if (GLOBAL_INSTALL_PROGRAMS.has(program) && args.some(isGlobalInstallFlag)) {
-		return ask(REASON_INSTALL, `${program} instala un paquete global`);
-	}
-	if (INSTALL_PROGRAMS.has(program) && args.includes("install")) {
-		return ask(REASON_INSTALL, `${program} install instala paquetes`);
-	}
-	if (program === "cargo" && args.includes("install")) return ask(REASON_INSTALL, "cargo install instala un binario");
 
-	if (program === "systemctl") return classifySystemctl(args);
-	if (program === "apt" || program === "apt-get" || program === "aptitude") return classifyApt(program, args);
-	if (program === "dpkg") return classifyDpkg(args);
-	if (program === "crontab") return classifyCrontab(args);
-	if (program === "kill") return classifyKill(args);
-	if (program === "find") return classifyFind(args);
-
+	if (program === "find") return classifyFind(args, cwd, depth);
 	if (program === "mv") return classifyMove(args, cwd);
 
 	return allow();
@@ -1287,8 +950,8 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 /**
  * First operand of a program whose flags may come before its subcommand. The
  * flags are skipped, and so is the value of the ones that take one, so
- * `apt-get -y install x` still reveals `install` and `systemctl --user status x`
- * still reveals `status` instead of stopping at the flag. Null when the arguments
+ * `npm --prefix ~/x publish` still reveals `publish` and `pi --extension x list`
+ * still reveals `list` instead of stopping at the flag. Null when the arguments
  * carry no operand at all.
  */
 function firstOperand(args: string[], valueFlags: Set<string>): string | null {
@@ -1300,31 +963,23 @@ function firstOperand(args: string[], valueFlags: Set<string>): string | null {
 	return rest[0] ?? null;
 }
 
-/**
- * Programs whose run leaves the machine as it was: the closed allowlist `find` may
- * execute through `-exec`/`-execdir`/`-ok`/`-okdir` without asking. Anything else
- * (`rm`, `mv`, `chmod`, a shell, a script of its own) keeps asking, and so does an
- * empty program, which is a line this reader cannot decide.
- */
-const FIND_READ_ONLY_PROGRAMS = new Set(["ls", "cat", "grep", "stat", "file", "wc", "head", "tail", "du", "echo"]);
-
 /** `find` predicates that run another program. */
 const FIND_EXEC_FLAGS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
-/** `find` predicates that destroy a match or write a file of their own. */
+/** `find` predicates that destroy a match or truncate a file of their own. */
 const FIND_WRITE_FLAGS = new Set(["-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]);
 
 /**
  * Verdict for `find`.
  *
- * `-exec`, `-execdir`, `-ok` and `-okdir` run a program the gate never sees as a
- * program of its own, so the verdict is read from the program that follows the
- * predicate: a read-only one is a read, and everything else keeps the ask that
- * `find` always had. That is what makes `find . -name '*.go' -exec ls -l {} +`
- * pass while `find . -name x -exec rm {} \;` still asks. `-delete` and the
- * predicates that write a file keep asking unconditionally.
+ * `-delete` and the predicates that truncate a file of their own keep asking
+ * unconditionally. `-exec`, `-execdir`, `-ok` and `-okdir` run a program the gate
+ * never sees as a program of its own, so the words after the predicate are
+ * classified as the command they are: `find . -name x -exec rm {} \;` deletes
+ * exactly as `rm` does and keeps its button, while `find . -name '*.go' -exec ls -l
+ * {} +` reads and asks for nothing.
  */
-function classifyFind(args: string[]): Verdict {
+function classifyFind(args: string[], cwd: string, depth: number): Verdict {
 	let index = 0;
 	while (index < args.length) {
 		const argument = args[index];
@@ -1335,210 +990,18 @@ function classifyFind(args: string[]): Verdict {
 			index += 1;
 			continue;
 		}
-		// The program is the word right after the predicate, so a path form
-		// (`/bin/ls`) is compared by its name, exactly as `programOf` does.
-		const program = basename(args[index + 1] ?? "");
-		if (!FIND_READ_ONLY_PROGRAMS.has(program)) {
-			return ask(REASON_DELETE_FILES, `find ${argument} ejecuta ${program || "un programa que no puedo leer"}`);
+		// One line can carry several `-exec` predicates, so the scan keeps going after
+		// the `;` or `+` that closes this one.
+		let end = index + 1;
+		while (end < args.length && args[end] !== ";" && args[end] !== "+") end += 1;
+		if (end === index + 1) {
+			return ask("No pude interpretar el comando: `find -exec` sin programa.", `find ${argument} sin programa: no reconozco la operación`);
 		}
-		// Skip the rest of the predicate up to its `;` or `+` and keep reading: one
-		// line can carry several `-exec` predicates and every one of them runs.
-		index += 2;
-		while (index < args.length && args[index] !== ";" && args[index] !== "+") index += 1;
-		index += 1;
+		const verdict = classifyWords(args.slice(index + 1, end), cwd, depth + 1);
+		if (verdict.ask) return verdict;
+		index = end + 1;
 	}
 	return allow();
-}
-
-/** `systemctl` flags that take a value, so the value is not read as the subcommand. */
-const SYSTEMCTL_VALUE_FLAGS = new Set([
-	"-H",
-	"--host",
-	"-M",
-	"--machine",
-	"-p",
-	"--property",
-	"-t",
-	"--type",
-	"--state",
-	"-n",
-	"--lines",
-	"-o",
-	"--output",
-	"-s",
-	"--signal",
-	"--kill-whom",
-	"--root",
-	"--job-mode",
-	"-E",
-	"--environment",
-]);
-
-/** `systemctl` subcommands that only report the state of the system. */
-const SYSTEMCTL_READ_SUBCOMMANDS = new Set([
-	"status",
-	"is-active",
-	"is-enabled",
-	"is-failed",
-	"is-system-running",
-	"show",
-	"cat",
-	"help",
-	"list-units",
-	"list-unit-files",
-	"list-timers",
-	"list-sockets",
-	"list-jobs",
-	"list-dependencies",
-	"list-sessions",
-	"list-machines",
-]);
-
-/**
- * Verdict for `systemctl`: the subcommand decides, not the program. `status`,
- * `is-active`, `list-units` and the rest of the read list only report, while
- * `start`, `stop`, `restart`, `enable`, `mask`, `daemon-reload` and everything else
- * change the system and keep asking.
- */
-function classifySystemctl(args: string[]): Verdict {
-	const subcommand = firstOperand(args, SYSTEMCTL_VALUE_FLAGS);
-	if (subcommand === null) {
-		// Only the version banner is a read on its own. A bare `systemctl` lists units
-		// too, but with no subcommand there is nothing the allowlist can be applied to.
-		if (args.includes("--version")) return allow();
-		return ask(REASON_SYSTEM_STATE, "systemctl sin subcomando: no reconozco la operación");
-	}
-	if (SYSTEMCTL_READ_SUBCOMMANDS.has(subcommand)) return allow();
-	return ask(REASON_SYSTEM_STATE, `systemctl ${subcommand} cambia servicios del sistema`);
-}
-
-/** `apt`/`apt-get` flags that take a value, so `-o X=1` does not hide the subcommand. */
-const APT_VALUE_FLAGS = new Set(["-o", "--option", "-t", "--target-release", "-c", "--config-file", "-a", "--host-architecture"]);
-
-/** `apt` subcommands that only read the package index. */
-const APT_READ_SUBCOMMANDS = new Set([
-	"list",
-	"search",
-	"show",
-	"policy",
-	"showpkg",
-	"showsrc",
-	"depends",
-	"rdepends",
-	"changelog",
-	"version",
-]);
-
-/**
- * Verdict for `apt`/`apt-get`/`aptitude`: only the subcommands that read the index
- * run unasked. `install`, `remove`, `purge`, `upgrade`, `dist-upgrade`,
- * `autoremove`, `clean` and anything unrecognised keep asking, and the flags before
- * the subcommand (`apt-get -y install x`) never hide it.
- */
-function classifyApt(program: string, args: string[]): Verdict {
-	const subcommand = firstOperand(args, APT_VALUE_FLAGS);
-	if (subcommand !== null && APT_READ_SUBCOMMANDS.has(subcommand)) return allow();
-	const detail =
-		subcommand === null
-			? `${program} sin subcomando: no reconozco la operación`
-			: `${program} ${subcommand} instala o quita paquetes del sistema`;
-	return ask(REASON_INSTALL, detail);
-}
-
-/** `dpkg` actions that only read the database or the contents of a package file. */
-const DPKG_READ_ACTIONS = new Set([
-	"-l",
-	"--list",
-	"-L",
-	"--listfiles",
-	"-s",
-	"--status",
-	"-S",
-	"--search",
-	"-p",
-	"--print-avail",
-	"-c",
-	"--contents",
-	"-I",
-	"--info",
-	"--get-selections",
-	"--print-architecture",
-	"--version",
-	"--help",
-]);
-
-/** Letters a read-only `dpkg` short cluster may carry (`-l`, `-L`, `-s`, `-S`, `-p`, `-c`). */
-const DPKG_READ_LETTERS = new Set(["l", "L", "s", "S", "p", "c"]);
-
-/**
- * Verdict for `dpkg`: the action is a flag, so it is read as one. `-l`/`--list`,
- * `-L`/`--listfiles`, `-s`/`--status` and the other reads run unasked; `-i`, `-r`,
- * `-P`, `--configure` and anything unrecognised keep asking.
- */
-function classifyDpkg(args: string[]): Verdict {
-	const action = args.find((argument) => argument.startsWith("-"));
-	if (action !== undefined) {
-		if (DPKG_READ_ACTIONS.has(action)) return allow();
-		const letters = shortFlagLetters(action);
-		if (letters !== null && letters.every((letter) => DPKG_READ_LETTERS.has(letter))) return allow();
-	}
-	const detail = action === undefined ? "dpkg sin acción: no reconozco la operación" : `dpkg ${action} cambia paquetes del sistema`;
-	return ask(REASON_INSTALL, detail);
-}
-
-/** Letters of a short flag cluster (`-lL` → `["l", "L"]`), or null when it is not one. */
-function shortFlagLetters(argument: string): string[] | null {
-	if (!/^-[A-Za-z]+$/.test(argument)) return null;
-	return Array.from(argument.slice(1));
-}
-
-/**
- * Verdict for `crontab`: `-l` lists the current table and changes nothing, so it is
- * the only form that runs unasked. `-e` opens the editor, `-r` removes the table and
- * a file argument replaces it, so all three keep asking.
- */
-function classifyCrontab(args: string[]): Verdict {
-	let lists = false;
-	let changes = false;
-	for (let index = 0; index < args.length; index += 1) {
-		const argument = args[index];
-		if (argument === "-u" || argument === "--user") {
-			index += 1; // the table the operation applies to is not the operation
-			continue;
-		}
-		if (argument === "--list") {
-			lists = true;
-			continue;
-		}
-		const letters = argument.startsWith("-") ? shortFlagLetters(argument) : null;
-		if (letters === null) {
-			// A file argument replaces the table, and a long flag I do not know could
-			// be anything: both keep asking.
-			changes = true;
-			continue;
-		}
-		for (const letter of letters) {
-			if (letter === "l") lists = true;
-			else changes = true; // `e`, `r`, `i` and anything the allowlist does not name
-		}
-	}
-	if (lists && !changes) return allow();
-	return ask(REASON_SCHEDULE, "crontab cambia o reemplaza tareas programadas");
-}
-
-/**
- * Verdict for `kill`: `-l` lists signal names and `-0` (or `-s 0`) only probes
- * whether a process exists, so both are reads. Any other flag or a bare operand
- * sends a real signal, which changes system state and keeps asking. `pkill` and
- * `killall` are untouched: they have no probe form here.
- */
-function classifyKill(args: string[]): Verdict {
-	const first = args[0];
-	if (first === undefined) return ask(REASON_SYSTEM_STATE, "kill sin argumentos: no reconozco la operación");
-	if (first === "-l" || first === "--list" || first === "-L" || first === "--table" || first === "-0") return allow();
-	// `kill -s 0 pid` and `kill -n 0 pid` probe exactly like `kill -0 pid`.
-	if ((first === "-s" || first === "--signal" || first === "-n") && (args[1] ?? "") === "0") return allow();
-	return ask(REASON_SYSTEM_STATE, "kill envía una señal a procesos");
 }
 
 /** Verdict for `mv`: moving onto an existing file overwrites it without asking. */
@@ -1558,40 +1021,12 @@ function classifyMove(args: string[], cwd: string): Verdict {
 	return allow();
 }
 
-/**
- * True when the reader of a download pipe only transforms the data it receives:
- * `curl … | python3 -m json.tool` formats the download, it does not run it, so the
- * pipe adds no risk of its own. The reader has to be a Python module of the closed
- * allowlist, with the same reading of its words the interpreter rule uses.
- */
-function readsPipedDataAsData(words: string[]): boolean {
-	const inner = commandWords(words);
-	if (inner.length === 0) return false;
-	if (interpreterKind(basename(inner[0])) !== "python") return false;
-	const request = pythonRequest(inner.slice(1));
-	return request.kind === "module" && isDataTransformModule(request.module, request.args);
-}
-
-/** Verdict for one simple command, redirections and download pipes included. */
-function classifySimpleCommand(command: SimpleCommand, next: SimpleCommand | undefined, cwd: string, depth: number): Verdict {
-	for (const redirection of command.redirs) {
-		const verdict = classifyRedirection(redirection, cwd);
-		if (verdict.ask) return verdict;
-	}
-
+/** Verdict for one simple command. The redirections were already split off by
+ * `splitCommands`, and they ask for nothing: the owner dropped every shell-writing
+ * rule, so `>`, `>>` and `|` are read as the plain operators they are. */
+function classifySimpleCommand(command: SimpleCommand, cwd: string, depth: number): Verdict {
 	const program = programOf(command.words);
 	if (program === "") return allow();
-
-	// `curl … | sh` runs code nobody read: the pipe is the whole risk. A reader that
-	// only transforms the download (`python3 -m json.tool`) is the exception, and it
-	// is read from the same closed allowlist as the interpreter rule.
-	if ((program === "curl" || program === "wget") && next !== undefined && (next.afterOp === "|" || next.afterOp === "|&")) {
-		const reader = programOf(next.words);
-		if ((SHELLS.has(reader) || INTERPRETERS.has(reader)) && !readsPipedDataAsData(next.words)) {
-			return ask(REASON_DOWNLOADED_CODE, `${program} | ${reader} ejecuta código descargado`);
-		}
-	}
-
 	return classifyWords(command.words, cwd, depth);
 }
 
@@ -1614,7 +1049,7 @@ function classifyCommandString(command: string, cwd: string, depth: number): Ver
 	}
 
 	for (let index = 0; index < commands.length; index += 1) {
-		const verdict = classifySimpleCommand(commands[index], commands[index + 1], cwd, depth);
+		const verdict = classifySimpleCommand(commands[index], cwd, depth);
 		if (verdict.ask) return verdict;
 	}
 	return allow();
@@ -1626,25 +1061,6 @@ function classifyBash(input: unknown, cwd: string): Verdict {
 	const command = (input as Json).command;
 	if (typeof command !== "string") return ask("No pude leer el comando.", "no pude leer el comando");
 	return classifyCommandString(command, cwd, 0);
-}
-
-/**
- * Verdict for the `write` tool (T22): a new file inside `$HOME` needs no
- * permission, an existing file (it overwrites the whole content) and anything
- * outside `$HOME` do.
- */
-function classifyWrite(input: unknown, cwd: string): Verdict {
-	const raw = readPathField(input);
-	if (raw === null) return ask("No pude leer la ruta del archivo.", "no pude leer la ruta del archivo");
-
-	const absolutePath = resolveUserPath(raw, cwd);
-	if (absolutePath === null) return ask("No puedo comprobar la ruta del archivo.", "no puedo resolver la ruta del archivo");
-	const shown = displayPath(absolutePath);
-	if (isOutsideHome(absolutePath)) {
-		return ask(`Va a escribir fuera de tu carpeta personal: ${shown}.`, `escribe fuera de $HOME: ${shown}`);
-	}
-	if (existsSync(absolutePath)) return ask(`Va a sobrescribir ${shown}.`, `sobrescribe ${shown}`);
-	return allow();
 }
 
 /**
@@ -1712,7 +1128,6 @@ function namesDestruction(name: string): boolean {
 function classifyCall(name: string, input: unknown, cwd: string): Verdict {
 	if (APPROVAL_FREE.has(name)) return allow();
 	if (name === "bash") return classifyBash(input, cwd);
-	if (name === "write") return classifyWrite(input, cwd);
 	// A tool with no rule of its own is not a decision the owner must answer on a
 	// phone: the packages he loaded are part of the agent he asked for. Only the
 	// names that say they destroy keep their button, and the match never fails open.
@@ -1871,7 +1286,7 @@ export default function alterTools(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	// T13/T22: approve the tool calls that can destroy, publish or escalate.
+	// T13/T22: approve the tool calls that lose data, publish or change Pi's tools.
 	//
 	// The gate runs on `tool_call`, which Pi awaits before executing anything and
 	// which can stop the call with `{ block: true, reason }`. The question travels

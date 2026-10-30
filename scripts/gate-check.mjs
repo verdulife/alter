@@ -13,6 +13,11 @@
  * command whole after the separator the bridge splits on. The extension emits
  * data, not markup, so this table never asserts a code fence: the bridge owns
  * the rendering.
+ *
+ * The table also keeps the rows of the rules the owner removed — permissions,
+ * services, installers, interpreters, downloaded code and every redirection — now
+ * expecting silence, so the history of the decision stays visible instead of
+ * disappearing from the file.
  * What it cannot prove: Pi's runtime. It never spawns `pi`, never answers an
  * `extension_ui_request` over RPC, and never executes a command. A `bash` case
  * asserts the decision, not the effect.
@@ -244,112 +249,109 @@ const cases = [
 	{ label: "find -delete", ...bash("find . -name x -delete"), expect: "ask", reason: "Va a borrar archivos." },
 
 	// --- bash: the command behind a wrapper ----------------------------
-	{ label: "sudo rm", ...bash("sudo rm x"), expect: "ask", reason: "Va a pedir permisos de administrador." },
+	{ label: "sudo rm", ...bash("sudo rm x"), expect: "ask", reason: "Va a borrar archivos." },
+	// `sudo` dejó de ser un disparador propio: lo que decide es el comando de dentro.
+	{ label: "sudo chmod +x (sudo no pregunta solo)", ...bash("sudo chmod +x f"), expect: "allow" },
 	{ label: "asignación de entorno + rm", ...bash("FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "env + rm", ...bash("env FOO=1 rm x"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "xargs rm", ...bash("find . -name x | xargs rm"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "bash -c con rm", ...bash("bash -c 'rm -rf x'"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "segundo comando de la línea", ...bash("ls && rm -rf x"), expect: "ask", reason: "Va a borrar archivos." },
 
-	// --- bash: overwriting through redirection -------------------------
-	{ label: "> sobre un archivo existente fuera de home", ...bash(`echo x > ${outside}/f`), expect: "ask", reason: `Va a sobrescribir ${outside}/f.` },
-	{
-		label: "> sobre un archivo existente tipo /tmp/existente.txt",
-		...bash(`echo x > ${outside}/existente.txt`),
-		expect: "ask",
-		reason: `Va a sobrescribir ${outside}/existente.txt.`,
-	},
-	{ label: "> sobre ~/.bashrc", ...bash("echo x > ~/.bashrc"), expect: "ask", reason: "Va a sobrescribir ~/.bashrc." },
-	{ label: "> sobre /etc/hosts", ...bash("echo x > /etc/hosts"), expect: "ask", reason: "Va a sobrescribir /etc/hosts." },
-	{ label: "> con variable entrecomillada en la ruta", ...bash('echo x > "$VAR"'), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
-	// La lista de dispositivos es cerrada: otro `/dev` sigue preguntando, y una
-	// variable que no es uno de ellos también.
-	{ label: "> sobre otro dispositivo de /dev", ...bash("echo x > /dev/sda"), expect: "ask", reason: "Va a sobrescribir /dev/sda." },
-	{ label: "> sobre $SINK entrecomillado", ...bash('echo x > "$SINK"'), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
-	{ label: "> sobre un archivo existente en home", ...bash(`echo x > ${home}/existente.txt`), expect: "ask", reason: "Va a sobrescribir ~/existente.txt." },
-	{ label: ">> sobre una ruta sensible", ...bash("echo x >> ~/.ssh/authorized_keys"), expect: "ask", reason: "Va a añadir contenido a ~/.ssh/authorized_keys." },
-	{ label: "> sobre un arranque de shell", ...bash("echo x > .bashrc"), expect: "ask", reason: "Va a sobrescribir ~/.bashrc." },
-	{ label: "> con variable en la ruta", ...bash("echo x > $HOME/.ssh/authorized_keys"), expect: "ask", reason: "Va a escribir en una ruta que no puedo comprobar." },
+	// --- bash: redirections, which no longer ask -----------------------
+	// La decisión del dueño borró la familia entera: `>` y `>>` dejaron de preguntar,
+	// también sobre un archivo que ya existe y sobre una ruta sensible. Lo único que
+	// queda de la familia es el `mv` que sobrescribe, que sí pierde datos.
+	{ label: "> sobre un archivo existente fuera de home", ...bash(`echo x > ${outside}/f`), expect: "allow" },
+	{ label: "> sobre un archivo existente tipo /tmp/existente.txt", ...bash(`echo x > ${outside}/existente.txt`), expect: "allow" },
+	{ label: "> sobre ~/.bashrc", ...bash("echo x > ~/.bashrc"), expect: "allow" },
+	{ label: "> sobre /etc/hosts", ...bash("echo x > /etc/hosts"), expect: "allow" },
+	{ label: "> con variable entrecomillada en la ruta", ...bash('echo x > "$VAR"'), expect: "allow" },
+	{ label: "> sobre otro dispositivo de /dev", ...bash("echo x > /dev/sda"), expect: "allow" },
+	{ label: "> sobre $SINK entrecomillado", ...bash('echo x > "$SINK"'), expect: "allow" },
+	{ label: "echo x > existente (ruta relativa)", ...bash("echo x > existente.txt"), expect: "allow" },
+	{ label: "> sobre un archivo existente en home", ...bash(`echo x > ${home}/existente.txt`), expect: "allow" },
+	{ label: ">> sobre una ruta sensible", ...bash("echo x >> ~/.ssh/authorized_keys"), expect: "allow" },
+	{ label: "> sobre un arranque de shell", ...bash("echo x > .bashrc"), expect: "allow" },
+	{ label: "> con variable en la ruta", ...bash("echo x > $HOME/.ssh/authorized_keys"), expect: "allow" },
 	{ label: "mv sobre un destino existente", ...bash("mv a.txt b.txt"), expect: "ask", reason: "Va a sobrescribir un archivo." },
 
-	// --- bash: permissions and processes -------------------------------
-	{ label: "chmod", ...bash("chmod +x f"), expect: "ask", reason: "Va a cambiar permisos de archivos." },
-	{ label: "chown", ...bash("chown root f"), expect: "ask", reason: "Va a cambiar permisos de archivos." },
-	{ label: "chattr", ...bash("chattr +i f"), expect: "ask", reason: "Va a cambiar atributos de archivos." },
-	{ label: "kill", ...bash("kill 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "killall", ...bash("killall node"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "systemctl", ...bash("systemctl restart x"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "service", ...bash("service x restart"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "shutdown", ...bash("shutdown -h now"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "reboot", ...bash("reboot"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	// --- bash: permissions, services and processes, which no longer ask ---
+	// Segunda familia borrada por el dueño: los permisos, la propiedad, los procesos
+	// y los servicios dejan de tener botón. Las filas quedan para que se vea que la
+	// decisión fue explícita y cuál era la cobertura anterior.
+	{ label: "chmod +x", ...bash("chmod +x f"), expect: "allow" },
+	{ label: "chown", ...bash("chown root f"), expect: "allow" },
+	{ label: "chattr", ...bash("chattr +i f"), expect: "allow" },
+	{ label: "kill", ...bash("kill 123"), expect: "allow" },
+	{ label: "killall", ...bash("killall node"), expect: "allow" },
+	{ label: "systemctl", ...bash("systemctl restart x"), expect: "allow" },
+	{ label: "service", ...bash("service x restart"), expect: "allow" },
+	{ label: "shutdown", ...bash("shutdown -h now"), expect: "allow" },
+	{ label: "reboot", ...bash("reboot"), expect: "allow" },
 
-	// --- bash: package and system state --------------------------------
-	{ label: "apt install", ...bash("apt install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "dpkg", ...bash("dpkg -r x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "npm install -g", ...bash("npm install -g x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "npm i -g", ...bash("npm i -g x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "pip install", ...bash("pip install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "cargo install", ...bash("cargo install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "crontab", ...bash("crontab -r"), expect: "ask", reason: "Va a programar una tarea automática." },
+	// --- bash: package and system state, which no longer ask --------------
+	// Tercera familia borrada: los instaladores del sistema y los lanzadores de
+	// paquetes dejan de preguntar. La publicación detrás de un lanzador sigue
+	// preguntando más abajo, porque eso sí es irreversible.
+	{ label: "apt install", ...bash("apt install x"), expect: "allow" },
+	{ label: "dpkg", ...bash("dpkg -r x"), expect: "allow" },
+	{ label: "npm install -g", ...bash("npm install -g x"), expect: "allow" },
+	{ label: "npm i -g", ...bash("npm i -g x"), expect: "allow" },
+	{ label: "pip install", ...bash("pip install x"), expect: "allow" },
+	{ label: "cargo install", ...bash("cargo install x"), expect: "allow" },
+	{ label: "crontab", ...bash("crontab -r"), expect: "allow" },
 
-	// --- bash: intérpretes y lanzadores de paquetes ---------------------
-	// El agujero del diario de producción: el programa era `python3`, así que
-	// `python3 -m pip install …` se permitía sin preguntar. Cuando el programa es
-	// un intérprete, decide lo que se le pide ejecutar: un módulo de Python, un
-	// paquete descargado o código escrito en el propio comando preguntan; un
-	// script que ya existe se sigue tratando como `go test`.
+	// --- bash: interpreters and package runners, which no longer ask -----
+	// Cuarta familia borrada: el intérprete dejó de leerse. `python3 -m pip install`,
+	// `python3 -c`, `node -e` y los lanzadores de paquetes ya no preguntan, porque el
+	// dueño no gatea la instalación ni el código descargado. Las filas del diario de
+	// producción se quedan con la expectativa nueva: son la prueba de la decisión.
 	{
 		label: "python3 -m pip install del diario de producción",
 		...bash("cd /tmp && python3 -m pip install --user --quiet pypdf"),
-		expect: "ask",
-		reason: "Va a instalar software en el sistema.",
+		expect: "allow",
 	},
 	{
 		label: "python3.11 -m pip install",
 		...bash("python3.11 -m pip install pypdf"),
-		expect: "ask",
-		reason: "Va a instalar software en el sistema.",
+		expect: "allow",
 	},
 	{
 		label: "python -m pip uninstall",
 		...bash("python -m pip uninstall pypdf"),
-		expect: "ask",
-		reason: "Va a instalar software en el sistema.",
+		expect: "allow",
 	},
-	{ label: "python3 -m ensurepip", ...bash("python3 -m ensurepip"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "python3 -m pip install", ...bash("python3 -m pip install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "python3 -m http.server", ...bash("python3 -m http.server 8000"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
-	{ label: "python3 -m venv", ...bash("python3 -m venv .venv"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
-	{ label: "python3 -m pip list", ...bash("python3 -m pip list"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
-	{ label: "python3 -m sin módulo", ...bash("python3 -m"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
-	{ label: "python3 -c", ...bash("python3 -c 'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "python3 -c pegado a las comillas", ...bash("python3 -c'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	// `-W` y `-X` toman su valor de la palabra siguiente: esa palabra no es un
-	// script y no puede terminar la lectura del comando.
-	{ label: "python3 -W ignore -c", ...bash("python3 -W ignore -c 'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "python3 -X utf8 -m pip install", ...bash("python3 -X utf8 -m pip install pypdf"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "node -e", ...bash("node -e 'console.log(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "node --eval", ...bash("node --eval 'console.log(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "perl -e", ...bash("perl -e 'print 1'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "ruby -e", ...bash("ruby -e 'puts 1'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
-	{ label: "npx", ...bash("npx cowsay hola"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
-	{ label: "npm exec", ...bash("npm exec cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
-	{ label: "pnpm dlx", ...bash("pnpm dlx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
-	{ label: "yarn dlx", ...bash("yarn dlx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
-	{ label: "bunx", ...bash("bunx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+	{ label: "python3 -m ensurepip", ...bash("python3 -m ensurepip"), expect: "allow" },
+	{ label: "python3 -m pip install", ...bash("python3 -m pip install x"), expect: "allow" },
+	{ label: "python3 -m http.server", ...bash("python3 -m http.server 8000"), expect: "allow" },
+	{ label: "python3 -m venv", ...bash("python3 -m venv .venv"), expect: "allow" },
+	{ label: "python3 -m pip list", ...bash("python3 -m pip list"), expect: "allow" },
+	{ label: "python3 -m sin módulo", ...bash("python3 -m"), expect: "allow" },
+	{ label: "python3 -c", ...bash("python3 -c 'print(1)'"), expect: "allow" },
+	{ label: "python3 -c pegado a las comillas", ...bash("python3 -c'print(1)'"), expect: "allow" },
+	{ label: "python3 -W ignore -c", ...bash("python3 -W ignore -c 'print(1)'"), expect: "allow" },
+	{ label: "python3 -X utf8 -m pip install", ...bash("python3 -X utf8 -m pip install pypdf"), expect: "allow" },
+	{ label: "node -e", ...bash("node -e 'console.log(1)'"), expect: "allow" },
+	{ label: "node --eval", ...bash("node --eval 'console.log(1)'"), expect: "allow" },
+	{ label: "perl -e", ...bash("perl -e 'print 1'"), expect: "allow" },
+	{ label: "ruby -e", ...bash("ruby -e 'puts 1'"), expect: "allow" },
+	{ label: "npx algo", ...bash("npx cowsay hola"), expect: "allow" },
+	{ label: "npm exec", ...bash("npm exec cowsay"), expect: "allow" },
+	{ label: "pnpm dlx", ...bash("pnpm dlx cowsay"), expect: "allow" },
+	{ label: "yarn dlx", ...bash("yarn dlx cowsay"), expect: "allow" },
+	{ label: "bunx", ...bash("bunx cowsay"), expect: "allow" },
 
 	// --- bash: módulos que solo transforman datos ----------------------
-	// La lista es cerrada y cada entrada lee su entrada (stdin o un archivo) y
-	// escribe en stdout: no puede escribir un archivo, abrir un socket ni instalar
-	// nada. Todo lo que no esté en ella sigue preguntando, y una entrada de más en
-	// la línea de órdenes también: `json.tool` escribe su segundo operando.
+	// La lista cerrada de módulos de Python desapareción con la regla de los
+	// intérpretes: lo que queda es la prueba de que un módulo con archivo de salida
+	// tampoco pregunta ya.
 	{ label: "python3 -m json.tool de un archivo", ...bash("python3 -m json.tool < datos.json"), expect: "allow" },
 	{ label: "python3 -m base64 -d", ...bash("python3 -m base64 -d datos.json"), expect: "allow" },
 	{
 		label: "python3 -m json.tool con archivo de salida",
 		...bash("python3 -m json.tool datos.json salida.json"),
-		expect: "ask",
-		reason: "Va a ejecutar un módulo de Python.",
+		expect: "allow",
 	},
 
 	// --- bash: lo que un intérprete no cambia ---------------------------
@@ -361,45 +363,46 @@ const cases = [
 	{ label: "node --version", ...bash("node --version"), expect: "allow" },
 	{ label: "yarn install local", ...bash("yarn install"), expect: "allow" },
 
-	// --- bash: lecturas que antes preguntaban ---------------------------
-	// La puerta está para lo que destruye, publica o escala, y estos cinco grupos
-	// son de solo lectura pero lo bastante frecuentes como para reconstruir el
-	// peaje. Se permiten solo por lista cerrada: el programa o el subcomando tiene
-	// que estar en ella, y todo lo que no esté sigue preguntando.
+	// --- bash: reads that no longer need a list --------------------------
+	// Con las familias de permisos, servicios e instaladores fuera, estas filas ya no
+	// prueban una lista cerrada de lecturas: prueban que el gate dejó de mirar esos
+	// programas. Se quedan para que la cobertura anterior siga visible.
 	{ label: "find -exec ls +", ...bash("find . -name '*.go' -exec ls -l {} +"), expect: "allow" },
 	{ label: "find -exec grep cerrado con ;", ...bash("find . -name '*.go' -exec grep -l x {} \\;"), expect: "allow" },
 	{ label: "find -ok stat", ...bash("find . -type f -ok stat {} \\;"), expect: "allow" },
 	{ label: "find -exec rm", ...bash("find . -name x -exec rm {} \\;"), expect: "ask", reason: "Va a borrar archivos." },
-	{ label: "find -execdir chmod", ...bash("find . -name x -execdir chmod 777 {} +"), expect: "ask", reason: "Va a borrar archivos." },
+	// `find -exec` se clasifica por el programa que ejecuta, no por una lista: `rm`
+	// pregunta y `chmod` no.
+	{ label: "find -execdir chmod", ...bash("find . -name x -execdir chmod 777 {} +"), expect: "allow" },
 	{ label: "find -exec sh", ...bash("find . -name x -exec sh -c 'rm x' {} \\;"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "systemctl --user status", ...bash("systemctl --user status alter.service"), expect: "allow" },
 	{ label: "systemctl --no-pager list-units", ...bash("systemctl --no-pager list-units"), expect: "allow" },
 	{ label: "systemctl is-active", ...bash("systemctl is-active alter.service"), expect: "allow" },
 	{ label: "systemctl --version", ...bash("systemctl --version"), expect: "allow" },
-	{ label: "systemctl --user start", ...bash("systemctl --user start alter.service"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "systemctl daemon-reload", ...bash("systemctl daemon-reload"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "systemctl --user start", ...bash("systemctl --user start alter.service"), expect: "allow" },
+	{ label: "systemctl daemon-reload", ...bash("systemctl daemon-reload"), expect: "allow" },
 	{ label: "crontab -l", ...bash("crontab -l"), expect: "allow" },
 	{ label: "crontab -u root -l", ...bash("crontab -u root -l"), expect: "allow" },
-	{ label: "crontab -e", ...bash("crontab -e"), expect: "ask", reason: "Va a programar una tarea automática." },
-	{ label: "crontab con archivo", ...bash("crontab tareas.txt"), expect: "ask", reason: "Va a programar una tarea automática." },
+	{ label: "crontab -e", ...bash("crontab -e"), expect: "allow" },
+	{ label: "crontab con archivo", ...bash("crontab tareas.txt"), expect: "allow" },
 	{ label: "apt list", ...bash("apt list --installed"), expect: "allow" },
 	{ label: "apt search", ...bash("apt search ripgrep"), expect: "allow" },
 	{ label: "apt show", ...bash("apt show alter"), expect: "allow" },
 	{ label: "apt-get policy", ...bash("apt-get policy x"), expect: "allow" },
-	{ label: "apt-get -y install", ...bash("apt-get -y install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "apt-get -o ... remove", ...bash("apt-get -o Debug::NoLocking=1 remove x"), expect: "ask", reason: "Va a instalar software en el sistema." },
-	{ label: "apt-get dist-upgrade", ...bash("apt-get dist-upgrade"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "apt-get -y install", ...bash("apt-get -y install x"), expect: "allow" },
+	{ label: "apt-get -o ... remove", ...bash("apt-get -o Debug::NoLocking=1 remove x"), expect: "allow" },
+	{ label: "apt-get dist-upgrade", ...bash("apt-get dist-upgrade"), expect: "allow" },
 	{ label: "dpkg -l", ...bash("dpkg -l"), expect: "allow" },
 	{ label: "dpkg -L con paquete", ...bash("dpkg -L alter"), expect: "allow" },
 	{ label: "dpkg --list", ...bash("dpkg --list"), expect: "allow" },
 	{ label: "dpkg -s", ...bash("dpkg -s alter"), expect: "allow" },
-	{ label: "dpkg -i", ...bash("dpkg -i x.deb"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "dpkg -i", ...bash("dpkg -i x.deb"), expect: "allow" },
 	{ label: "kill -0 como sonda", ...bash("kill -0 123"), expect: "allow" },
 	{ label: "kill -l", ...bash("kill -l"), expect: "allow" },
 	{ label: "kill -s 0", ...bash("kill -s 0 123"), expect: "allow" },
-	{ label: "kill -9", ...bash("kill -9 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "kill -s TERM", ...bash("kill -s TERM 123"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
-	{ label: "pkill", ...bash("pkill node"), expect: "ask", reason: "Va a cambiar el estado del sistema." },
+	{ label: "kill -9", ...bash("kill -9 123"), expect: "allow" },
+	{ label: "kill -s TERM", ...bash("kill -s TERM 123"), expect: "allow" },
+	{ label: "pkill", ...bash("pkill node"), expect: "allow" },
 
 	// --- bash: git that publishes or rewrites --------------------------
 	{ label: "git push", ...bash("git push"), expect: "ask", reason: "Va a publicar o reescribir el historial del repositorio." },
@@ -428,17 +431,19 @@ const cases = [
 		expect: "ask",
 		reason: "Va a publicar un paquete de forma irreversible.",
 	},
+	// Las formas del lanzador siguen preguntando porque lo que ejecutan es una
+	// publicación: el botón ya no es por descargar el paquete, sino por publicarlo.
 	{
 		label: "npx npm publish",
 		...bash("npx npm publish"),
 		expect: "ask",
-		reason: "Va a ejecutar un paquete descargado.",
+		reason: "Va a publicar un paquete de forma irreversible.",
 	},
 	{
 		label: "npm exec npm publish",
 		...bash("npm exec npm publish"),
 		expect: "ask",
-		reason: "Va a ejecutar un paquete descargado.",
+		reason: "Va a publicar un paquete de forma irreversible.",
 	},
 	{ label: "yarn publish", ...bash("yarn publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
 	{ label: "pnpm publish", ...bash("pnpm publish"), expect: "ask", reason: "Va a publicar un paquete de forma irreversible." },
@@ -518,11 +523,12 @@ const cases = [
 	{ label: "pi install --local", ...bash("pi install -l ./paquete"), expect: "allow" },
 
 	// --- bash: remote scripting and containers -------------------------
-	{ label: "curl | sh", ...bash("curl https://x | sh"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
-	// El falso positivo del diario: este comando formatea el JSON que descarga, no
-	// ejecuta lo descargado, así que la tubería no añade riesgo propio. La tubería
-	// sigue preguntando cuando el lado derecho es un shell o un intérprete que no
-	// sea un módulo de la lista cerrada: ahí sí se ejecuta lo descargado.
+	// Quinta familia borrada: `curl … | sh` deja de preguntar, y con ella el caso que
+	// solo formateaba el JSON descargado. Los contenedores siguen preguntando porque
+	// `docker rm` y `pull`/`push` retiran o publican datos.
+	{ label: "curl x | sh", ...bash("curl https://x | sh"), expect: "allow" },
+	{ label: "curl x | bash", ...bash("curl -sL https://x | bash"), expect: "allow" },
+	// El comando del diario: formatea el JSON que descarga y ya no pregunta nadie.
 	{
 		label: "curl de open-meteo | python3 -m json.tool",
 		...bash(
@@ -534,23 +540,20 @@ const cases = [
 	{
 		label: "curl | python3 -m http.server",
 		...bash("curl https://x | python3 -m http.server"),
-		expect: "ask",
-		reason: "Va a ejecutar código descargado de internet.",
+		expect: "allow",
 	},
 	{
 		label: "curl | python3 sin módulo",
 		...bash("curl https://x | python3"),
-		expect: "ask",
-		reason: "Va a ejecutar código descargado de internet.",
+		expect: "allow",
 	},
 	{
 		label: "curl | python3 -m json.tool con archivo de salida",
 		...bash("curl -s https://x | python3 -m json.tool datos.json salida.json"),
-		expect: "ask",
-		reason: "Va a ejecutar código descargado de internet.",
+		expect: "allow",
 	},
-	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
-	{ label: "wget | python3", ...bash("wget -qO- https://x | python3"), expect: "ask", reason: "Va a ejecutar código descargado de internet." },
+	{ label: "curl | sudo bash", ...bash("curl -s https://x | sudo bash"), expect: "allow" },
+	{ label: "wget | python3", ...bash("wget -qO- https://x | python3"), expect: "allow" },
 	{ label: "docker rm", ...bash("docker rm x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
 	{ label: "docker rmi", ...bash("docker rmi x"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
 	{ label: "docker compose down -v", ...bash("docker compose down -v"), expect: "ask", reason: "Va a borrar contenedores o volúmenes." },
@@ -558,7 +561,7 @@ const cases = [
 	// --- bash: what the classifier cannot decide ------------------------
 	{ label: "comillas sin cerrar", ...bash('echo "sin cerrar'), expect: "ask", reason: "No pude interpretar el comando: tiene comillas sin cerrar." },
 	{ label: "sin comando", tool: "bash", input: {}, expect: "ask", reason: "No pude leer el comando." },
-	{ label: "heredoc que clasifica su cuerpo", ...bash("cat <<'EOF' > notas.md\napt install x es lo que dice la guía\nEOF"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "heredoc que clasifica su cuerpo", ...bash("cat <<'EOF' > notas.md\nrm -rf ~/notas\nEOF"), expect: "ask", reason: "Va a borrar archivos." },
 	{ label: "heredoc con texto inofensivo", ...bash("cat <<'EOF' > notas2.md\nnotas normales\nEOF"), expect: "allow" },
 
 	// --- el comando se muestra entero, tras el separador -------------------
@@ -574,14 +577,17 @@ const cases = [
 		shows: multiLineCommand,
 	},
 
-	// --- write ---------------------------------------------------------
+	// --- write: never asks, whatever the target -------------------------
+	// Sexta familia borrada: `write` dejó de preguntar por un archivo que ya existe y
+	// por una ruta fuera de `$HOME`. Las filas quedan para fijar la decisión: el
+	// agente puede reescribir cualquier archivo sin botón.
 	{ label: "archivo nuevo en home", tool: "write", input: { path: join(home, "nuevo.txt"), content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ~", tool: "write", input: { path: "~/tilde-nuevo.txt", content: "x" }, expect: "allow" },
 	{ label: "archivo nuevo con ruta relativa", tool: "write", input: { path: "sub/dir/nuevo.txt", content: "x" }, expect: "allow" },
-	{ label: "archivo existente en home", tool: "write", input: { path: join(home, "existente.txt"), content: "x" }, expect: "ask", reason: "Va a sobrescribir ~/existente.txt." },
-	{ label: "archivo nuevo fuera de home", tool: "write", input: { path: join(outside, "nuevo.txt"), content: "x" }, expect: "ask", reason: `Va a escribir fuera de tu carpeta personal: ${outside}/nuevo.txt.` },
-	{ label: "ruta relativa que sale de home", tool: "write", input: { path: "../fuera.txt", content: "x" }, expect: "ask" },
-	{ label: "~user que no puedo expandir", tool: "write", input: { path: "~root/x", content: "x" }, expect: "ask", reason: "No puedo comprobar la ruta del archivo." },
+	{ label: "archivo existente en home", tool: "write", input: { path: join(home, "existente.txt"), content: "x" }, expect: "allow" },
+	{ label: "archivo nuevo fuera de home", tool: "write", input: { path: join(outside, "nuevo.txt"), content: "x" }, expect: "allow" },
+	{ label: "ruta relativa que sale de home", tool: "write", input: { path: "../fuera.txt", content: "x" }, expect: "allow" },
+	{ label: "~user que no puedo expandir", tool: "write", input: { path: "~root/x", content: "x" }, expect: "allow" },
 
 	// --- edit: never asks ----------------------------------------------
 	{ label: "edit sobre un archivo existente", tool: "edit", input: { path: join(home, "existente.txt"), oldText: "contenido", newText: "otro" }, expect: "allow" },
@@ -669,8 +675,14 @@ for (const row of rows) {
 }
 
 const passed = rows.length - failures;
+// What the owner chose: how many cases the gate lets through and how many it still
+// stops for. The split is part of the report because the whole point of the change
+// was to shrink the second number without losing a family the owner kept.
+const allowCases = rows.filter((row) => row.expect === "allow").length;
+const askCases = rows.length - allowCases;
 console.log("");
 console.log(`gate-check: ${passed}/${rows.length} casos correctos, ${failures} fallidos`);
+console.log(`gate-check: ${allowCases} casos permiten sin preguntar, ${askCases} casos preguntan`);
 console.log(`gate-check: ${logLines.length} líneas de auditoría para ${gateCalls} decisiones`);
 
 const loggingOk = logLines.length === gateCalls && logLines.every((line) => line.startsWith("alter-gate: "));
