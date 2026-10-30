@@ -52,6 +52,11 @@ const (
 	// id replace each other, and the final message replaces them all.
 	bridgeDraftID = 1
 
+	// bridgeThinkingDraft is the first draft of every turn. It is the only
+	// liveness signal a Telegram Web client renders for a bot, so it must stay
+	// short and obviously provisional.
+	bridgeThinkingDraft = "Pensando…"
+
 	// bridgeEmptyReply and bridgeErrorReply are the short human lines the chat
 	// receives instead of a silent drop: a turn that produced no text or failed
 	// must always answer something the owner can act on.
@@ -652,6 +657,14 @@ func (r *bridgeRuntime) promptTurn(ctx context.Context, chatID int64, prompt str
 	// leave the owner looking at nothing while Pi works.
 	stopTyping := r.keepTypingAlive(ctx, chatID)
 	defer stopTyping()
+
+	// Telegram Web does not render the typing indicator for bots, but it does
+	// render drafts, which is the channel that already shows the answer as it is
+	// written. Announcing the turn on that same channel is what the owner sees;
+	// the first streamed delta replaces this text.
+	if derr := r.client.SendRichDraft(ctx, chatID, bridgeDraftID, bridgeThinkingDraft); derr != nil {
+		r.logger.Printf("bridge: thinking draft: %v", derr)
+	}
 
 	// A turn that runs past the threshold announces itself once: silence for
 	// minutes is indistinguishable from a dead turn in the chat.

@@ -578,11 +578,16 @@ func TestBridgeTextTurnStreamsDraftAndDeliversFinal(t *testing.T) {
 	if finals[0] != "Hola desde Pi, **con markdown**" {
 		t.Errorf("final markdown = %q, want the authoritative assistant text", finals[0])
 	}
-	if len(drafts) == 0 {
-		t.Error("no draft was published: the streamed text must reach the chat while Pi answers")
+	if len(drafts) < 2 {
+		t.Fatalf("drafts = %v, want the thinking draft and then the streamed text", drafts)
 	}
-	if len(drafts) > 0 && !strings.Contains(drafts[0], "Hola") {
-		t.Errorf("draft = %q, want the accumulated assistant text", drafts[0])
+	// The first draft announces the turn: a Telegram Web client renders drafts but
+	// not the chat action, so this is the only liveness signal the owner sees.
+	if drafts[0] != bridgeThinkingDraft {
+		t.Errorf("first draft = %q, want the thinking draft %q", drafts[0], bridgeThinkingDraft)
+	}
+	if !strings.Contains(drafts[len(drafts)-1], "Hola") {
+		t.Errorf("last draft = %q, want the accumulated assistant text", drafts[len(drafts)-1])
 	}
 	if len(typing) == 0 || typing[0] != "typing" {
 		t.Errorf("chat actions = %v, want a typing action before the answer", typing)
