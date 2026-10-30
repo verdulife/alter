@@ -1,112 +1,100 @@
 # Fase 3 — Recordatorios que suenan
 
-> Plan de diseño. Nada de esto está implementado todavía. El objetivo es cerrar
-> la única promesa que el sistema hace hoy y no cumple: un recordatorio con
-> `remind_at` se guarda bien y nunca avisa.
+> Plan de diseño aprobado. El vault es la única fuente de verdad; systemd es el
+> despertador; el agente es quien redacta y actúa.
 
-## Principio
-
-**Sin infraestructura nueva.** Nada de cron, nada de daemon aparte, nada de
-segunda conexión a Telegram. El bridge ya está vivo, ya es dueño del token y ya
-tiene una sesión de Pi con contexto. La fase 3 es un ticker dentro de él.
+## Arquitectura
 
 ```
-alter.service (ya existe)
-  └── bridge
-       ├── poller           ← tus mensajes
-       ├── turnos           ← lo que ya hay
-       └── ticker (60 s)    ← nuevo, y es todo
+vault/reminders/2026-11-03-llamar-a-mama.md     ← fuente de verdad
+        │
+        │  alter remind sync                     ← reconcilia vault ↔ timers
+        │     (al arrancar el servicio, y cuando el agente crea o edita uno)
+        ▼
+systemd --user: alter-remind-llamar-a-mama.timer
+        │  OnCalendar=<remind_at>  Persistent=true
+        ▼
+alter remind fire llamar-a-mama
+        ├── valida el .md con el mismo validador de `alter vault check`
+        ├── si ya venció y no está disparado, sigue; si no, sale sin ruido
+        ├── marca last_fired (atómico) o adelanta remind_at si es recurrente
+        ├── despierta a Pi: `pi -p` con el contenido del recordatorio
+        │      └── Pi redacta y avisa con `alter notify "..."`
+        └── si Pi falla, `alter notify` con el título (el aviso no se pierde)
 ```
 
-## Por qué un ticker y no un cron
+## Por qué así
 
-| | Cron externo | Ticker interno |
-|---|---|---|
-| Proceso nuevo | sí | **no** |
-| Compite por el token | tendría que hablar con el bridge | **no** |
-| Sesión de Pi | una segunda, sin contexto | **la misma** |
-| Apagado | dos ciclos de vida | uno |
-| Recuperación al volver | la tiene que inventar | trivial: mira los vencidos |
+- **Sobrevive a reinicios** porque el estado está en el vault y `sync` recrea los
+  timers al arrancar.
+- **Precisión al segundo**: no se comprueba cada minuto.
+- **El aviso llega aunque el bridge esté caído**: el timer ejecuta un binario
+  independiente, no depende del poller.
+- **Puesta al día**: `Persistent=true` para systemd y, además, `sync` dispara lo
+  que venció mientras la máquina estaba apagada.
+- **El agente actualiza y notifica**, no un texto fijo.
+- **Una sola fuente de verdad**: el `.md`. Los timers son derivados y
+  reconstruibles; si desaparecen, `sync` los vuelve a crear.
 
-El ticker es ~80 líneas contra un subsistema.
+## Timers transient, a propósito
 
-## Flujo de un disparo
+`sync` usa `systemd-run --user --on-calendar=… --unit=alter-remind-<slug>`, no
+ficheros de unidad. Evita escribir dos ficheros por recordatorio, `daemon-reload`
+y `enable`. El precio: un reinicio de la máquina los borra, y eso lo cubre `sync`
+al arrancar junto con la puesta al día.
+
+Si en el futuro los recordatorios crecen hasta decenas, se migra a unidades
+persistentes sin cambiar el contrato.
+
+## Componentes
+
+| Pieza | Responsabilidad |
+|---|---|
+| `internal/vault/reminders.go` | leer vencidos, validar, marcar `last_fired`, adelantar recurrencia. Nada de sistema. |
+| `internal/reminder/scheduler.go` | hablar con `systemd-run`/`systemctl`: crear, borrar, listar. Aislado tras una interfaz para poder probarlo con un doble. |
+| `cmd/alter/remind.go` | subcomandos `sync` y `fire`, y `notify` como transporte de texto. |
+| `cmd/alter/bridge_wiring.go` | una llamada a `sync` al arrancar. Nada más. |
+| `.agents/skills/alter-tasks` | una línea: tras crear o editar un recordatorio, ejecutar `alter remind sync`. |
+
+## Subcomandos
 
 ```
-cada 60 s
-  due := recordatorios con status=open y remind_at <= ahora, sin last_fired
-  si vacío → nada (no se registra, no se loguea)
-  marcar last_fired en cada uno (escritura atómica, ANTES de notificar)
-  si son varios → un solo turno con todos, no N mensajes
-  runTurn("Recordatorios vencidos: …")
-  Pi redacta el aviso; el bridge lo entrega como cualquier respuesta
+alter remind sync            reconcilia: crea los que faltan, borra huérfanos,
+                             dispara los vencidos sin disparar
+alter remind sync --dry-run  dice qué haría, sin tocar systemd
+alter remind fire <slug>     dispara uno (lo llama el timer; idempotente)
+alter notify "<texto>"       envía un mensaje al chat del dueño
 ```
 
-**Marcar antes de notificar** es la decisión de idempotencia: si el envío
-falla, se pierde un aviso (se ve en el log) en lugar de repetirse cada minuto
-para siempre. Se documenta como riesgo aceptado; nunca hay duplicados.
+## Idempotencia y errores
 
-## Contrato de datos
+- `last_fired` se escribe **antes** de lanzar a Pi. Un fallo de envío pierde ese
+  aviso (se registra) en vez de repetirlo cada minuto.
+- `fire` sobre uno ya disparado no hace nada.
+- Un `.md` inválido no se dispara: se reporta y se sigue con los demás.
+- `sync` nunca borra un `.md`: solo timers.
 
-Ya existe y no se toca: `.agents/skills/alter-vault` define las claves, y
-`internal/vault/schema.go` las valida. El ticker **rechaza** una entrada inválida
-y la reporta en el log; no adivina fechas ni completa campos.
+## Recurrencia
 
-Campos que el ticker usa y escribe:
-
-| Campo | Lectura | Escritura |
-|---|---|---|
-| `remind_at` | filtro por vencimiento | — |
-| `status` | solo `open` | — |
-| `last_fired` | si es posterior a `remind_at`, ya está hecho | timestamp RFC3339 |
-| `recurrence` | `daily`/`weekly`/`monthly`/`yearly` | recalcula `remind_at` |
-
-Un recordatorio **recurrente** no se marca como disparado: se adelanta su
-`remind_at` a la siguiente ocurrencia. Los demás escriben `last_fired`.
-
-## Configuración
-
-| Variable | Default | Qué hace |
-|---|---|---|
-| `ALTER_REMINDERS_ENABLED` | `true` | apaga el ticker sin tocar nada más |
-| `ALTER_REMINDERS_INTERVAL` | `60s` | frecuencia de comprobación |
-
-Nada más. Sin fichero de configuración nuevo.
-
-## Tareas
-
-| ID | Tarea | Criterio |
-|---|---|---|
-| F3-1 | `internal/vault/reminders.go`: `DueReminders`, `MarkFired`, `NextOccurrence`, escritura atómica | tests de vencido, futuro, ya disparado, inválido, recurrente, zona horaria |
-| F3-2 | Ticker en el bridge: arranque, parada con el contexto, un turno agrupado | test: un vencido produce un turno; ninguno produce cero |
-| F3-3 | Config y documentación | variables en `docs/bridge-fase1.md` |
-| F3-4 | Verificación real en el móvil | ver el criterio de aceptación |
+`recurrence: daily|weekly|monthly|yearly` no marca `last_fired`: adelanta
+`remind_at` a la siguiente ocurrencia y `sync` reprograma. Un recordatorio
+recurrente nunca "termina".
 
 ## Criterio de aceptación
 
-1. Crear un recordatorio con `remind_at` a dos minutos vista.
+1. Crear un recordatorio a dos minutos vista.
 2. **Reiniciar el servicio** antes de que venza.
 3. Recibir el aviso en Telegram, redactado por Pi.
 4. Reiniciar otra vez: **no** se repite.
-5. Un recordatorio con fecha pasada de hace una hora, creado mientras el
-   servicio estaba parado, se dispara al arrancar (puesta al día).
-
-Ese último punto es el que separa "funciona" de "funciona cuando todo va bien".
+5. Crear uno con `remind_at` de hace una hora y ejecutar `sync`: se dispara.
+6. Crear uno recurrente semanal: tras dispararse, su `remind_at` avanza siete
+   días y el timer se reprograma.
+7. Borrar un `.md` y ejecutar `sync`: su timer desaparece de
+   `systemctl --user list-timers`.
 
 ## No objetivos
 
-- Gestionar recordatorios por comando (`/recordar`): se siguen creando
-  hablando con el agente, que es lo que ya funciona.
+- Gestión por comandos de chat (`/recordar`): se sigue hablando con el agente.
 - Notificaciones fuera de Telegram.
-- Reintentos con backoff: si un aviso falla, se registra y se sigue.
-- Precisión al segundo: un minuto de margen es aceptable para un secretario.
-
-## Riesgos aceptados
-
-- **Servicio caído en el momento exacto:** el aviso llega tarde, al arrancar.
-  Con la puesta al día, no se pierde.
-- **Reloj del sistema:** un salto de hora puede adelantar o retrasar un aviso.
-- **Marcar antes de notificar:** un fallo de envío pierde ese aviso. Se prefiere
-  a duplicarlo cada minuto.
-- **Un solo proceso:** systemd garantiza una instancia; dos bridges con el mismo
-  token ya se rompen hoy por `409 Conflict`, así que no es un riesgo nuevo.
+- Reintentos con backoff.
+- Unidades de sistema persistentes (se migra si hace falta).
