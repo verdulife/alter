@@ -119,6 +119,6 @@ era correcta; lo que faltaba era el entorno. Se corrigió en dos capas: la unit
 declara `--setenv=PATH` y `--property=EnvironmentFile`, y `fire`/`notify` cargan
 el `.env` por su cuenta como segunda red.
 
-Deuda conocida: esa segunda red lee `<WorkDir>/.env`, pero una unit transient
-corre con `$HOME` como directorio de trabajo, así que solo actúa la primera capa.
-Hacerlo determinista pide `ALTER_ENV_FILE` o `WorkingDirectory=` en la unit.
+Deuda cerrada: esa segunda red leía `<WorkDir>/.env`, pero una unit transient
+corre con `$HOME`. La unit declara ahora `--property=WorkingDirectory=<WorkDir>`,
+así que las dos capas ven el mismo fichero. Verificado con un disparo real.

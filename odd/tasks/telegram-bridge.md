@@ -317,3 +317,29 @@ Verificado con `scripts/gate-check.mjs`: 86 casos sobre el clasificador real,
 61/84 correctos en la versión anterior y 86/86 en esta. Límite conocido: el gate
 es un clasificador, no un sandbox; el contenido de un script o binario que ya
 existe no se lee.
+
+**Fase 3 cerrada** (2026-10-30). Recordatorios que suenan, con timers de systemd
+transient y un agente efímero por disparo. Commits:
+
+| Commit | Contenido |
+|---|---|
+| `67e712f` | `internal/vault`: vencidos, `last_fired` atómico, recurrencia con hora de pared |
+| `bc212ec` | `internal/reminder`: systemd tras una interfaz, con doble para tests |
+| `53a1179` | `alter remind sync/fire` y `alter notify`; `sync` al arrancar |
+| `c7470fd` | la unit hereda `PATH` y `EnvironmentFile`; `fire`/`notify` cargan el `.env` |
+| `a0c615e` | la carrera del placeholder: reclamar antes de enviar y reparar si se pierde |
+| `11a0530` | la unit corre en el directorio del bridge, así funciona la segunda red |
+| `2fe99d4` | verificación en producción, con los seis criterios |
+
+Verificado en el móvil: aviso a su hora, puesta al día tras una caída, ninguno
+repetido, recurrente que avanza siete días, huérfano eliminado por `sync`.
+
+Fallo real encontrado en la verificación, no en los tests: las units de
+`systemd-run` no heredan el entorno, así que el primer disparo marcó el
+recordatorio y no pudo avisar. La lógica era correcta; faltaba el entorno.
+
+**L21** — Decisiones del usuario en el debate de la fase 3: el vault es la única
+fuente de verdad, systemd es el despertador y **el agente es efímero por
+disparo** (un `pi -p` limpio), de modo que un aviso llega aunque el bridge esté
+caído. Se descartó el ticker interno y se descartó que el timer hablara con el
+bridge por IPC.
