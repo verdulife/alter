@@ -106,7 +106,24 @@ igual que `git push`):
   `checkout --`, `restore`, `commit --amend`, `branch -d`, `tag -d`,
   `stash drop`, `filter-branch`;
 - guiones remotos: `curl` o `wget` canalizados a un intérprete;
+- intérpretes: `python`, `python3`, `python3.x`, `node`, `perl`, `ruby`. El nombre
+  del programa no basta para decidir, porque el instalador va detrás: `python3 -m
+  pip install …` instala lo mismo que `pip install` (y `-m pip uninstall` y `-m
+  ensurepip` también), cualquier otro `-m <módulo>` es código que el gate no ha
+  visto nunca y pregunta («Va a ejecutar un módulo de Python.»), y `-c` de Python
+  y `-e`/`-E` de Perl y Ruby (más `--eval` de Node) son código escrito en el propio
+  comando, que pregunta sin intentar leerlo («Va a ejecutar código arbitrario.»).
+  No hay lista de módulos permitidos: `venv`, `http.server` y `json.tool` escriben
+  o sirven, así que ninguno está en ella;
+- lanzadores de paquetes: `npx`, `npm exec`, `pnpm dlx`, `yarn dlx` y `bunx`
+  descargan un paquete y lo ejecutan, así que preguntan siempre («Va a ejecutar un
+  paquete descargado.»);
 - contenedores: `docker rm`, `rmi`, `prune`, `compose down -v`.
+
+Ejecutar un script que ya existe **no pregunta**: `python3 script.py`, `node
+script.js`, `bash instalar.sh` y `./binario` son la misma clase que `go test`.
+Esa fue una decisión deliberada, y su consecuencia está en el riesgo 6: lo que hay
+dentro del archivo no se lee.
 
 Lo que el clasificador no puede decidir, pregunta: comillas sin cerrar, una ruta
 que no resuelve, una línea partida en demasiadas piezas. El cuerpo de un heredoc
@@ -174,6 +191,14 @@ Estos no son defectos: son el precio de lo que pediste. Se aceptan sabiéndolos.
    botón. Y como `bash` corre sin permiso dentro de `$HOME`, un turno puede
    borrar o cifrar archivos tuyos sin que veas nada. La red de seguridad ya no es
    el botón: es el diario y lo que revises en él.
+   - Desde el agujero del diario (`python3 -m pip install …` permitido porque el
+     programa era `python3`), los intérpretes se leen por lo que se les pide: `-m`,
+     `-c`, `-e`/`-E`/`--eval` y los lanzadores de paquetes (`npx`, `npm exec`,
+     `pnpm dlx`, `yarn dlx`, `bunx`) preguntan. No se lee el contenido de ningún
+     programa: `python3 script.py`, `node script.js` y `./binario` se siguen
+     ejecutando sin botón, así que un instalador metido en un script propio, en un
+     `python3 -` o en una bandera que el gate no lea (`node -p`, `php -r`) pasa.
+     Sigue siendo una frontera de formas conocidas, no un aislamiento.
 7. **`write` de un archivo nuevo dentro de `$HOME` no pregunta**, tampoco en
    rutas como `~/.ssh/authorized_keys` o `~/.bashrc` cuando aún no existen. Crear
    un archivo no destruye nada y pedir permiso por cada archivo nuevo volvía a

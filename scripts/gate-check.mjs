@@ -291,6 +291,60 @@ const cases = [
 	{ label: "cargo install", ...bash("cargo install x"), expect: "ask", reason: "Va a instalar software en el sistema." },
 	{ label: "crontab", ...bash("crontab -r"), expect: "ask", reason: "Va a programar una tarea automática." },
 
+	// --- bash: intérpretes y lanzadores de paquetes ---------------------
+	// El agujero del diario de producción: el programa era `python3`, así que
+	// `python3 -m pip install …` se permitía sin preguntar. Cuando el programa es
+	// un intérprete, decide lo que se le pide ejecutar: un módulo de Python, un
+	// paquete descargado o código escrito en el propio comando preguntan; un
+	// script que ya existe se sigue tratando como `go test`.
+	{
+		label: "python3 -m pip install del diario de producción",
+		...bash("cd /tmp && python3 -m pip install --user --quiet pypdf"),
+		expect: "ask",
+		reason: "Va a instalar software en el sistema.",
+	},
+	{
+		label: "python3.11 -m pip install",
+		...bash("python3.11 -m pip install pypdf"),
+		expect: "ask",
+		reason: "Va a instalar software en el sistema.",
+	},
+	{
+		label: "python -m pip uninstall",
+		...bash("python -m pip uninstall pypdf"),
+		expect: "ask",
+		reason: "Va a instalar software en el sistema.",
+	},
+	{ label: "python3 -m ensurepip", ...bash("python3 -m ensurepip"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "python3 -m http.server", ...bash("python3 -m http.server 8000"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
+	{ label: "python3 -m venv", ...bash("python3 -m venv .venv"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
+	{ label: "python3 -m pip list", ...bash("python3 -m pip list"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
+	{ label: "python3 -m sin módulo", ...bash("python3 -m"), expect: "ask", reason: "Va a ejecutar un módulo de Python." },
+	{ label: "python3 -c", ...bash("python3 -c 'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "python3 -c pegado a las comillas", ...bash("python3 -c'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	// `-W` y `-X` toman su valor de la palabra siguiente: esa palabra no es un
+	// script y no puede terminar la lectura del comando.
+	{ label: "python3 -W ignore -c", ...bash("python3 -W ignore -c 'print(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "python3 -X utf8 -m pip install", ...bash("python3 -X utf8 -m pip install pypdf"), expect: "ask", reason: "Va a instalar software en el sistema." },
+	{ label: "node -e", ...bash("node -e 'console.log(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "node --eval", ...bash("node --eval 'console.log(1)'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "perl -e", ...bash("perl -e 'print 1'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "ruby -e", ...bash("ruby -e 'puts 1'"), expect: "ask", reason: "Va a ejecutar código arbitrario." },
+	{ label: "npx", ...bash("npx cowsay hola"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+	{ label: "npm exec", ...bash("npm exec cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+	{ label: "pnpm dlx", ...bash("pnpm dlx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+	{ label: "yarn dlx", ...bash("yarn dlx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+	{ label: "bunx", ...bash("bunx cowsay"), expect: "ask", reason: "Va a ejecutar un paquete descargado." },
+
+	// --- bash: lo que un intérprete no cambia ---------------------------
+	// Ejecutar un script que ya existe es la misma clase que `go test`, y así se
+	// decidió: la regla nueva mira lo que el intérprete recibe, no su nombre.
+	{ label: "python3 script.py sigue permitido", ...bash("python3 script.py"), expect: "allow" },
+	{ label: "node script.js sigue permitido", ...bash("node script.js"), expect: "allow" },
+	{ label: "python3 --version", ...bash("python3 --version"), expect: "allow" },
+	{ label: "node --version", ...bash("node --version"), expect: "allow" },
+	{ label: "yarn install local", ...bash("yarn install"), expect: "allow" },
+
 	// --- bash: lecturas que antes preguntaban ---------------------------
 	// La puerta está para lo que destruye, publica o escala, y estos cinco grupos
 	// son de solo lectura pero lo bastante frecuentes como para reconstruir el

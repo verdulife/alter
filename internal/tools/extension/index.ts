@@ -693,6 +693,9 @@ function stripWrapperArgs(program: string, args: string[]): string[] {
 /** Shell word that starts with an assignment, as in `FOO=1 rm x` or `A=b c=d cmd`. */
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
+/** An option set with no value-taking flag, for the callers that only need an operand. */
+const NO_VALUE_FLAGS: Set<string> = new Set();
+
 /**
  * The sentences the owner reads. Each one names the consequence in the second
  * person and, unless the program IS the point (`sudo`), never the program: "rm
@@ -709,6 +712,9 @@ const REASON_SCHEDULE = "Va a programar una tarea automática.";
 const REASON_HISTORY = "Va a publicar o reescribir el historial del repositorio.";
 const REASON_DOWNLOADED_CODE = "Va a ejecutar código descargado de internet.";
 const REASON_CONTAINERS = "Va a borrar contenedores o volúmenes.";
+const REASON_MODULE = "Va a ejecutar un módulo de Python.";
+const REASON_DOWNLOADED_PACKAGE = "Va a ejecutar un paquete descargado.";
+const REASON_ARBITRARY_CODE = "Va a ejecutar código arbitrario.";
 
 /** One gate rule: what the owner reads, and what the journal records. */
 type Rule = { reason: string; detail: string };
@@ -792,6 +798,146 @@ function scriptArgument(args: string[]): string | null {
 	}
 	return null;
 }
+
+/**
+ * Interpreters whose arguments the gate reads. The production journal had
+ * `python3 -m pip install …` allowed because the program was `python3` and nothing
+ * looked at what it was asked to run: an installer behind an interpreter walked
+ * through the gap. What the interpreter is given decides, not its name.
+ */
+type InterpreterKind = "python" | "node" | "perl" | "ruby";
+
+/** Program names of each interpreter, version suffixes included (`python3.11`, `perl5.36`). */
+const INTERPRETER_NAMES: { kind: InterpreterKind; name: RegExp }[] = [
+	{ kind: "python", name: /^python(\d+(\.\d+)?)?$/ },
+	{ kind: "node", name: /^node(js)?$/ },
+	{ kind: "perl", name: /^perl(\d+(\.\d+)?)?$/ },
+	{ kind: "ruby", name: /^ruby(\d+(\.\d+)?)?$/ },
+];
+
+/** Interpreter family of a program name, or null when it is not one. */
+function interpreterKind(program: string): InterpreterKind | null {
+	for (const entry of INTERPRETER_NAMES) {
+		if (entry.name.test(program)) return entry.kind;
+	}
+	return null;
+}
+
+/**
+ * Short-option letters that make an interpreter run the code written in the
+ * command instead of a file: `-c` for Python and `-e` for Node, Perl and Ruby.
+ * Perl's `-E` is the same flag with features enabled, so it walks the same rule.
+ * A command can pass the code glued to the flag (`python3 -c'print(1)'`), so the
+ * letters of the cluster are read, not just the exact flag.
+ */
+const INLINE_CODE_LETTERS: Record<InterpreterKind, string> = {
+	python: "c",
+	node: "e",
+	perl: "eE",
+	ruby: "e",
+};
+
+/**
+ * Letters of an interpreter's short-option cluster (`-c`, `-we`, `-cprint(1)`), or
+ * null when the word is not a short option. Only the leading letters are read, so a
+ * glued value (`-cprint(1)`) does not turn the parentheses into flag names.
+ */
+function optionLetters(argument: string): string | null {
+	if (!argument.startsWith("-") || argument.startsWith("--") || argument === "-") return null;
+	const letters = /^-([A-Za-z]*)/.exec(argument)?.[1] ?? "";
+	return letters.length > 0 ? letters : null;
+}
+
+/** Perl short options that swallow a glued value (`-Mstrict`, `-Ilib`), so they are not code. */
+const PERL_VALUE_PREFIXES = ["-M", "-m", "-I"];
+
+/** Python short options that take their value as the next word (`-W ignore`, `-X utf8`). */
+const PYTHON_VALUE_LETTERS = "WX";
+
+/** True for the module names that are pip itself: `pip`, `pip3`, `pip3.11`. */
+function isPipModule(module: string): boolean {
+	return /^pip\d*(\.\d+)*$/.test(module);
+}
+
+/**
+ * Verdict for `python`. A module asks, because it is code that is not in the command
+ * line: `-m pip install`/`uninstall` and `-m ensurepip` with the installer reason
+ * and any other module as unknown code (there is no allowlist of modules worth
+ * keeping: `venv`, `http.server` and `json.tool` all write or serve). Inline code
+ * (`-c`) asks as arbitrary code. A script argument is allowed: it is an existing
+ * file, the same class as `go test`, and the decision is recorded in
+ * `docs/alter-limites.md`.
+ */
+function classifyPython(program: string, args: string[]): Verdict {
+	for (let index = 0; index < args.length; index += 1) {
+		const argument = args[index];
+		// `--` ends the options and `-` reads the script from stdin: both run a
+		// script, so they keep the verdict `python3 script.py` has.
+		if (argument === "--" || argument === "-") return allow();
+		if (!argument.startsWith("-")) return allow(); // an existing script
+		const letters = optionLetters(argument);
+		if (letters === null) continue; // a long option (`--version`): none runs code
+		// `-W ignore` and `-X utf8` take the next word as their value, so that word is
+		// not a script and must not end the scan: `python3 -W ignore -c '…'` still asks.
+		if (argument.length === 2 && PYTHON_VALUE_LETTERS.includes(letters)) {
+			index += 1;
+			continue;
+		}
+		if (letters.includes("c")) return ask(REASON_ARBITRARY_CODE, `${program} -c ejecuta código arbitrario`);
+		if (!letters.includes("m")) continue;
+		const module = args[index + 1] ?? "";
+		if (module.length === 0) {
+			return ask(REASON_MODULE, `${program} -m sin módulo: no reconozco la operación`);
+		}
+		const subcommand = args.slice(index + 2).find((rest) => !rest.startsWith("-")) ?? "";
+		if (module === "ensurepip") return ask(REASON_INSTALL, `${program} -m ensurepip instala pip`);
+		if (isPipModule(module) && (subcommand === "install" || subcommand === "uninstall")) {
+			return ask(REASON_INSTALL, `${program} -m pip ${subcommand} instala o quita paquetes`);
+		}
+		return ask(REASON_MODULE, `${program} -m ${module} ejecuta un módulo`);
+	}
+	return allow();
+}
+
+/**
+ * Verdict for an interpreter. What it is asked to run decides: `-c`/`-e` and the
+ * Node long form `--eval` are code written in the command, so they ask without
+ * being read (a reader of code is a promise this gate cannot keep); a script
+ * argument is allowed, because running an existing file is the same class as
+ * `go test`.
+ */
+function classifyInterpreter(program: string, kind: InterpreterKind, args: string[]): Verdict {
+	if (kind === "python") return classifyPython(program, args);
+
+	for (let index = 0; index < args.length; index += 1) {
+		const argument = args[index];
+		if (argument === "--" || argument === "-") return allow();
+		if (!argument.startsWith("-")) return allow(); // an existing script
+		// The tokenizer glues a quoted value to its flag (`--eval'x'`), so the long
+		// Node option is matched by its head.
+		if (kind === "node" && argument.startsWith("--eval")) {
+			return ask(REASON_ARBITRARY_CODE, `${program} --eval ejecuta código arbitrario`);
+		}
+		if (kind === "perl" && PERL_VALUE_PREFIXES.some((prefix) => argument.startsWith(prefix))) continue;
+		const letters = optionLetters(argument);
+		if (letters === null) continue; // a long option: none of them runs code here
+		const flag = Array.from(letters).find((letter) => INLINE_CODE_LETTERS[kind].includes(letter));
+		if (flag !== undefined) {
+			return ask(REASON_ARBITRARY_CODE, `${program} -${flag} ejecuta código arbitrario`);
+		}
+	}
+	return allow();
+}
+
+/** Programs that download and run a package on every invocation. */
+const PACKAGE_RUNNERS = new Set(["npx", "bunx"]);
+
+/** Package managers whose subcommand downloads and runs a package. */
+const PACKAGE_RUNNER_SUBCOMMANDS: Record<string, string> = {
+	npm: "exec",
+	pnpm: "dlx",
+	yarn: "dlx",
+};
 
 /** Verdict for a `git` invocation, read from the real subcommand. */
 function classifyGit(args: string[]): Verdict {
@@ -943,6 +1089,22 @@ function classifyWords(input: string[], cwd: string, depth: number): Verdict {
 
 	const alwaysAsk = ASK_PROGRAMS[program];
 	if (alwaysAsk !== undefined) return ask(alwaysAsk.reason, alwaysAsk.detail);
+
+	// An installer or arbitrary code behind an interpreter is the same act as the
+	// program itself, so the interpreter's arguments are read before anything else
+	// about it: `python3 -m pip install x` asks as `pip install x` does.
+	const kind = interpreterKind(program);
+	if (kind !== null) return classifyInterpreter(program, kind, args);
+
+	// A package runner downloads a package and runs it: there is no local file to
+	// review, so every form asks.
+	const runnerSubcommand = PACKAGE_RUNNER_SUBCOMMANDS[program];
+	if (PACKAGE_RUNNERS.has(program)) {
+		return ask(REASON_DOWNLOADED_PACKAGE, `${program} descarga y ejecuta un paquete`);
+	}
+	if (runnerSubcommand !== undefined && firstOperand(args, NO_VALUE_FLAGS) === runnerSubcommand) {
+		return ask(REASON_DOWNLOADED_PACKAGE, `${program} ${runnerSubcommand} descarga y ejecuta un paquete`);
+	}
 
 	if (program === "git") return classifyGit(args);
 	if (program === "docker" || program === "podman" || program === "docker-compose") {
