@@ -67,10 +67,11 @@ const (
 	// id replace each other, and the final message replaces them all.
 	bridgeDraftID = 1
 
-	// bridgeThinkingDraft is the first draft of every turn. It is the only
-	// liveness signal a Telegram Web client renders for a bot, so it must stay
-	// short and obviously provisional.
-	bridgeThinkingDraft = "Pensando…"
+	// bridgeThinkingDraft is the placeholder of every turn. It is the only
+	// liveness signal a Telegram Web client renders for a bot, and the owner asked
+	// for the bare ellipsis rather than a word: it reads as an animation, not as
+	// text competing with the answer.
+	bridgeThinkingDraft = "…"
 
 	// bridgeEmptyReply and bridgeErrorReply are the short human lines the chat
 	// receives instead of a silent drop: a turn that produced no text or failed
